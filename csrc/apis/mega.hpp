@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <pybind11/functional.h>
 
@@ -137,6 +138,7 @@ static void fp8_fp4_mega_moe(
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor>& kernel_timing,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
@@ -144,7 +146,8 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& enable_kernel_timing
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -187,6 +190,13 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
+    if (enable_kernel_timing) {
+        DG_HOST_ASSERT(kernel_timing.has_value());
+        DG_HOST_ASSERT(kernel_timing->scalar_type() == torch::kLong);
+        DG_HOST_ASSERT(kernel_timing->is_cuda());
+        DG_HOST_ASSERT(kernel_timing->is_contiguous());
+        DG_HOST_ASSERT(kernel_timing->numel() >= 16);
+    }
 
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -215,7 +225,8 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               enable_kernel_timing ? kernel_timing : std::nullopt);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

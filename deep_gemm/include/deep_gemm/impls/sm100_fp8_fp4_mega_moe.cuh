@@ -35,6 +35,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kEnableKernelTiming,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -52,6 +53,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                            uint64_t* dg_timing,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -158,6 +160,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank,
         l2_sf_buffer.get_end_ptr()
     );
+
+#define DG_TIMING_ADD(field, value) do {                                     \
+        if constexpr (kEnableKernelTiming) {                                 \
+            const auto dg_timing_value = static_cast<uint64_t>(value);       \
+            if (threadIdx.x == 0 && dg_timing != nullptr &&                  \
+                dg_timing_value != 0) {                                      \
+                atomicAdd(                                                   \
+                    reinterpret_cast<unsigned long long*>(dg_timing + field),\
+                    static_cast<unsigned long long>(dg_timing_value));       \
+            }                                                                \
+        }                                                                    \
+    } while (0)
+
+    uint64_t dg_kernel_start = 0;
+    if constexpr (kEnableKernelTiming) {
+        dg_kernel_start = clock64();
+        DG_TIMING_ADD(0, 1);
+    }
 
     // Data types
     // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
@@ -288,7 +308,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks,
+        kEnableKernelTiming>(workspace, dg_timing);
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -401,6 +422,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
+        uint64_t dg_dispatch_barrier_start = 0;
+        if constexpr (kEnableKernelTiming)
+            dg_dispatch_barrier_start = clock64();
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -408,6 +432,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+        DG_TIMING_ADD(4, clock64() - dg_dispatch_barrier_start);
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -525,7 +550,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
+                uint64_t dg_pull_mbarrier_start = 0;
+                if constexpr (kEnableKernelTiming)
+                    dg_pull_mbarrier_start = clock64();
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                DG_TIMING_ADD(11, clock64() - dg_pull_mbarrier_start);
                 ptx::tma_store_1d(
                     math::advance_ptr(dst_base_ptr, i * kNumBytesPerPull),
                     pull_buffer.get_base_ptr(), kNumBytesPerPull
@@ -633,6 +662,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         // Wait for all ranks to finish cleaning
+        uint64_t dg_cleanup_barrier_start = 0;
+        if constexpr (kEnableKernelTiming)
+            dg_cleanup_barrier_start = clock64();
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -640,6 +672,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+        DG_TIMING_ADD(5, clock64() - dg_cleanup_barrier_start);
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -664,7 +697,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
-                while (ptx::ld_acq(ptr) != expected);
+                uint64_t dg_l1_wait_start = 0;
+                uint64_t dg_l1_wait_polls = 0;
+                if constexpr (kEnableKernelTiming)
+                    dg_l1_wait_start = clock64();
+                while (ptx::ld_acq(ptr) != expected) {
+                    if constexpr (kEnableKernelTiming)
+                        ++dg_l1_wait_polls;
+                }
+                DG_TIMING_ADD(7, clock64() - dg_l1_wait_start);
+                DG_TIMING_ADD(8, dg_l1_wait_polls);
             } else {
                 // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
                 // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
@@ -679,7 +721,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 DG_STATIC_ASSERT(kShiftOffset <= 64, "Invalid shift amount");
                 constexpr uint64_t kExpectedMask = kShiftOffset == 64 ?
                     static_cast<uint64_t>(-1) : (1ull << kShiftOffset) - 1;
-                while (ptx::ld_acq_gpu(ptr) != kExpectedMask);
+                uint64_t dg_l2_wait_start = 0;
+                uint64_t dg_l2_wait_polls = 0;
+                if constexpr (kEnableKernelTiming)
+                    dg_l2_wait_start = clock64();
+                while (ptx::ld_acq_gpu(ptr) != kExpectedMask) {
+                    if constexpr (kEnableKernelTiming)
+                        ++dg_l2_wait_polls;
+                }
+                DG_TIMING_ADD(9, clock64() - dg_l2_wait_start);
+                DG_TIMING_ADD(10, dg_l2_wait_polls);
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -793,7 +844,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Wait tensor memory empty barrier arrival
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                uint64_t dg_tmem_empty_start = 0;
+                if constexpr (kEnableKernelTiming)
+                    dg_tmem_empty_start = clock64();
                 shared_storage.tmem_empty_barriers[accum_stage_idx].wait(accum_phase ^ 1);
+                DG_TIMING_ADD(13, clock64() - dg_tmem_empty_start);
                 ptx::tcgen05_after_thread_sync();
 
                 // Empty barrier arrival
@@ -814,7 +869,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait TMA load completion
+                    uint64_t dg_full_barrier_start = 0;
+                    if constexpr (kEnableKernelTiming)
+                        dg_full_barrier_start = clock64();
                     shared_storage.full_barriers[stage_idx].wait(phase);
+                    DG_TIMING_ADD(12, clock64() - dg_full_barrier_start);
                     ptx::tcgen05_after_thread_sync();
 
                     const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
@@ -864,7 +923,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // To safely deconstruct barriers, we need another round of waits
             if (current_iter_idx > 0) {
                 const auto accum_phase_idx = ((current_iter_idx - 1) / kNumEpilogueStages) & 1;
+                uint64_t dg_tmem_empty_start = 0;
+                if constexpr (kEnableKernelTiming)
+                    dg_tmem_empty_start = clock64();
                 shared_storage.tmem_empty_barriers[(current_iter_idx - 1) % kNumEpilogueStages].wait(accum_phase_idx);
+                DG_TIMING_ADD(13, clock64() - dg_tmem_empty_start);
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
@@ -915,7 +978,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+            uint64_t dg_tmem_full_start = 0;
+            if constexpr (kEnableKernelTiming)
+                dg_tmem_full_start = clock64();
             shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
+            DG_TIMING_ADD(14, clock64() - dg_tmem_full_start);
             ptx::tcgen05_after_thread_sync();
 
             // Compute offsets
@@ -1211,11 +1278,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             Allocator().free(0, kNumTmemCols);
 
         // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
+        uint64_t dg_combine_barrier_start = 0;
+        if constexpr (kEnableKernelTiming)
+            dg_combine_barrier_start = clock64();
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
+        DG_TIMING_ADD(6, clock64() - dg_combine_barrier_start);
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1307,7 +1378,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     do_reduce = move_mask_and_load(load_stage_idx ^ 1);
 
                     // Accumulate
+                    uint64_t dg_combine_load_start = 0;
+                    if constexpr (kEnableKernelTiming)
+                        dg_combine_load_start = clock64();
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
+                    DG_TIMING_ADD(15, clock64() - dg_combine_load_start);
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
@@ -1351,6 +1426,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
     }
+    DG_TIMING_ADD(1, clock64() - dg_kernel_start);
+#undef DG_TIMING_ADD
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");

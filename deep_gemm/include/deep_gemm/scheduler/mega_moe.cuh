@@ -22,6 +22,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          bool kEnableKernelTiming = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -42,6 +43,7 @@ struct MegaMoEScheduler {
 
     // Arrival counts
     const layout::Workspace& workspace;
+    uint64_t* timing_base = nullptr;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -58,8 +60,21 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(
+        const layout::Workspace& workspace,
+        uint64_t* timing_base = nullptr
+    ): workspace(workspace), timing_base(timing_base) {
         block_idx = blockIdx.x;
+    }
+
+    CUTLASS_DEVICE void timing_add(int field, uint64_t value) const {
+        if constexpr (kEnableKernelTiming) {
+            if (timing_base != nullptr && threadIdx.x == 0 && value != 0) {
+                atomicAdd(
+                    reinterpret_cast<unsigned long long*>(timing_base + field),
+                    static_cast<unsigned long long>(value));
+            }
+        }
     }
 
     CUTLASS_DEVICE uint32_t get_wave_expert_end_idx() const {
@@ -189,9 +204,19 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
+                uint64_t wait_start = 0;
+                uint64_t polls = 0;
+                if constexpr (kEnableKernelTiming)
+                    wait_start = clock64();
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    if constexpr (kEnableKernelTiming)
+                        ++polls;
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                if constexpr (kEnableKernelTiming) {
+                    timing_add(2, clock64() - wait_start);
+                    timing_add(3, polls);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

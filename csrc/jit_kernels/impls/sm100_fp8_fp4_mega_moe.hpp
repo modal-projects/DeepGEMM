@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
@@ -25,6 +26,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool enable_kernel_timing;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -32,6 +34,7 @@ public:
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
+        void* kernel_timing;
 
         // Tensormap
         CUtensorMap tensor_map_l1_acts;
@@ -70,6 +73,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -87,7 +91,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.enable_kernel_timing ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -97,6 +102,7 @@ static void __instantiate_kernel() {{
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
             args.sym_buffer_ptrs,
+            args.kernel_timing,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
             args.tensor_map_l1_weights,
@@ -123,7 +129,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::optional<torch::Tensor> kernel_timing
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -189,6 +196,9 @@ static void sm100_fp8_fp4_mega_moe(
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+    uint64_t* kernel_timing_ptr = nullptr;
+    if (kernel_timing.has_value())
+        kernel_timing_ptr = reinterpret_cast<uint64_t*>(kernel_timing->data_ptr<int64_t>());
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
@@ -199,11 +209,13 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .enable_kernel_timing = kernel_timing.has_value(),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        .kernel_timing = kernel_timing_ptr,
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,
@@ -219,7 +231,11 @@ static void sm100_fp8_fp4_mega_moe(
     };
 
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
+    const auto runtime = compiler->build(
+        kernel_timing.has_value() ?
+            "sm100_fp8_fp4_mega_moe_timing" :
+            "sm100_fp8_fp4_mega_moe",
+        code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

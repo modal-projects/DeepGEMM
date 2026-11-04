@@ -128,6 +128,13 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
     alignas(128) uint32_t ib_pool_combine_idx[kNumMaxIBPoolTokens];
     alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
+    // opus design: per source node, tokens of the source this GPU proxies (written by the proxy SM); forward-combine
+    // chunk counters and completed-chunk counters per parity and remote node (local only)
+    static constexpr uint32_t kIBOMaxNodes = 16;
+    static constexpr uint32_t kIBOMaxChunks = 64;
+    alignas(128) uint32_t ib_o_nt[kIBOMaxNodes];
+    alignas(128) uint32_t ib_o_fchunk[2][kIBOMaxNodes][kIBOMaxChunks];
+    alignas(128) uint32_t ib_o_fdone[2][kIBOMaxNodes];
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 

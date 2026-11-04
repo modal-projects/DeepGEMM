@@ -343,7 +343,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             fused_y, fused_stats = run_fused()
             baseline_y, baseline_stats = run_baseline()
             assert torch.equal(fused_stats, baseline_stats)
-            assert torch.equal(fused_y, baseline_y), f'calc_diff={calc_diff(fused_y, baseline_y)}'
+            # DG_MEGA_MOE_IB_TOLERANCE=<calc_diff bound>: the opus IB design reduces node-local partials before the
+            # cross-node hop (and may send fp8), so the summation order differs from the reference; report the error
+            tol = float(os.environ.get('DG_MEGA_MOE_IB_TOLERANCE', '0'))
+            if tol > 0:
+                diff = calc_diff(fused_y, baseline_y)
+                ref = baseline_y.float()
+                err = (fused_y.float() - ref)
+                rel_rms = (err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-30)).item()
+                max_abs = err.abs().max().item()
+                bad = (~torch.isfinite(fused_y.float())).sum().item()
+                if i < 3 or (i + 1) % 10 == 0 or diff >= tol or bad:
+                    print(f'OPUS_ERR rank={rank_idx} test={i} calc_diff={diff:.3e} rel_rms={rel_rms:.3e} max_abs={max_abs:.3e} '
+                          f'ref_max={ref.abs().max().item():.3e} nonfinite={bad}', flush=True)
+                assert diff < tol and bad == 0, f'calc_diff={diff} >= {tol} (nonfinite {bad})'
+            else:
+                assert torch.equal(fused_y, baseline_y), f'calc_diff={calc_diff(fused_y, baseline_y)}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)

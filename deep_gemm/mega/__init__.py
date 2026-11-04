@@ -49,16 +49,30 @@ class SymmBuffer:
         )
         from . import ib as _ib
         if base is None and _ib.enabled():
-            # Mega MoE over IB: one NCCL window; extra tail holds per-destination combine staging
-            # (num_ranks copies of the combine buffer, see kernel `ib_combine_staging`)
-            combine_bytes = (num_topk + 1) * num_max_tokens_per_rank * hidden * 2
-            # v2a landing zone: per source rank, its input region (tokens, SF, top-k idx + weights), generous
-            landing_bytes = num_max_tokens_per_rank * (hidden * 2 + hidden // 16 + num_topk * 16 + 64) + 4096
-            # v2d combine landing: per expert rank, a contiguous chunk of up to max_tokens x top-k BF16 rows
-            combine_landing_bytes = num_max_tokens_per_rank * num_topk * hidden * 2
-            # v5a pack region: per peer, gathered rows + map with the landing layout
-            num_bytes = ((num_bytes + 127) // 128) * 128 + group.size() * (combine_bytes + landing_bytes + combine_landing_bytes + landing_bytes)
+            # Mega MoE over IB (opus design, REDESIGN_OPUS.md 3): one NCCL window; the tail holds, per node, the
+            # dispatch mirror x2 parity, the return landing x2 parity, the proxy combine buffer and the forward
+            # staging; must match the kernel's kIB* constants
+            import os as _os
+            T, H, K = num_max_tokens_per_rank, hidden, num_topk
+            a128 = lambda v: (v + 127) // 128 * 128
+            off_idx = T * H + T * (H // 32)
+            mirror_stride = a128(off_idx + T * K * 8 + T * K * 4) + 128
+            ret_stride = T * H * 2 + 128
+            node_stride = 2 * mirror_stride + 2 * ret_stride + K * T * H * 2 + T * H * 2
+            lsa_guess = int(_os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0')) or min(group.size(), torch.cuda.device_count())
+            num_nodes = (group.size() + lsa_guess - 1) // lsa_guess
+            tail = a128(num_bytes)
+            num_bytes = tail + num_nodes * node_stride
             self.buffer, self.handle = _ib.allocate(group, num_bytes)
+            assert self.handle.num_lsa_ranks >= lsa_guess or self.handle.num_lsa_ranks == group.size(), \
+                f'IB tail sized for NVLink domains of {lsa_guess}, got {self.handle.num_lsa_ranks}'
+            # Sentinels: 0xFF everywhere (fp8 / UE8M0 / f32 NaN, header ~0), INT64_MIN in the top-k idx mirrors
+            self.buffer[tail:].fill_(-1)
+            sentinel_idx = torch.full((T * K,), -2 ** 63, dtype=torch.int64, device='cuda')
+            for n in range(num_nodes):
+                for p in range(2):
+                    o = tail + n * node_stride + p * mirror_stride + off_idx
+                    self.buffer[o:o + T * K * 8].view(torch.int64).copy_(sentinel_idx)
             self.group.barrier()
             torch.cuda.synchronize()
         elif base is None:

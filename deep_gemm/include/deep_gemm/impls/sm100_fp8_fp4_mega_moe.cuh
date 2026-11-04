@@ -8,7 +8,6 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
-#include <deep_gemm/comm/gin.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/mma/sm100.cuh>
@@ -139,73 +138,58 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define IB_TRACE(i, cond) do {} while (0)
 #endif
 
-    // Mega MoE over IB: ranks outside this NVLink domain are reached with NCCL Gin (DESIGN-v1.md)
+    // Mega MoE over IB, opus design (REDESIGN_OPUS.md): counterpart forwarding. Every cross-node byte moves between
+    // GPUs with the same local index. A source puts slices of its input region into a sentinel-filled mirror on its
+    // counterpart (the proxy), which publishes counts / slot entries to its NVLink peers exactly like an NVLink
+    // source would; peers pull rows from the proxy's mirror over NVLink; L2 rows for remote sources go to the
+    // proxy's combine buffer; the proxy reduces them and returns one record per token. Readiness = data != sentinel.
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-    constexpr bool kIsIB = true;
     const auto& ib_dev_comm = *reinterpret_cast<const ncclDevComm_t*>(sym_buffer.gin_dev_comm);
     const auto ib_window = reinterpret_cast<ncclWindow_t>(sym_buffer.gin_window);
     const uint64_t ib_epoch = ptx::ld_volatile(workspace.get_ib_epoch_ptr()) + 1;
-    const auto make_gin = [&]() { return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, sm_idx); };
-    const auto is_remote = [&](const uint32_t& r) { return not sym_buffer.is_lsa(r); };
-    // Remote combine rows are staged here (one copy of the combine buffer per destination rank), then put
-    const auto ib_combine_staging = math::advance_ptr<uint8_t>(
-        sym_buffer.get_base_ptr(), math::align<int64_t>(buffer.get_num_bytes(), 128));
-    const auto ib_combine_bytes = static_cast<int64_t>(buffer.combine_token_buffer.get_num_bytes());
-    // v2a landing zone: per source rank, a copy of its contiguous input region (tokens, SF, top-k idx, weights)
-    const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
-    const auto ib_landing_bytes = math::align<int64_t>(
-        reinterpret_cast<uint8_t*>(buffer.input_topk_weights_buffer.get_end_ptr()) - ib_input_base, 128);
-    const auto ib_landing = ib_combine_staging + kNumRanks * ib_combine_bytes;
-    // v4 packed landing layout per source (same offsets as the input region for SF/idx/weights, plus a token
-    // map): [x rows packed by k][SF rows packed by k][top-k idx, whole][top-k weights, whole][map: token -> k]
-    constexpr uint32_t kIBNumLandingPieces = 5;  // x packed, SF packed, top-k idx, top-k weights, map
-    const int64_t ib_token_bytes = buffer.input_token_buffer.data_layout.template get_num_bytes<int64_t>();
-    const int64_t ib_sf_bytes = buffer.input_sf_buffer.data_layout.template get_num_bytes<int64_t>();
-    const int64_t ib_off_sf = reinterpret_cast<const uint8_t*>(buffer.input_sf_buffer.get_base_ptr()) - ib_input_base;
-    const int64_t ib_off_idx = reinterpret_cast<const uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr()) - ib_input_base;
-    const int64_t ib_off_w = reinterpret_cast<const uint8_t*>(buffer.input_topk_weights_buffer.get_base_ptr()) - ib_input_base;
-    const int64_t ib_idx_bytes = buffer.input_topk_idx_buffer.data_layout.template get_num_bytes<int64_t>();
-    const int64_t ib_w_bytes = buffer.input_topk_weights_buffer.data_layout.template get_num_bytes<int64_t>();
-    const int64_t ib_off_map = ib_landing_bytes;  // right after the mirrored input region
-    // v7 meta block: [per-expert pair counts: kIBMaxExpertsPerRank x u32][num pairs: u32, padded to 128][entries:
-    // (j | local_expert << 16, slot) x pairs]; sent first on its own signal so the receiver's tables need no scan
-    const int64_t ib_off_meta = math::align<int64_t>(ib_off_map + static_cast<int64_t>(kNumMaxTokensPerRank) * 2, 128);
-    const int64_t ib_off_meta_pairs = ib_off_meta + layout::MegaMoESignals::kIBMaxExpertsPerRank * 4;
-    const int64_t ib_off_meta_count = ib_off_meta_pairs + 4;  // v10: rows packed for this peer (chunk count)
-    const int64_t ib_off_meta_entries = ib_off_meta_pairs + 128;
-    // v10: the whole top-k weight array rides in the meta piece (entries carry the packed row index), so the only
-    // landing pieces are the streamed x/SF chunks and the meta block
-    const int64_t ib_off_meta_w = ib_off_meta_entries + static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * 8;
-    const int64_t ib_landing_stride = math::align<int64_t>(
-        ib_off_meta_w + static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * 4, 128);
-    constexpr uint32_t kIBChunkRows = layout::MegaMoESignals::kIBChunkRows;
-    DG_STATIC_ASSERT(kNumMaxTokensPerRank <= kIBChunkRows * layout::MegaMoESignals::kIBMaxChunks, "IB chunk table too small");
-    // v2d: per expert rank, a contiguous chunk of our combine rows, ordered by (token, top-k)
-    constexpr uint32_t kIBRowBytes = kHidden * sizeof(nv_bfloat16);
-    constexpr int64_t kIBCombineLandingBytes = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * kIBRowBytes;
-    DG_STATIC_ASSERT(kNumMaxTokensPerRank * kNumTopk <= 65536, "IB packs pair indices in 16 bits");
-    const auto ib_combine_landing = ib_landing + kNumRanks * ib_landing_stride;
-    // v5a: per-peer pack blocks (gathered rows + map) with the landing layout; own region, so no reuse hazard
-    const auto ib_pack = ib_combine_landing + kNumRanks * kIBCombineLandingBytes;
     const uint32_t ib_parity = static_cast<uint32_t>(ib_epoch & 1);
-    // v5b: combine rows are staged in (source, local expert, slot) order and sent per expert group as the group's
-    // last L2 row-tile lands (one put + strong signal per group and source)
-    constexpr uint32_t kIBNumCombineGroups = layout::MegaMoESignals::kIBNumCombineGroups;
-    constexpr uint32_t kIBNumL2NTiles = L2_SHAPE_N / BLOCK_N;
-    DG_STATIC_ASSERT(kNumExpertsPerRank <= layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB prefix table too small");
-    // v9: one combine group per local expert; its rows go out (one put + bundled weak signal per source) as soon
-    // as the expert's L2 tiles are staged, and the combine waits per (expert rank, local expert) of each token
-    DG_STATIC_ASSERT(kNumExpertsPerRank <= kIBNumCombineGroups and kNumExpertsPerRank <= kNumSMs, "v9 needs one posting SM per local expert");
-    const auto ib_group_of = [](const uint32_t& local_expert_idx) { return local_expert_idx; };
-    const auto ib_group_begin = [](const uint32_t& g) { return g; };
+    const uint32_t ib_lsa = sym_buffer.num_lsa_ranks;
+    const uint32_t ib_my_node = sym_buffer.rank_idx / ib_lsa;
+    const uint32_t ib_num_nodes = kNumRanks / ib_lsa;
+    const auto is_remote = [&](const uint32_t& r) { return not sym_buffer.is_lsa(r); };
+    const auto ib_cp = [&](const uint32_t& r, const uint32_t& n) { return n * ib_lsa + r % ib_lsa; };  // counterpart of r on node n
+    const auto ib_node_of_slot = [&](const uint32_t& nr) { return nr < ib_my_node ? nr : nr + 1; };     // nr-th remote node
+    const auto make_gin = [&](const uint32_t& ctx) { return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx); };
+    // Mirror layout = the upstream input region layout: x [T][H] fp8, SF [T][H/32], top-k idx [T][K] i64, weights [T][K] f32
+    constexpr int64_t kIBT = kNumMaxTokensPerRank;
+    constexpr int64_t kIBTokBytes = kHidden, kIBSFBytes = kHidden / 32;
+    constexpr int64_t kIBOffSF = kIBT * kIBTokBytes;
+    constexpr int64_t kIBOffIdx = kIBOffSF + kIBT * kIBSFBytes;
+    constexpr int64_t kIBOffW = kIBOffIdx + kIBT * kNumTopk * 8;
+    constexpr int64_t kIBOffHdr = math::constexpr_align<int64_t>(kIBOffW + kIBT * kNumTopk * 4, 128);
+    constexpr int64_t kIBMirrorStride = kIBOffHdr + 128;
+    // Return records (one per source token and remote node), forward staging, proxy combine buffer
+    constexpr int64_t kIBRecBytes = kHidden * 2;  // P1: bf16 reduced partial
+    constexpr int64_t kIBRetHdr = kIBT * kIBRecBytes;
+    constexpr int64_t kIBRetStride = kIBRetHdr + 128;
+    constexpr int64_t kIBPCombStride = static_cast<int64_t>(kNumTopk) * kIBT * kHidden * 2;
+    constexpr int64_t kIBFStageStride = kIBT * kIBRecBytes;
+    constexpr int64_t kIBNodeStride = 2 * kIBMirrorStride + 2 * kIBRetStride + kIBPCombStride + kIBFStageStride;
+    constexpr uint32_t kIBChunk = 32;  // tokens per dispatch x put and per return put
+    DG_STATIC_ASSERT(kIBT <= kIBChunk * layout::MegaMoESignals::kIBOMaxChunks, "IB chunk table");
+    const auto ib_tail = math::advance_ptr<uint8_t>(sym_buffer.get_base_ptr(), math::align<int64_t>(buffer.get_num_bytes(), 128));
+    const auto ib_mirror = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + p * kIBMirrorStride; };
+    const auto ib_ret = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + p * kIBRetStride; };
+    const auto ib_pcomb = [&](const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + 2 * kIBRetStride; };
+    const auto ib_fstage = [&](const uint32_t& n) { return ib_pcomb(n) + kIBPCombStride; };
+    const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
     const auto ib_atom_add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
         uint32_t old;
         asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(v) : "memory");
         return old;
     };
-#else
-    constexpr bool kIsIB = false;
-    constexpr int64_t ib_token_bytes = 0, ib_off_sf = 0, ib_sf_bytes = 0;  // unused without IB
+    const auto ib_ldv4 = [](const void* ptr) {
+        uint4 v;
+        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr) : "memory");
+        return v;
+    };
+    const auto ib_is_sentinel4 = [](const uint4& v) { return (v.x & v.y & v.z & v.w) == 0xffffffffu; };
+    constexpr uint64_t kIBIdxSentinel = 0x8000000000000000ull;
 #endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
@@ -290,7 +274,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier task_info_full_barriers[kNumScheduleStages];
         Barrier task_info_empty_barriers[kNumScheduleStages];
         uint32_t tmem_ptr_in_smem;
-        uint32_t ib_post_group;  // v5c: (generation << 8) | expert group whose combine rows this CTA must send
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -363,7 +346,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
-    IB_TRACE(16, sm_idx == 0 and thread_idx == 0);  // opus: kernel start (after the cluster sync)
+    IB_TRACE(16, sm_idx == 0 and thread_idx == 0);
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -379,9 +362,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.task_info_empty_barriers,
             shared_storage.task_infos
     );
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-    scheduler.set_ib(sym_buffer.num_lsa_ranks, sym_buffer.rank_idx, ib_epoch);
-#endif
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -405,11 +385,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
-    #ifndef DG_MEGA_MOE_IB_KEEP_REGS
-#define DG_MEGA_MOE_IB_KEEP_REGS 0
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    constexpr bool kIsIB = true;
+#else
+    constexpr bool kIsIB = false;
 #endif
-    // Gin state needs dispatch registers; DG_MEGA_MOE_IB_KEEP_REGS=1 keeps the upstream split (perf experiment)
-    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64 and (not kIsIB or DG_MEGA_MOE_IB_KEEP_REGS);
+    // IB: the dispatch warps hold Gin state and the row poll/copy; keep the 96-register split
+    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64 and not kIsIB;
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;
@@ -450,91 +432,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         };
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v4: packed push. Gather: every dispatch warp handles tokens t = sm * warps + warp + k * SMs * warps; for
-        // each remote rank p in the token's top-k it takes slot k = pack_count[p]++ and copies the token row and SF
-        // row into our own landing slot (ib_landing + rank * stride, unused locally) at packed index k, and records
-        // map[p][t] = k. After the dispatch grid sync, SM (p + kNumRanks * piece) puts piece `piece` to p with one
-        // strong signal each (5 pieces): packed x block, packed SF block, whole top-k idx, whole weights, map.
-        DG_STATIC_ASSERT(kNumRanks <= 32, "IB push keeps a peer bitmask in 32 bits");
-        DG_STATIC_ASSERT(kNumMaxTokensPerRank <= 65535, "IB landing map holds 16-bit packed indices");
-#ifndef DG_MEGA_MOE_IB_DIAG
-#define DG_MEGA_MOE_IB_DIAG 0
-#endif
+        // D0: post the slices of our input region to the mirror of our slot on each counterpart. Pieces per remote
+        // node: 0 header (epoch | num_tokens), 1 top-k idx, 2 weights, 3 SF, 4.. x rows in chunks of kIBChunk.
+        // Data-only puts; nothing to wait for (the input region is written before the launch). One SM per piece.
         {
-            const auto own_topk = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-            const uint32_t parity = static_cast<uint32_t>(ib_epoch & 1);
-            for (uint32_t t = sm_idx * kNumDispatchWarps + warp_idx; t < num_tokens; t += kNumSMs * kNumDispatchWarps) {
-                const int e = lane_idx < kNumTopk ? static_cast<int>(own_topk[t * kNumTopk + lane_idx]) : -1;
-                const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0;
-                const bool pair_remote = e >= 0 and is_remote(r);
-                const uint32_t bit = pair_remote ? (1u << r) : 0u;
-                uint32_t peers = __reduce_or_sync(0xffffffff, bit);
-                // v7: every remote pair takes a slot in its (peer, expert) list and an entry in the peer's meta block;
-                // the slot is also parked in ib_combine_idx[j] (finalized with the per-expert prefix after the sync)
-                uint32_t my_kk = 0;  // v10: packed row index of this token at my pair's peer
-                while (peers != 0) {
-                    const uint32_t p = __ffs(peers) - 1;
-                    peers &= peers - 1;
-                    uint32_t kk = 0;
-                    if (lane_idx == 0)
-                        kk = atomicAdd(workspace.get_ib_pack_count_ptr(parity, p), 1u);
-                    kk = __shfl_sync(0xffffffff, kk, 0);
-                    if (pair_remote and r == p)
-                        my_kk = kk;
-                    // peer p's pack block (dedicated region since v5a), laid out like p's landing copy of our region
-                    const auto stage_p = ib_pack + p * ib_landing_stride;
-                    const auto src_x = ib_input_base + t * ib_token_bytes;
-                    const auto dst_x = stage_p + static_cast<int64_t>(kk) * ib_token_bytes;
-                    for (int64_t o = lane_idx * 16; o < ib_token_bytes; o += 32 * 16)
-                        *reinterpret_cast<int4*>(dst_x + o) = *reinterpret_cast<const int4*>(src_x + o);
-                    if (ib_sf_bytes > 0) {
-                        const auto src_sf = ib_input_base + ib_off_sf + t * ib_sf_bytes;
-                        const auto dst_sf = stage_p + ib_off_sf + static_cast<int64_t>(kk) * ib_sf_bytes;
-                        for (int64_t o = lane_idx * 16; o < ib_sf_bytes; o += 32 * 16)
-                            *reinterpret_cast<int4*>(dst_sf + o) = *reinterpret_cast<const int4*>(src_sf + o);
-                    }
-                    // v10: the warp that completes a chunk of kIBChunkRows packed rows for p sends it now: one put
-                    // + bundled weak signal per piece (x, SF) on p's (our rank, chunk) word; the other warps' rows
-                    // were released by their acq_rel adds, ours by the fence
-                    __syncwarp();
-                    if (lane_idx == 0) {
-                        __threadfence();
-                        const uint32_t c = kk / kIBChunkRows;
-                        if (ib_atom_add_acq_rel(workspace.get_ib_chunk_fill_ptr(parity, p, c), 1u) + 1 == kIBChunkRows) {
-                            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, p);
-                            const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
-                            const int64_t r0 = static_cast<int64_t>(c) * kIBChunkRows;
-                            gin.put_signal_weak(dst + r0 * ib_token_bytes, stage_p + r0 * ib_token_bytes,
-                                                static_cast<uint64_t>(kIBChunkRows) * ib_token_bytes, p,
-                                                workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, c));
-                            if (ib_sf_bytes > 0)
-                                gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
-                                                    static_cast<uint64_t>(kIBChunkRows) * ib_sf_bytes, p,
-                                                    workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, c));
-                            // v10b/c: no flush (it stalls the gather ~tens of us per chunk); sources are a dedicated
-                            // pack region rewritten only by the next launch (see the note after the grid sync)
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
-                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(kIBChunkRows) * (ib_token_bytes + ib_sf_bytes));
-#endif
+            const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
+            const uint32_t num_pieces = 4 + num_x_chunks;
+            for (uint32_t q = kNumSMs - 1 - sm_idx; q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {  // last SMs first (SM 0 has upstream roles)
+                if (warp_idx == 0 and lane_idx == 0) {
+                    const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
+                    const uint32_t c = ib_cp(sym_buffer.rank_idx, n);
+                    const auto gin = make_gin(q);
+                    const auto dst = ib_mirror(ib_parity, ib_my_node);
+                    if (piece == 0) {
+                        gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, c);
+                    } else if (num_tokens > 0) {
+                        int64_t off = 0, bytes = 0;
+                        if (piece == 1) off = kIBOffIdx, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 8;
+                        else if (piece == 2) off = kIBOffW, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 4;
+                        else if (piece == 3) off = kIBOffSF, bytes = static_cast<int64_t>(num_tokens) * kIBSFBytes;
+                        else {
+                            const uint32_t t0 = (piece - 4) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
+                            off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                         }
+                        gin.put(dst + off, ib_input_base + off, static_cast<uint64_t>(bytes), c);
                     }
-                    __syncwarp();
                 }
-                if (pair_remote) {
-                    const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                    const uint32_t j = t * kNumTopk + lane_idx;
-                    const uint32_t slot = atomicAdd(workspace.get_ib_pack_slot_ptr(parity, r, le), 1u);
-                    const uint32_t idx = atomicAdd(workspace.get_ib_pack_pairs_ptr(parity, r), 1u);
-                    auto entries = reinterpret_cast<uint32_t*>(ib_pack + r * ib_landing_stride + ib_off_meta_entries);
-                    entries[2 * idx] = j | (le << 16);
-                    entries[2 * idx + 1] = slot | (my_kk << 16);  // v10: slot and the packed row index
-                    *workspace.get_ib_combine_idx_ptr(j) = slot;
-                }
+                __syncwarp();
+            }
+            // Next launch's forward-combine counters (the other parity was last used by the previous launch)
+            if (sm_idx == 1) {
+                for (uint32_t i = thread_idx; i < layout::MegaMoESignals::kIBOMaxNodes * layout::MegaMoESignals::kIBOMaxChunks; i += kNumDispatchThreads)
+                    workspace.signals->ib_o_fchunk[ib_parity ^ 1][i / layout::MegaMoESignals::kIBOMaxChunks][i % layout::MegaMoESignals::kIBOMaxChunks] = 0;
+                if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
+                    workspace.signals->ib_o_fdone[ib_parity ^ 1][thread_idx] = 0;
             }
         }
-#endif
         IB_TRACE(0, sm_idx == 0 and thread_idx == 0);
+#endif
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -558,112 +493,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             if (is_remote(dst_rank_idx))
-                return;  // v2c: the receiver builds this entry from our landing copy
+                return;  // the counterpart (proxy) on that node writes this entry
 #endif
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // (v2a': no per-SM signals; SM 0 signals once per Gin context after the grid sync + its count puts)
-#endif
 
-        IB_TRACE(1, sm_idx == 0 and thread_idx == 0);  // index work done (before the grid sync)
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
 
-        IB_TRACE(10, sm_idx == 0 and thread_idx == 0);  // after the dispatch grid sync
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v4: the gather above is complete grid-wide. Reset the other parity's pack counters (used by the next
-        // launch), then SM (peer + kNumRanks * piece) puts piece `piece` of our packed region to `peer` + one
-        // strong signal on context `piece`
-        if (sm_idx == 0 and thread_idx < kNumRanks)
-            *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1) ^ 1u, thread_idx) = 0;
-        if (sm_idx == 0 and thread_idx < kNumExpertsPerRank) {
-            *workspace.get_ib_group_total_ptr(ib_parity ^ 1u, thread_idx) = 0;
-            *workspace.get_ib_group_done_ptr(ib_parity ^ 1u, thread_idx) = 0;
-        }
-        if (sm_idx == 1) {  // v7: next launch's per-(peer, expert) slot counters and pair counters
-            for (uint32_t i = thread_idx; i < kNumRanks * kNumExpertsPerRank; i += kNumDispatchThreads)
-                *workspace.get_ib_pack_slot_ptr(ib_parity ^ 1u, i / kNumExpertsPerRank, i % kNumExpertsPerRank) = 0;
-            if (thread_idx < kNumRanks)
-                *workspace.get_ib_pack_pairs_ptr(ib_parity ^ 1u, thread_idx) = 0;
-            constexpr uint32_t kIBNumChunkSlots = (kNumMaxTokensPerRank + kIBChunkRows - 1) / kIBChunkRows;
-            for (uint32_t i = thread_idx; i < kNumRanks * kIBNumChunkSlots; i += kNumDispatchThreads)
-                *workspace.get_ib_chunk_fill_ptr(ib_parity ^ 1u, i / kIBNumChunkSlots, i % kIBNumChunkSlots) = 0;
-        }
-        DG_STATIC_ASSERT(kNumRanks <= kNumSMs, "Insufficient SMs for IB landing pieces");
-        if (sm_idx < kNumRanks and is_remote(sm_idx)) {
-            // EP32-capable layout: SM `peer` posts every piece of our packed region to `peer`, one piece per
-            // dispatch warp (lane 0): 0 x packed, 1 SF packed, 2 top-k idx, 3 weights, 4 map (+count), 5 meta
-            const uint32_t peer = sm_idx;
-            const auto stage_p = ib_pack + peer * ib_landing_stride;
-            const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
-            const int64_t cnt = *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1), peer);
-            auto counts = reinterpret_cast<uint32_t*>(stage_p + ib_off_meta);
-            if (thread_idx < kNumExpertsPerRank)
-                counts[thread_idx] = *workspace.get_ib_pack_slot_ptr(ib_parity, peer, thread_idx);
-            const uint32_t npairs = *workspace.get_ib_pack_pairs_ptr(ib_parity, peer);
-            if (thread_idx == 0) {
-                *reinterpret_cast<uint32_t*>(stage_p + ib_off_meta_pairs) = npairs;
-                *reinterpret_cast<uint32_t*>(stage_p + ib_off_meta_count) = static_cast<uint32_t>(cnt);
-            }
-            // v10: the top-k weights ride in the meta block
-            for (uint32_t i = thread_idx; i < num_tokens * kNumTopk; i += kNumDispatchThreads)
-                reinterpret_cast<float*>(stage_p + ib_off_meta_w)[i] = reinterpret_cast<const float*>(ib_input_base + ib_off_w)[i];
-            __threadfence();
-            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            if (lane_idx == 0) {
-                // v10: warp 0 sends the partial last chunk (full chunks went out during the gather), warp 1 the
-                // meta block; every piece is one put with its own bundled weak signal
-                const uint32_t full = static_cast<uint32_t>(cnt) / kIBChunkRows, rem = static_cast<uint32_t>(cnt) % kIBChunkRows;
-                if (warp_idx == 0 and rem > 0) {
-                    const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, peer);
-                    const int64_t r0 = static_cast<int64_t>(full) * kIBChunkRows;
-                    gin.put_signal_weak(dst + r0 * ib_token_bytes, stage_p + r0 * ib_token_bytes,
-                                        static_cast<uint64_t>(rem) * ib_token_bytes, peer,
-                                        workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, full));
-                    if (ib_sf_bytes > 0)
-                        gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
-                                            static_cast<uint64_t>(rem) * ib_sf_bytes, peer,
-                                            workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, full));
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
-                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(rem) * (ib_token_bytes + ib_sf_bytes));
-#endif
-                }
-                if (warp_idx == (kNumDispatchWarps > 1 ? 1u : 0u)) {
-                    const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, peer + 1);
-                    const int64_t size = (ib_off_meta_w - ib_off_meta) + static_cast<int64_t>(num_tokens) * kNumTopk * 4;
-                    gin.put_signal_weak(dst + ib_off_meta, stage_p + ib_off_meta, static_cast<uint64_t>(size), peer,
-                                        workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx));
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
-                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
-#endif
-                }
-            }
-            __syncwarp();
-        }
-        // v10c: no flush at all. The pack blocks are a dedicated region (v5a), rewritten only by the NEXT launch's
-        // gather, and the next launch cannot start before every put of this one has landed at its receiver (the
-        // receivers' combine rows, which this launch waits for, are posted after their L2, which needed our rows).
-        // (v10b's per-context flush here cost ~60-70 us: it waits for every in-flight put on the context.)
-#endif
-
         // Write expert count
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                if (is_remote(thread_idx))
-                    ;  // v2c: remote readiness uses ib_combine_ready
-                else
+            if (thread_idx < kNumRanks and not is_remote(thread_idx))
+#else
+            if (thread_idx < kNumRanks)
 #endif
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
-            }
             __syncwarp();
 
             #pragma unroll
@@ -673,7 +523,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (is_remote(dst_rank_idx))
-                    continue;  // v2c: the receiver counts our tokens from the landing copy
+                    continue;  // published by the proxy on that node
 #endif
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
@@ -682,134 +532,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
             }
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // v2c: our token count, on context 0 like the landing put; the pre-pull barrier's strong signal
-            // (also SM 0, context 0) settles both at each remote rank
-            // v2h: one lane per peer (each peer is its own QP, so lanes do not contend; v2f's one-lane loop
-            // serialized ~5 us per op)
-            // v5a: the count put moved into the map landing piece
-#endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        IB_TRACE(11, sm_idx == 0 and thread_idx == 0);  // counts written, about to enter the pre-pull barrier
         // Barrier before pulling
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v5a: NVLink part only; remote readiness (counts + landing data) is proven by the landing signals
+        // NVLink part only: proxied sources publish their entries through the count-arrival protocol (release)
         comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            make_gin, ib_epoch, false, true, false);
+            [&]() { return make_gin(0); }, ib_epoch, false, true, false);
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
-        // v3e: SM r (one per remote source) builds the counts/index table for source r: warp 0 scans r's landing
-        // top-k (a), warp 1 (or warp 0 after it) scans our own top-k for pairs routed to r (b); each SM then adds 1
-        // to ib_counts_ready, which reaches epoch * num_remote once every source is done (the scheduler waits on it).
-        if (sm_idx < kNumRanks and is_remote(sm_idx)) {
-            const auto ib_topk_offset = reinterpret_cast<uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr()) - ib_input_base;
-            const uint32_t r = sm_idx;
-            const bool do_a = warp_idx == 0, do_b = kNumDispatchWarps > 1 ? warp_idx == 1 : warp_idx == 0;
-            constexpr uint32_t kIBScanUnroll = 8;
-            if (do_a) {
-                // v7 (a): source r's meta piece carries its per-expert pair counts and the (pair, expert, slot)
-                // table: no scan of its top-k is needed. Counts -> expert_recv_count / prefix / group totals;
-                // entries -> src_token_topk_idx(expert, r, slot) = pair.
-                while (ptx::ld_acq_sys(workspace.get_ib_meta_ready_ptr(r)) != ib_epoch);
-                const auto meta = ib_landing + r * ib_landing_stride;
-                const auto counts = reinterpret_cast<const uint32_t*>(meta + ib_off_meta);
-                const uint32_t npairs = *reinterpret_cast<const uint32_t*>(meta + ib_off_meta_pairs);
-                const auto entries = reinterpret_cast<const uint32_t*>(meta + ib_off_meta_entries);
-                for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
-                    *workspace.get_expert_recv_count_ptr(r, e) = counts[e];
-                for (uint32_t i = lane_idx; i < npairs; i += 32) {
-                    const uint32_t e0 = entries[2 * i], s1 = entries[2 * i + 1];
-                    // v10: (packed row index << 16) | pair index
-                    *workspace.get_src_token_topk_idx_ptr(e0 >> 16, r, s1 & 0xffffu) = (e0 & 0xffffu) | (s1 & 0xffff0000u);
-                }
-                {
-                    // v10: pieces expected per chunk of source r this launch (x + SF per chunk)
-                    const uint32_t cnt_r = *reinterpret_cast<const uint32_t*>(meta + ib_off_meta_count);
-                    const uint32_t pieces = ib_sf_bytes > 0 ? 2u : 1u;
-                    for (uint32_t c = lane_idx; c < (cnt_r + kIBChunkRows - 1) / kIBChunkRows; c += 32)
-                        *workspace.get_ib_chunk_expected_ptr(r, c) += pieces;
-                }
-                if (lane_idx == 0)
-                    *workspace.get_ib_pairs_from_ptr(r) = npairs;
-                __syncwarp();
-                // exclusive prefix of the per-expert counts = row offset of (r, expert) in the combine staging;
-                // the group totals count row-tiles (rows x L2 N tiles) the epilogue will stage
-                {
-                    uint32_t run = 0;
-                    for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
-                        const uint32_t e = e0 + lane_idx;
-                        const uint32_t c = e < kNumExpertsPerRank ? counts[e] : 0u;
-                        uint32_t incl = c;
-                        #pragma unroll
-                        for (uint32_t d = 1; d < 32; d <<= 1) {
-                            const uint32_t v = __shfl_up_sync(0xffffffff, incl, d);
-                            if (lane_idx >= d) incl += v;
-                        }
-                        if (e < kNumExpertsPerRank) {
-                            *workspace.get_ib_src_prefix_ptr(r, e) = run + incl - c;
-                            if (c > 0)
-                                atomicAdd(workspace.get_ib_group_total_ptr(ib_parity, ib_group_of(e)), c * kIBNumL2NTiles);
-                        }
-                        run += __shfl_sync(0xffffffff, incl, 31);
-                    }
-                    if (lane_idx == 0)
-                        *workspace.get_ib_src_prefix_ptr(r, kNumExpertsPerRank) = run;
-                }
-            }
-            if (do_b) {
-                // v7 (b): our pairs routed to rank r already hold their slot in ib_combine_idx (gather); add the
-                // per-expert prefix of OUR pair counts to r (final after the dispatch grid sync) and count the groups
-                // r will signal us for
-                const auto own = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-                auto* scratch_pre = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[kNumRanks + r]);
-                DG_STATIC_ASSERT(layout::MegaMoESignals::kNumIBScratchBytes >= 4 * layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB scratch too small");
-                DG_STATIC_ASSERT(2 * kNumRanks <= layout::MegaMoESignals::kNumMaxIBScratchSlots, "IB scratch slots");
-                uint32_t run = 0;
-                for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
-                    const uint32_t e = e0 + lane_idx;
-                    const uint32_t c = e < kNumExpertsPerRank ? *workspace.get_ib_pack_slot_ptr(ib_parity, r, e) : 0u;
-                    uint32_t incl = c;
-                    #pragma unroll
-                    for (uint32_t d = 1; d < 32; d <<= 1) {
-                        const uint32_t v = __shfl_up_sync(0xffffffff, incl, d);
-                        if (lane_idx >= d) incl += v;
-                    }
-                    if (e < kNumExpertsPerRank) {
-                        scratch_pre[e] = run + incl - c;
-                        // v9: rank r will send expert e's rows for our pairs with one weak-signalled put
-                        if (c > 0)
-                            *workspace.get_ib_combine_expected_e_ptr(r, e) += 1;
-                    }
-                    run += __shfl_sync(0xffffffff, incl, 31);
-                }
-                __syncwarp();
-                constexpr uint32_t kIBScanUnroll2 = 8;
-                for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll2) {
-                  int es[kIBScanUnroll2];
-                  #pragma unroll
-                  for (uint32_t u = 0; u < kIBScanUnroll2; ++u) {
-                    const uint32_t j = base0 + u * 32 + lane_idx;
-                    es[u] = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
-                  }
-                  #pragma unroll
-                  for (uint32_t u = 0; u < kIBScanUnroll2; ++u) {
-                    const uint32_t j = base0 + u * 32 + lane_idx;
-                    const int e = es[u];
-                    if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r)
-                        *workspace.get_ib_combine_idx_ptr(j) += scratch_pre[static_cast<uint32_t>(e) % kNumExpertsPerRank];
-                  }
-                }
-            }
-            __threadfence();
-            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            if (thread_idx == 0)
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.get_ib_counts_ready_ptr()), 1ull);
-            IB_TRACE(3, thread_idx == 0 and sm_idx == (sym_buffer.is_lsa(0) ? sym_buffer.num_lsa_ranks : 0));
-        }
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
@@ -838,13 +572,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        asm volatile("fence.proxy.async.global;" ::: "memory");
+        __threadfence_system();  // acquire: pairs with the proxy's fence before its count add (entries, per-source counts)
+        IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
 #endif
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        uint32_t ib_last_src = 0xffffffffu, ib_last_chunk = 0;  // v10: last (source, chunk) this warp saw land
-#endif
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
@@ -927,17 +659,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
-            const uint32_t src_entry = *workspace.get_src_token_topk_idx_ptr(
+            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
-            const uint32_t src_token_topk_idx = src_entry & 0xffffu;  // v10: remote entries carry the packed row index above
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if (is_remote(current_rank_in_expert_idx)) {
-                // v5b: this row's staging index = prefix of (source, local expert) + slot (pair order on both sides)
-                if (cute::elect_one_sync())
-                    *workspace.get_ib_pool_combine_idx_ptr(expert_pool_block_offset * BLOCK_M + (token_idx - expert_start_idx)) =
-                        *workspace.get_ib_src_prefix_ptr(current_rank_in_expert_idx, current_expert_idx) + token_idx_in_rank;
-            }
-#endif
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -958,42 +681,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
-            // Remote-node sources: read the landing copy pushed at kernel start (v2a); same-node: NVLink peer
-            const auto src_ptr = [&](auto local_ptr) {  // whole arrays (top-k weights): mirrored offset
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                if (is_remote(current_rank_in_expert_idx)) {
-                    using ptr_t = decltype(local_ptr);
-                    const auto offset = reinterpret_cast<const uint8_t*>(local_ptr) - ib_input_base;
-                    return reinterpret_cast<ptr_t>(ib_landing + current_rank_in_expert_idx * ib_landing_stride + offset);
+            // D2: a source on another node is pulled from its counterpart's mirror over NVLink; the load is the poll
+            const bool ib_rem = is_remote(current_rank_in_expert_idx);
+            const uint32_t ib_proxy = ib_rem ? ib_cp(current_rank_in_expert_idx, ib_my_node) : current_rank_in_expert_idx;
+            const auto ib_mir = ib_mirror(ib_parity, current_rank_in_expert_idx / ib_lsa);
+            const auto src_base_ptr = ib_rem ?
+                sym_buffer.map(ib_mir + static_cast<int64_t>(src_token_idx) * kIBTokBytes, ib_proxy) :
+                sym_buffer.map(reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()), current_rank_in_expert_idx);
+            if (ib_rem) {
+                // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
+                DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
+                #pragma unroll
+                for (uint32_t u = 0; u < kIBTokBytes / (32 * 16); u += 2) {
+                    const uint32_t o0 = (u * 32 + lane_idx) * 16, o1 = ((u + 1) * 32 + lane_idx) * 16;
+                    uint4 v0 = ib_ldv4(src_base_ptr + o0);
+                    uint4 v1 = (u + 1) * 32 * 16 < kIBTokBytes ? ib_ldv4(src_base_ptr + o1) : uint4{0, 0, 0, 0};
+                    while (ib_is_sentinel4(v0)) v0 = ib_ldv4(src_base_ptr + o0);
+                    while (ib_is_sentinel4(v1)) v1 = ib_ldv4(src_base_ptr + o1);
+                    *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o0) = v0;
+                    if ((u + 1) * 32 * 16 < kIBTokBytes)
+                        *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o1) = v1;
                 }
-#endif
-                return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
-            };
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // v10: token / SF rows of remote sources arrive in chunks with their own weak signals; wait for the
-            // chunk holding this row (cached per warp: consecutive rows usually share it)
-            const uint32_t ib_packed = is_remote(current_rank_in_expert_idx) ? (src_entry >> 16) : 0u;
-            if (is_remote(current_rank_in_expert_idx)) {
-                const uint32_t c = ib_packed / kIBChunkRows;
-                if (current_rank_in_expert_idx != ib_last_src or c != ib_last_chunk) {
-                    const auto ready_ptr = workspace.get_ib_chunk_ready_ptr(current_rank_in_expert_idx, c);
-                    const uint64_t want = *workspace.get_ib_chunk_expected_ptr(current_rank_in_expert_idx, c);
-                    while (ptx::ld_acq_sys(ready_ptr) < want);
-                    ib_last_src = current_rank_in_expert_idx; ib_last_chunk = c;
-                }
+                asm volatile("fence.proxy.async.global;" ::: "memory");  // generic stores, read by the GEMM's TMA
             }
+#else
+            constexpr bool ib_rem = false;
+            const auto src_base_ptr = sym_buffer.map(
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
 #endif
-            const auto src_row_ptr = [&](auto local_ptr, const int64_t& off, const int64_t& row_bytes) {
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                if (is_remote(current_rank_in_expert_idx)) {
-                    using ptr_t = decltype(local_ptr);
-                    return reinterpret_cast<ptr_t>(ib_landing + current_rank_in_expert_idx * ib_landing_stride + off + ib_packed * row_bytes);
-                }
-#endif
-                return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
-            };
-            const auto src_base_ptr = src_row_ptr(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), 0, ib_token_bytes);
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -1003,7 +719,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cute::tma_store_arrive();
                 ptx::tma_store_wait<0>();
             };
-            if (cute::elect_one_sync()) {
+            if (not ib_rem and cute::elect_one_sync()) {
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumChunks; ++ i) {
                     ptx::tma_load_1d(
@@ -1019,19 +735,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Load the weight first, so that its remote latency overlaps with the SF copy below
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            const auto weight = is_remote(current_rank_in_expert_idx) ?
-                reinterpret_cast<const float*>(ib_landing + current_rank_in_expert_idx * ib_landing_stride + ib_off_meta_w)[src_token_topk_idx] :
+            // (proxied weights were polled by the proxy before it published the counts)
+            const auto weight = ib_rem ?
+                *sym_buffer.map(reinterpret_cast<const float*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy) :
                 *sym_buffer.map(buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
 #else
-            const auto weight = *src_ptr(
-                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx);
+            const auto weight = *sym_buffer.map(
+                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                current_rank_in_expert_idx);
 #endif
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = src_row_ptr(
-                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(), ib_off_sf, ib_sf_bytes);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            const auto remote_sf_ptr = ib_rem ?
+                sym_buffer.map(reinterpret_cast<uint32_t*>(ib_mir + kIBOffSF + static_cast<int64_t>(src_token_idx) * kIBSFBytes), ib_proxy) :
+                sym_buffer.map(buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(), current_rank_in_expert_idx);
+#else
+            const auto remote_sf_ptr = sym_buffer.map(
+                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
+                current_rank_in_expert_idx);
+#endif
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
@@ -1040,8 +765,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if (j < kNumSFUint32) {
+                    uint32_t sf = ib_rem ? ptx::ld_volatile(remote_sf_ptr + j) : remote_sf_ptr[j];
+                    while (ib_rem and sf == 0xffffffffu)  // four NaN UE8M0 scales: not landed yet
+                        sf = ptx::ld_volatile(remote_sf_ptr + j);
+                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf;
+                }
+#else
                 if (j < kNumSFUint32)
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+#endif
             }
             __syncwarp();
 
@@ -1054,7 +788,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
                 // Complete last chunk's store
-                issue_and_wait_pull_store(kNumChunks - 1);
+                if (not ib_rem)
+                    issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
@@ -1064,43 +799,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
-        IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v8: the dispatch warps are idle from here until the cleanup; SM g (g < groups) waits for expert group g's
-        // staged row-tiles to reach the group total, then its warps send the group's rows to the remote sources
-        // (warp w: sources w, w + warps, ...; one put + one strong signal each), off the epilogue's critical path
-        if (sm_idx < kNumExpertsPerRank) {
-            const uint32_t g = sm_idx;
-            const uint32_t total = ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g));
-            if (total > 0) {
-                if (thread_idx == 0)
-                    while (ptx::ld_acq(workspace.get_ib_group_done_ptr(ib_parity, g)) < total)
-                        __nanosleep(256);
-                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-                const uint32_t gb = ib_group_begin(g), ge = ib_group_begin(g + 1);
-                if (lane_idx == 0) {
-                    const auto gin = make_gin();
-                    for (uint32_t s = warp_idx; s < kNumRanks; s += kNumDispatchWarps) {
-                        if (not is_remote(s))
-                            continue;
-                        const uint32_t r0 = *workspace.get_ib_src_prefix_ptr(s, gb), r1 = *workspace.get_ib_src_prefix_ptr(s, ge);
-                        if (r1 > r0) {
-                            // v9: one NIC op: the put plus a weak signal on (our rank, expert g) at the source
-                            gin.put_signal_weak(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes + static_cast<int64_t>(r0) * kIBRowBytes,
-                                                ib_combine_staging + s * ib_combine_bytes + static_cast<int64_t>(r0) * kIBRowBytes,
-                                                static_cast<uint64_t>(r1 - r0) * kIBRowBytes, s,
-                                                workspace.get_ib_combine_ready_e_ptr(sym_buffer.rank_idx, g));
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
-                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(r1 - r0) * kIBRowBytes);
-#endif
-                        }
-                    }
-                }
-                __syncwarp();
-            }
-        }
-#endif
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1126,12 +824,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Other SMs: clean blocks
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 // Read expert token count before clearing
-                auto num_recv_tokens = static_cast<uint32_t>(
+                const auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                for (uint32_t r = 0; r < kNumRanks; ++ r)
-                    num_recv_tokens += is_remote(r) ? static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(r, i)) : 0u;
-#endif
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 // Compute expert pool block offset
@@ -1168,11 +862,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Wait for all ranks to finish cleaning
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // NVLink part only: cross-node reuse is ordered by parity + the mandatory headers (REDESIGN_OPUS.md 6)
         comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            make_gin, ib_epoch, true, false);
+            [&]() { return make_gin(0); }, ib_epoch, true, false, false);
+        // E: re-arm the mirrors of this parity. Every node-local pull from them is done (barrier above); the
+        // forward-combine polled every row (fdone), so every byte the NIC wrote this launch has landed (rule A)
+        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+            const uint32_t n = ib_node_of_slot(nr);
+            const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+            const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
+            if (thread_idx == 0)
+                while (ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks);
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            const auto mir = ib_mirror(ib_parity, n);
+            const uint32_t gtid = sm_idx * kNumDispatchThreads + thread_idx;
+            constexpr uint32_t kGThreads = kNumSMs * kNumDispatchThreads;
+            const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+            const uint4 idx_sentinel = {0u, 0x80000000u, 0u, 0x80000000u};
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBTokBytes / 16; u += kGThreads)
+                reinterpret_cast<uint4*>(mir)[u] = ones;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBSFBytes / 16; u += kGThreads)
+                reinterpret_cast<uint4*>(mir + kIBOffSF)[u] = ones;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk * 8 / 16; u += kGThreads)
+                reinterpret_cast<uint4*>(mir + kIBOffIdx)[u] = idx_sentinel;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk; u += kGThreads)
+                reinterpret_cast<uint32_t*>(mir + kIBOffW)[u] = 0xffffffffu;
+            if (gtid == 0)
+                *reinterpret_cast<uint64_t*>(mir + kIBOffHdr) = ~0ull;
+        }
+        IB_TRACE(17, sm_idx == 0 and thread_idx == 0);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+        if (sm_idx == 0 and thread_idx == 0)
+            workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
+#endif
+        if (sm_idx == 0 and thread_idx == 0)
+            *workspace.get_ib_epoch_ptr() = ib_epoch;
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
@@ -1181,15 +908,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
-#endif
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        IB_TRACE(17, sm_idx == 0 and thread_idx == 0);  // opus: cleanup barrier done
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-        if (sm_idx == 0 and thread_idx == 0)
-            workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
-#endif
-        if (sm_idx == 0 and thread_idx == 0)
-            *workspace.get_ib_epoch_ptr() = ib_epoch;
 #endif
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
@@ -1458,12 +1176,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // GEMM epilogue warps
         const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        uint32_t ib_post_seen = 0;
-        if (epilogue_warp_idx == 0 and lane_idx == 0)
-            shared_storage.ib_post_group = 0;
-        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-#endif
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
         const auto epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
         const auto warp_idx_in_wg = epilogue_warp_idx % 4;
@@ -1482,6 +1194,71 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(WG_BLOCK_M % STORE_BLOCK_M_L1 == 0 and WG_BLOCK_M % STORE_BLOCK_M_L2 == 0, "Invalid warpgroup block M");
         DG_STATIC_ASSERT(STORE_BLOCK_M_L1 % ATOM_M == 0 and STORE_BLOCK_M_L2 % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // D1 (proxy-dispatch): the last SMs' epilogue warps (idle until the first task, which needs these counts)
+        // act for the counterpart source of one remote node each: poll its header, top-k idx and weights in the
+        // mirror, assign slots deterministically in pair order, write the entries and per-source counts into the
+        // node's tables over NVLink, then publish with the upstream count-arrival add (kNumSMs << 32 | count).
+        if (sm_idx + ib_num_nodes >= kNumSMs + 1) {
+            const uint32_t n = ib_node_of_slot(kNumSMs - 1 - sm_idx);
+            const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
+            const auto mir = ib_mirror(ib_parity, n);
+            const auto hdr = reinterpret_cast<const uint64_t*>(mir + kIBOffHdr);
+            uint64_t h = 0;
+            comm::wait_until([&]() { h = ptx::ld_volatile(hdr); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
+                if (epilogue_thread_idx == 0)
+                    printf("DeepGEMM IB proxy header timeout: rank=%u, source=%u, header=%llx, epoch=%llu\n",
+                           sym_buffer.rank_idx, s, (unsigned long long) h, (unsigned long long) ib_epoch);
+            });
+            const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
+            const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
+            const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
+            for (uint32_t i = epilogue_thread_idx; i < nt * kNumTopk; i += kNumEpilogueThreads) {
+                while (ptx::ld_volatile(idx + i) == kIBIdxSentinel);
+                while (ptx::ld_volatile(wts + i) == 0xffffffffu);
+            }
+            auto cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+            const uint32_t num_node_experts = ib_lsa * kNumExpertsPerRank;
+            DG_DEVICE_ASSERT(num_node_experts * 4 <= sizeof(shared_storage.smem_d));
+            for (uint32_t i = epilogue_thread_idx; i < num_node_experts; i += kNumEpilogueThreads)
+                cnt[i] = 0;
+            if (epilogue_thread_idx == 0)
+                workspace.signals->ib_o_nt[n] = nt;
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if (epilogue_warp_idx == 0) {
+                for (uint32_t b = 0; b < nt * kNumTopk; b += 32) {
+                    const uint32_t j = b + lane_idx;
+                    const int e = j < nt * kNumTopk ? static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + j))) : -1;
+                    const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
+                    const bool on = e >= 0 and r / ib_lsa == ib_my_node;
+                    const uint32_t key = on ? static_cast<uint32_t>(e) : (0x80000000u | lane_idx);
+                    const uint32_t m = __match_any_sync(0xffffffffu, key);
+                    const uint32_t pre = __popc(m & ((1u << lane_idx) - 1u));
+                    const uint32_t le = (r % ib_lsa) * kNumExpertsPerRank + static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                    if (on) {
+                        const uint32_t slot = cnt[le] + pre;
+                        *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(static_cast<uint32_t>(e) % kNumExpertsPerRank, s, slot), r) = j;
+                    }
+                    __syncwarp();
+                    if (on and pre == 0)
+                        cnt[le] += __popc(m);
+                    __syncwarp();
+                }
+                __threadfence_system();
+            }
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            for (uint32_t i = epilogue_thread_idx; i < num_node_experts; i += kNumEpilogueThreads) {
+                const uint32_t d = ib_my_node * ib_lsa + i / kNumExpertsPerRank, e = i % kNumExpertsPerRank;
+                *sym_buffer.map(workspace.get_expert_recv_count_ptr(s, e), d) = cnt[i];
+                __threadfence_system();
+                ptx::atomic_add_sys(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(e), d),
+                                    (static_cast<uint64_t>(kNumSMs) << 32) | static_cast<uint64_t>(cnt[i]));
+            }
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            IB_TRACE(19, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
+        }
+#endif
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1781,9 +1558,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 prefetch_prologue(num_valid_store_blocks, raw_values);
 
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                uint32_t ib_staged_rows = 0;
-#endif
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumStoreBlocks; ++ s) {
                     if (s >= num_valid_store_blocks)
@@ -1861,42 +1635,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        bool is_remote_row = false;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                        is_remote_row = is_remote(dst_rank_idx);
-                        if (is_remote_row) {
-                            // v2d: row position in the contiguous chunk for this source, plus this lane's column
-                            const auto offset_in_row = reinterpret_cast<int64_t>(dst_ptr) - reinterpret_cast<int64_t>(
-                                buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx).get_data_buffer(dst_token_idx).get_base_ptr());
-                            const auto chunk_idx = *workspace.get_ib_pool_combine_idx_ptr(pool_m_idx + m_idx_in_block);
-                            const auto staging_ptr = reinterpret_cast<float4*>(
-                                ib_combine_staging + dst_rank_idx * ib_combine_bytes + static_cast<int64_t>(chunk_idx) * kIBRowBytes + offset_in_row);
-                            *staging_ptr = packed;  // sent per expert group once the group's rows are all staged (v5b)
-                            if (lane_idx % 16 == 0)
-                                ++ib_staged_rows;
+                        // C1: rows of sources on other nodes go to the proxy's combine buffer (same layout), over NVLink
+                        if (is_remote(dst_rank_idx)) {
+                            const auto off = reinterpret_cast<const uint8_t*>(dst_ptr) -
+                                reinterpret_cast<const uint8_t*>(buffer.combine_token_buffer.get_base_ptr());
+                            *sym_buffer.map(reinterpret_cast<float4*>(ib_pcomb(dst_rank_idx / ib_lsa) + off),
+                                            ib_cp(dst_rank_idx, ib_my_node)) = packed;
+                            continue;
                         }
 #endif
-                        if (not is_remote_row)
-                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
                 }
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                {
-                    // v5c: per task, each warp adds its staged row-tiles to the expert group's counter (acq_rel
-                    // atomic: this warp's row stores are released, the finisher acquires everyone's). The warp
-                    // that completes the group publishes it in shared memory; after the task barrier every
-                    // epilogue warp sends that group's rows to the sources it owns (one put + strong signal each)
-                    const uint32_t n_staged = __reduce_add_sync(0xffffffff, ib_staged_rows);
-                    ib_staged_rows = 0;
-                    if (n_staged > 0 and not task_info.is_shared()) {
-                        const uint32_t g = ib_group_of(task_info.local_expert_idx);
-                        // v8: release this warp's staged rows into the group counter; the idle dispatch warps of
-                        // SM `group` poll it and send the group's rows once it reaches the total
-                        if (lane_idx == 0)
-                            ib_atom_add_acq_rel(workspace.get_ib_group_done_ptr(ib_parity, g), n_staged);
-                    }
-                }
-#endif
+
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
@@ -1953,43 +1705,102 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        __threadfence();  // staged rows reach L2 before the grid sync; the NIC reads them after it
-#endif
-        IB_TRACE(5, sm_idx == 0 and epilogue_thread_idx == 0);
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        {
-            IB_TRACE(6, sm_idx == 0 and epilogue_thread_idx == 0);
-            // v5b: combine rows were sent per expert group from the L2 epilogue; nothing left to send here
-
-            // Every SM must finish reading the per-expert counts above before any SM's dispatch warps clear them
-            // (that cleanup only waits for its own SM's epilogue); the sync also orders all row puts before the signals
-            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
-                workspace, sm_idx, epilogue_thread_idx,
-                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
-            );
-
-        }
-#endif
-        IB_TRACE(7, sm_idx == 0 and epilogue_thread_idx == 0);
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if (is_remote(epilogue_thread_idx)) {
-                // readiness for remote ranks is the per-SM strong signal before the grid sync
-            } else
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks and not is_remote(epilogue_thread_idx))
+#else
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
 #endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
-        }
+        IB_TRACE(5, sm_idx == 0 and epilogue_thread_idx == 0);
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // C2 (forward-combine): for each source this GPU proxies, reduce every token's node-local partials (written
+        // into our proxy combine buffer by the node's L2 epilogues; readiness = the upstream per-rank L2 flags), stage
+        // one record per token, and put 32-token chunks back to the source; the warp completing the last chunk posts
+        // the return header. Every mirror row is polled here (rule A: every byte the NIC wrote is awaited).
+        {
+            const auto fwd_grid_idx = ptx::get_grid_idx() + 1;
+            for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+                const uint32_t n = ib_node_of_slot(nr);
+                const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
+                const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+                const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
+                const auto ret_dst = ib_ret(ib_parity, ib_my_node);
+                if (nt == 0) {
+                    if (sm_idx == 0 and epilogue_thread_idx == 0)
+                        make_gin(nr).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                    continue;
+                }
+                const auto mir = ib_mirror(ib_parity, n);
+                const auto fst = ib_fstage(n);
+                const auto pc = ib_pcomb(n);
+                const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
+                for (uint32_t t = epilogue_warp_idx * kNumSMs + sm_idx; t < nt; t += kNumSMs * kNumEpilogueWarps) {
+                    const int e = lane_idx < kNumTopk ? static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + t * kNumTopk + lane_idx))) : -1;
+                    const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
+                    const bool on = e >= 0 and r / ib_lsa == ib_my_node;
+                    const uint32_t on_mask = __ballot_sync(0xffffffffu, on);
+                    const auto flag_ptr = workspace.get_combine_ready_grid_idx_ptr(r);
+                    comm::wait_until([&]() { return __all_sync(0xffffffffu, not on or ptx::ld_acq_sys(flag_ptr) == fwd_grid_idx); },
+                                     [&]() { printf("DeepGEMM IB forward-combine flags timeout: rank=%u, source=%u, token=%u\n", sym_buffer.rank_idx, s, t); });
+                    // Rule A: this token's x / SF rows have landed (normally long ago)
+                    for (uint32_t u = lane_idx; u < kIBTokBytes / 16; u += 32)
+                        while (ib_is_sentinel4(ib_ldv4(mir + static_cast<int64_t>(t) * kIBTokBytes + u * 16)));
+                    for (uint32_t u = lane_idx; u < kIBSFBytes / 16; u += 32)
+                        while (ib_is_sentinel4(ib_ldv4(mir + kIBOffSF + static_cast<int64_t>(t) * kIBSFBytes + u * 16)));
+                    // Reduce node-local slots in top-k order (fp32), write the bf16 record
+                    const auto rec = fst + static_cast<int64_t>(t) * kIBRecBytes;
+                    constexpr uint32_t kPieces = kHidden * 2 / (32 * 16);
+                    DG_STATIC_ASSERT(kPieces * 32 * 16 == kHidden * 2, "IB forward piece");
+                    #pragma unroll 4
+                    for (uint32_t p = 0; p < kPieces; ++ p) {
+                        float2 acc[4] = {};
+                        uint32_t m = on_mask;
+                        while (m) {
+                            const uint32_t k = __ffs(m) - 1;
+                            m &= m - 1;
+                            const auto v = __ldcg(reinterpret_cast<const uint4*>(
+                                pc + (static_cast<int64_t>(k) * kIBT + t) * kHidden * 2 + (p * 32 + lane_idx) * 16));
+                            const auto b = reinterpret_cast<const nv_bfloat162*>(&v);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < 4; ++ l)
+                                ptx::accumulate(acc[l], b[l]);
+                        }
+                        uint4 o;
+                        auto ob = reinterpret_cast<nv_bfloat162*>(&o);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < 4; ++ l)
+                            ob[l] = __float22bfloat162_rn(acc[l]);
+                        *reinterpret_cast<uint4*>(rec + (p * 32 + lane_idx) * 16) = o;
+                    }
+                    __syncwarp();
+                    if (lane_idx == 0) {
+                        __threadfence();
+                        const uint32_t c = t / kIBChunk, size = cute::min(kIBChunk, nt - c * kIBChunk);
+                        if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][c], 1u) + 1 == size) {
+                            const auto gin = make_gin(c + nr);
+                            const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
+                            gin.put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                            if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fdone[ib_parity][n], 1u) + 1 == nchunks)
+                                gin.put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+            IB_TRACE(6, sm_idx == 0 and epilogue_thread_idx == 0);
+        }
+#endif
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
@@ -2001,30 +1812,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // C3: slots on other nodes arrive as one reduced record per node (below), not through the slot buffers
+            const bool ib_slot_remote = lane_idx < kNumTopk and stored_topk_slot_idx >= 0 and
+                is_remote(static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank);
+            const uint32_t ib_node_bit = ib_slot_remote ? (1u << (static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank / ib_lsa)) : 0u;
+            const uint32_t ib_nodes_hit = __reduce_or_sync(0xffffffffu, ib_node_bit);
+            const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0 and not ib_slot_remote);
+            const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0 and not ib_slot_remote;
+#else
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             // Wait for the ranks of the selected experts to finish their L2 writes
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+#endif
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            const uint32_t ib_peer_rank = is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0;
-            const uint32_t ib_peer_expert = is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) % kNumExpertsPerRank : 0;
-            const bool ib_peer_remote = is_routed and is_remote(ib_peer_rank);
-            // v9: per-token readiness: each routed slot waits only for its own (expert rank, local expert) put
-            const auto ib_peer_ready_ptr = workspace.get_ib_combine_ready_e_ptr(ib_peer_rank, ib_peer_expert);
-            const uint64_t ib_peer_expected = *workspace.get_ib_combine_expected_e_ptr(ib_peer_rank, ib_peer_expert);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
-                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) >= ib_peer_expected
-                                : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
-#else
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-#endif
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            asm volatile("fence.proxy.async.global;" ::: "memory");  // NIC-written rows are read by TMA below
-#endif
-            IB_TRACE(8, sm_idx == 0 and epilogue_warp_idx == 0 and lane_idx == 0 and token_chunk_idx == sm_idx);
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 
@@ -2038,21 +1843,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Load
                     if (cute::elect_one_sync()) {
-                        auto src_ptr = math::advance_ptr<uint8_t>(
+                        const auto src_ptr = math::advance_ptr<uint8_t>(
                             buffer.combine_token_buffer.get_rank_buffer(slot_idx)
                                                 .get_data_buffer(token_idx).get_base_ptr(),
                             chunk_byte_offset);
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                        if (slot_idx < kNumTopk) {
-                            const auto e = static_cast<uint32_t>(
-                                buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + slot_idx]);
-                            const auto er = e / kNumExpertsPerRank;
-                            if (is_remote(er))
-                                src_ptr = ib_combine_landing + er * kIBCombineLandingBytes +
-                                    static_cast<int64_t>(*workspace.get_ib_combine_idx_ptr(token_idx * kNumTopk + slot_idx)) * kIBRowBytes +
-                                    chunk_byte_offset;
-                        }
-#endif
                         ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
                         ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
                     }
@@ -2086,6 +1880,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 load_stage_idx ^= 1;
             }
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // C3: one record per remote node; every record of every remote node is polled (rule A: the proxy writes
+            // all of them), added if this token has experts there, then re-armed for the launch after next
+            for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+                const uint32_t n = ib_node_of_slot(nr);
+                const auto rec = ib_ret(ib_parity, n) + static_cast<int64_t>(token_idx) * kIBRecBytes + chunk_byte_offset;
+                const bool hit = (ib_nodes_hit >> n) & 1u;
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                    const auto ptr = rec + (j * 32 + lane_idx) * 16;
+                    uint4 v = ib_ldv4(ptr);
+                    while (ib_is_sentinel4(v))
+                        v = ib_ldv4(ptr);
+                    if (hit) {
+                        const auto b = reinterpret_cast<const nv_bfloat162*>(&v);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], b[l]);
+                    }
+                    *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                }
+            }
+#endif
+
             // Cast
             #pragma unroll
             for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
@@ -2115,21 +1933,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Rule H: the return header of every proxy is awaited (even with zero tokens), then re-armed
+        if (sm_idx == 0 and epilogue_thread_idx + 1 < ib_num_nodes) {
+            const uint32_t n = ib_node_of_slot(epilogue_thread_idx);
+            const auto hdr = reinterpret_cast<uint64_t*>(ib_ret(ib_parity, n) + kIBRetHdr);
+            comm::wait_until([&]() { return ptx::ld_volatile(hdr) == ib_epoch; }, [&]() {
+                printf("DeepGEMM IB return header timeout: rank=%u, node=%u, header=%llx, epoch=%llu\n",
+                       sym_buffer.rank_idx, n, (unsigned long long) ptx::ld_volatile(hdr), (unsigned long long) ib_epoch);
+            });
+            *hdr = ~0ull;
+        }
+#endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
         IB_TRACE(9, sm_idx == 0 and epilogue_thread_idx == 0);
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
-            printf("IB_TRACE rank=%u epoch=%llu us: idx=%.1f gsync=%.1f pre_barrier=%.1f barrier=%.1f scan=%.1f pull_end=%.1f l2_done=%.1f l2_sync=%.1f combine_put=%.1f first_wait=%.1f end=%.1f\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch,
-                   (t[1] - t[0]) / 1e3, (t[10] - t[0]) / 1e3, (t[11] - t[0]) / 1e3, (t[2] - t[0]) / 1e3, (t[3] - t[0]) / 1e3, (t[4] - t[0]) / 1e3,
-                   (t[5] - t[0]) / 1e3, (t[6] - t[0]) / 1e3, (t[7] - t[0]) / 1e3, (t[8] - t[0]) / 1e3, (t[9] - t[0]) / 1e3);
-            printf("IB_TRACE2 rank=%u epoch=%llu us (rel. to gather end): kernel_start=%.1f combine_end_since_start=%.1f prev_launch_cleanup_end_since_start=%.1f\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, ((int64_t) t[16] - (int64_t) t[0]) / 1e3,
-                   ((int64_t) t[9] - (int64_t) t[16]) / 1e3, t[18] / 1e3);
-            printf("IB_PUTS rank=%u since_last_print: landing_puts=%llu landing_bytes=%llu combine_puts=%llu combine_bytes=%llu landing_region=%lld\n",
-                   sym_buffer.rank_idx, (unsigned long long) t[14], (unsigned long long) t[15], (unsigned long long) t[12],
-                   (unsigned long long) t[13], (long long) ib_landing_bytes);
-            workspace.signals->ib_trace[12] = workspace.signals->ib_trace[13] = workspace.signals->ib_trace[14] = workspace.signals->ib_trace[15] = 0;
+            const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: posted=%.1f pre_pull_barrier=%.1f counts=%.1f proxy_d1(sm last)=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(0), us(2), us(3), us(19), us(5), us(6), us(9), t[18] / 1e3);
         }
 #endif
     }

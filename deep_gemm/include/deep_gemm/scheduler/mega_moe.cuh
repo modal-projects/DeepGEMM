@@ -10,10 +10,6 @@
 #include <deep_gemm/ptx/utils.cuh>
 
 // TODO: add MegaMoE namespace
-#ifndef DG_MEGA_MOE_IB_CONTEXTS
-#define DG_MEGA_MOE_IB_CONTEXTS 4  // Gin contexts used by Mega MoE over IB (see comm/gin.cuh)
-#endif
-
 namespace deep_gemm::sched {
 
 // Get minimal L1 warmup waves to ensure no L1 -> L2 deadlock
@@ -231,20 +227,6 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumL1Clusters % kNumLocalityDomains == 0 and kNumL2Clusters % kNumLocalityDomains == 0, "Each domain must take whole clusters");
     uint32_t sm_locality_domain_idx = 0;
 
-    // Mega MoE over IB: when `ib_num_lsa_ranks > 0`, only same-node ranks add into
-    // `expert_recv_count_sum`; ranks on other nodes put their per-source counts and then an
-    // epoch-tagged arrival flag (see impls/sm100_fp8_fp4_mega_moe.cuh, DESIGN-v1 B3/B4)
-    uint32_t ib_num_lsa_ranks = 0, ib_rank_idx = 0;
-    uint64_t ib_epoch = 0;
-
-    CUTLASS_DEVICE void set_ib(const uint32_t& num_lsa_ranks, const uint32_t& rank_idx, const uint64_t& epoch) {
-        ib_num_lsa_ranks = num_lsa_ranks, ib_rank_idx = rank_idx, ib_epoch = epoch;
-    }
-
-    CUTLASS_DEVICE bool ib_is_remote(const uint32_t& rank_idx) const {
-        return ib_num_lsa_ranks > 0 and rank_idx / ib_num_lsa_ranks != ib_rank_idx / ib_num_lsa_ranks;
-    }
-
     CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace):
         workspace(workspace) {}
 
@@ -308,33 +290,13 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                const uint32_t num_adding_ranks = ib_num_lsa_ranks > 0 ? ib_num_lsa_ranks : kNumRanks;
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * num_adding_ranks);
+                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
-
-        // Ranks on other nodes: wait for their arrival flag, then add their per-source counts
-        if (ib_num_lsa_ranks > 0) {
-            for (uint32_t r = 0; r < kNumRanks; ++ r) {
-                if (not ib_is_remote(r))
-                    continue;
-                // v2c: SM 0 builds remote counts from the landing copies, then publishes ib_counts_ready
-                // v3e: one SM per remote source adds 1 when its table is built
-                while (ptx::ld_acq_sys(workspace.get_ib_counts_ready_ptr()) < ib_epoch * static_cast<uint64_t>(kNumRanks - ib_num_lsa_ranks));
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
-                    const auto expert_idx = i * 32 + ptx::get_lane_idx();
-                    if (expert_idx < kNumExpertsPerRank)
-                        stored_num_tokens_per_expert[i] += static_cast<uint32_t>(
-                            ptx::ld_volatile(workspace.get_expert_recv_count_ptr(r, expert_idx)));
-                }
-            }
-            __syncwarp();
-        }
 
         num_total_m_blocks = get_num_total_pool_blocks();
         const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;

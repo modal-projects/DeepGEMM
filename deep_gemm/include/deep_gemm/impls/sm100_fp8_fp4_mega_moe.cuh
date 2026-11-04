@@ -576,9 +576,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 DG_STATIC_ASSERT(kNumExpertsPerRank <= 32, "IB scan keeps one expert counter per lane");
                 uint32_t num_pairs = 0, cnt = 0;
                 const uint32_t lt_mask = (1u << lane_idx) - 1;
-                for (uint32_t base = 0; base < n * kNumTopk; base += 32) {
+                // v3b: the landing top-k lives in memory the NIC just wrote (uncached): batch the loads so one
+                // memory latency covers kIBScanUnroll iterations instead of one
+                constexpr uint32_t kIBScanUnroll = 8;
+                for (uint32_t base0 = 0; base0 < n * kNumTopk; base0 += 32 * kIBScanUnroll) {
+                  int es[kIBScanUnroll];
+                  #pragma unroll
+                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
+                    const uint32_t j = base0 + u * 32 + lane_idx;
+                    es[u] = j < n * kNumTopk ? static_cast<int>(topk[j]) : -1;
+                  }
+                  #pragma unroll
+                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
+                    const uint32_t base = base0 + u * 32;
+                    if (base >= n * kNumTopk)
+                        break;
                     const uint32_t j = base + lane_idx;
-                    const int e = j < n * kNumTopk ? static_cast<int>(topk[j]) : -1;
+                    const int e = es[u];
                     const bool mine = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx;
                     const uint32_t ballot = __ballot_sync(0xffffffff, mine);
                     const uint32_t le = mine ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
@@ -598,6 +612,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (mine)
                         *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j | (idx << 16);
                     num_pairs += __popc(ballot);
+                  }
                 }
                 // only this warp touches the (remote r, local expert) counters: plain stores replace the atomics
                 if (lane_idx < kNumExpertsPerRank)
@@ -607,14 +622,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // (b) our own pairs routed to rank r
                 const auto own = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
                 uint32_t num_own = 0;
-                for (uint32_t base = 0; base < num_tokens * kNumTopk; base += 32) {
+                for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll) {
+                  int es[kIBScanUnroll];
+                  #pragma unroll
+                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
+                    const uint32_t j = base0 + u * 32 + lane_idx;
+                    es[u] = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
+                  }
+                  #pragma unroll
+                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
+                    const uint32_t base = base0 + u * 32;
+                    if (base >= num_tokens * kNumTopk)
+                        break;
                     const uint32_t j = base + lane_idx;
-                    const int e = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
+                    const int e = es[u];
                     const bool to_r = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r;
                     const uint32_t ballot = __ballot_sync(0xffffffff, to_r);
                     if (to_r)
                         *workspace.get_ib_combine_idx_ptr(j) = num_own + __popc(ballot & ((1u << lane_idx) - 1));
                     num_own += __popc(ballot);
+                  }
                 }
             }
             __threadfence();

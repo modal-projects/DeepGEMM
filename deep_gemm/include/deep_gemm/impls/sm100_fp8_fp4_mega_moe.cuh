@@ -1421,9 +1421,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
             for (uint32_t q = kNumSMs - 2 - sm_idx; sm_idx + 2 <= kNumSMs and q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {
                 if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
-                    // Meta first: on a 400G link the 0.7 MB x of each counterpart would otherwise delay the meta
-                    while (ptx::ld_acq_sys(&workspace.signals->ib_o_meta_posted) < ib_epoch)
-                        __nanosleep(64);
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
                     int64_t off = 0, bytes = 0;
                     if (piece == 0) {

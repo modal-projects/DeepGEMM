@@ -151,6 +151,9 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
     gin_type = int(os.environ.get('DG_MEGA_MOE_IB_GIN_TYPE', '0'))  # 0 any, 2 proxy, 3 GDAKI, 5 EFA GDA
     state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS, gin_type)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
-    buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa] if num_lsa < world else [])
+    # DG_MEGA_MOE_IB_FORCE=1: compile the IB kernel even when all ranks share one NVLink domain (compile and
+    # local-path checks on single-node clusters; Gin paths are never taken since every rank is load/store-reachable)
+    force = os.environ.get('DG_MEGA_MOE_IB_FORCE', '0') == '1'
+    buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa] if (num_lsa < world or force) else [])
     handle = types.SimpleNamespace(buffer_ptrs=buffer_ptrs, ib_state=state, num_lsa_ranks=num_lsa)
     return tensor, handle

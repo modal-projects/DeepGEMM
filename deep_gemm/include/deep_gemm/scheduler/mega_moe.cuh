@@ -323,7 +323,8 @@ struct MegaMoEScheduler {
                 if (not ib_is_remote(r))
                     continue;
                 // v2c: SM 0 builds remote counts from the landing copies, then publishes ib_counts_ready
-                while (ptx::ld_acq_sys(workspace.get_ib_counts_ready_ptr()) != ib_epoch);
+                // v3e: one SM per remote source adds 1 when its table is built
+                while (ptx::ld_acq_sys(workspace.get_ib_counts_ready_ptr()) < ib_epoch * static_cast<uint64_t>(kNumRanks - ib_num_lsa_ranks));
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
                     const auto expert_idx = i * 32 + ptx::get_lane_idx();

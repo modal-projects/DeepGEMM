@@ -552,16 +552,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             make_gin, ib_epoch, false, true);
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
-        if (sm_idx == 0) {
-            // v2c: every remote source's landing copy (tokens, SF, top-k idx, weights) and token count have
-            // settled (barrier). Count the tokens routed to our experts and fill the source-index table locally.
+        // v3e: SM r (one per remote source) builds the counts/index table for source r: warp 0 scans r's landing
+        // top-k (a), warp 1 (or warp 0 after it) scans our own top-k for pairs routed to r (b); each SM then adds 1
+        // to ib_counts_ready, which reaches epoch * num_remote once every source is done (the scheduler waits on it).
+        if (sm_idx < kNumRanks and is_remote(sm_idx)) {
             const auto ib_topk_offset = reinterpret_cast<uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr()) - ib_input_base;
-            // One warp per remote rank r, in (token, top-k) order:
-            //  (a) as receiver: pairs of source r routed to us -> slot per local expert (atomic) + ordered chunk index
-            //  (b) as source: our pairs routed to expert rank r -> ordered chunk index (where r will put the row)
-            for (uint32_t r = warp_idx; r < kNumRanks; r += kNumDispatchWarps) {
-                if (not is_remote(r))
-                    continue;
+            const uint32_t r = sm_idx;
+            const bool do_a = warp_idx == 0, do_b = kNumDispatchWarps > 1 ? warp_idx == 1 : warp_idx == 0;
+            constexpr uint32_t kIBScanUnroll = 8;
+            if (do_a) {
                 // v3d: one strong signal per context per launch from r settles all of r's landing puts
                 while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * DG_MEGA_MOE_IB_CONTEXTS);
                 const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
@@ -574,7 +573,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t lt_mask = (1u << lane_idx) - 1;
                 // v3b: the landing top-k lives in memory the NIC just wrote (uncached): batch the loads so one
                 // memory latency covers kIBScanUnroll iterations instead of one
-                constexpr uint32_t kIBScanUnroll = 8;
                 for (uint32_t base0 = 0; base0 < n * kNumTopk; base0 += 32 * kIBScanUnroll) {
                   int es[kIBScanUnroll];
                   #pragma unroll
@@ -620,6 +618,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     *workspace.get_expert_recv_count_ptr(r, lane_idx) = cnt;
                 if (lane_idx == 0)
                     *workspace.get_ib_pairs_from_ptr(r) = num_pairs;
+            }
+            if (do_b) {
                 // (b) our own pairs routed to rank r
                 const auto own = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
                 uint32_t num_own = 0;
@@ -648,8 +648,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __threadfence();
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
             if (thread_idx == 0)
-                ptx::st_rel_sys(workspace.get_ib_counts_ready_ptr(), ib_epoch);
-            IB_TRACE(3, thread_idx == 0);
+                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.get_ib_counts_ready_ptr()), 1ull);
+            IB_TRACE(3, thread_idx == 0 and sm_idx == (sym_buffer.is_lsa(0) ? sym_buffer.num_lsa_ranks : 0));
         }
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,

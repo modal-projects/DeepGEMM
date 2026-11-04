@@ -55,7 +55,11 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
 
     ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
     CHECK_NCCL(ncclCommQueryProperties(st->comm, &props));
-    TORCH_CHECK(props.ginSupport[NCCL_GIN_TYPE_GDAKI], "NCCL Gin GDAKI is unavailable on this communicator (ginType=", props.ginType, ")");
+    ncclTeam_t lsa = ncclTeamLsa(st->comm);
+    const bool need_gin = lsa.nRanks < world;  // all ranks in one NVLink domain: load/store only
+    TORCH_CHECK(not need_gin or props.ginSupport[NCCL_GIN_TYPE_GDAKI],
+                "NCCL Gin GDAKI is unavailable on this communicator (ginType=", props.ginType, ")");
+    if (need_gin) {
 
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.ginType = NCCL_GIN_TYPE_GDAKI;
@@ -73,8 +77,7 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     CHECK_NCCL(ncclDevCommCreate(st->comm, &reqs, static_cast<ncclDevComm_t*>(st->dev_comm_host)));
     CHECK_CUDA(cudaMalloc(&st->dev_comm_dev, dev_comm_size));
     CHECK_CUDA(cudaMemcpy(st->dev_comm_dev, st->dev_comm_host, dev_comm_size, cudaMemcpyHostToDevice));
-
-    ncclTeam_t lsa = ncclTeamLsa(st->comm);
+    }
     const int64_t node_first = rank - lsa.rank;
     std::vector<int64_t> ptrs(static_cast<size_t>(world), 0);
     for (int i = 0; i < lsa.nRanks; ++ i) {
@@ -94,9 +97,11 @@ torch::Tensor as_tensor(int64_t ptr, int64_t num_bytes, int64_t device) {
 
 void destroy(int64_t handle) {
     auto* st = reinterpret_cast<IBState*>(handle);
-    ncclDevCommDestroy(st->comm, static_cast<ncclDevComm_t*>(st->dev_comm_host));
-    cudaFree(st->dev_comm_dev);
-    free(st->dev_comm_host);
+    if (st->dev_comm_host != nullptr) {
+        ncclDevCommDestroy(st->comm, static_cast<ncclDevComm_t*>(st->dev_comm_host));
+        cudaFree(st->dev_comm_dev);
+        free(st->dev_comm_host);
+    }
     ncclCommWindowDeregister(st->comm, st->window);
     ncclMemFree(st->ptr);
     ncclCommDestroy(st->comm);

@@ -1359,6 +1359,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
         IB_TRACE(23, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
+#if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
+        if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
+            printf("OPUS_D0 rank=%u epoch=%llu num_tokens=%u enter\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, num_tokens);
+#endif
         if (sm_idx == kNumSMs - 1 and num_tokens == kIBT) {
             // Full batch: every top-k / weight row is polled by the proxy, so the input slices go out as they are
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
@@ -1413,6 +1417,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (epilogue_thread_idx == 0)
                 ptx::st_rel_sys(&workspace.signals->ib_o_meta_posted, ib_epoch);
         }
+#if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
+        if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
+            printf("OPUS_D0 rank=%u epoch=%llu meta posted\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch);
+#endif
         {
             const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks

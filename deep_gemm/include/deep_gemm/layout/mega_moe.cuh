@@ -105,6 +105,7 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_landing_ready[kNumMaxRanks];  // +1 per Gin context per launch per source (v2e)
     alignas(128) uint64_t ib_trace[16];  // DG_MEGA_MOE_IB_TRACE: %globaltimer per stage (SM 0)
     alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
+    alignas(128) uint64_t ib_landing_expected[kNumMaxRanks];  // local: cumulative signals expected from each source (v3a)
     alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
     alignas(128) uint32_t ib_pool_combine_idx[kNumMaxIBPoolTokens];
     alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
@@ -225,6 +226,11 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_ib_arrival_ptr(const uint32_t& src_rank_idx = 0) const {
         return signals->ib_arrival + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_landing_expected_ptr(const uint32_t& src_rank_idx = 0) const {
+        return signals->ib_landing_expected + src_rank_idx;
     }
 
     CUTLASS_DEVICE

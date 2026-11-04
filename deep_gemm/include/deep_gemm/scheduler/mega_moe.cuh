@@ -10,6 +10,10 @@
 #include <deep_gemm/ptx/utils.cuh>
 
 // TODO: add MegaMoE namespace
+#ifndef DG_MEGA_MOE_IB_CONTEXTS
+#define DG_MEGA_MOE_IB_CONTEXTS 4  // Gin contexts used by Mega MoE over IB (see comm/gin.cuh)
+#endif
+
 namespace deep_gemm::sched {
 
 // Get minimal L1 warmup waves to ensure no L1 -> L2 deadlock
@@ -318,8 +322,8 @@ struct MegaMoEScheduler {
             for (uint32_t r = 0; r < kNumRanks; ++ r) {
                 if (not ib_is_remote(r))
                     continue;
-                // every SM of the source strong-signals once per launch after its index (and SM 0 count) puts
-                while (ptx::ld_acq_sys(workspace.get_ib_arrival_ptr(r)) != ib_epoch * kNumSMs);
+                // the source's SM 0 strong-signals once per Gin context per launch (v2a')
+                while (ptx::ld_acq_sys(workspace.get_ib_arrival_ptr(r)) != ib_epoch * DG_MEGA_MOE_IB_CONTEXTS);
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
                     const auto expert_idx = i * 32 + ptx::get_lane_idx();

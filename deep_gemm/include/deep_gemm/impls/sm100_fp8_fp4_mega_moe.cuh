@@ -426,10 +426,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // Strong signal per SM after its index puts (SM 0 signals after its count puts below)
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-        if (sm_idx != 0 and thread_idx < kNumRanks and is_remote(thread_idx))
-            make_gin().signal_inc(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), thread_idx);
+        // (v2a': no per-SM signals; SM 0 signals once per Gin context after the grid sync + its count puts)
 #endif
 
         // Grid sync
@@ -474,10 +471,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     expert_status);
             }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // SM 0's strong signal settles its index and count puts (same context) at each remote rank
+            // One strong signal per (Gin context, remote peer): every SM's index puts were posted before the grid
+            // sync above and SM 0's count puts before this sync, so each context's signal settles all of them
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            if (thread_idx < kNumRanks and is_remote(thread_idx))
-                make_gin().signal_inc(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), thread_idx);
+            DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumDispatchThreads, "Insufficient threads for IB signals");
+            if (thread_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(thread_idx % kNumRanks))
+                comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, thread_idx / kNumRanks)
+                    .signal_inc(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), thread_idx % kNumRanks);
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -1556,17 +1556,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 rows_before += n;
                 pool_block_offset += math::ceil_div(n, BLOCK_M);
             }
-            // Each SM strong-signals every remote rank after its row puts; the source waits for kNumSMs signals
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-            if (epilogue_thread_idx < kNumRanks and is_remote(epilogue_thread_idx))
-                make_gin().signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), epilogue_thread_idx);
-
             // Every SM must finish reading the per-expert counts above before any SM's dispatch warps clear them
-            // (that cleanup only waits for its own SM's epilogue, at the dispatch/epilogue barrier below)
+            // (that cleanup only waits for its own SM's epilogue); the sync also orders all row puts before the signals
             comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
                 workspace, sm_idx, epilogue_thread_idx,
                 [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
             );
+            // One strong signal per (Gin context, remote peer) settles every SM's row puts on that context
+            DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumEpilogueThreads, "Insufficient threads for IB signals");
+            if (sm_idx == 0 and epilogue_thread_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and
+                is_remote(epilogue_thread_idx % kNumRanks))
+                comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, epilogue_thread_idx / kNumRanks)
+                    .signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), epilogue_thread_idx % kNumRanks);
         }
 #endif
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
@@ -1603,7 +1604,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool ib_peer_remote = is_routed and is_remote(ib_peer_rank);
             const auto ib_peer_ready_ptr = workspace.get_ib_combine_ready_ptr(ib_peer_rank);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
-                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) == ib_epoch * kNumSMs : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
+                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) == ib_epoch * DG_MEGA_MOE_IB_CONTEXTS : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
 #else
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
 #endif

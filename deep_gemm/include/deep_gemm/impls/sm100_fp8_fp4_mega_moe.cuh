@@ -443,7 +443,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto fst = ib_fstage(n);
             const auto pc = ib_pcomb(n);
             const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
-            for (uint32_t t = global_warp; t < nt; t += num_global_warps) {
+            // Work item = (token, quarter of the hidden dim): 4 warps per token, every load of an item issued back to back
+            constexpr uint32_t kSplit = 4;
+            constexpr uint32_t kPieces = kHidden * 2 / (32 * 16);  // 16-byte bf16 units per lane over the row
+            constexpr uint32_t kPPI = kPieces / kSplit;
+            DG_STATIC_ASSERT(kPieces * 32 * 16 == kHidden * 2 and kPPI * kSplit == kPieces, "IB forward piece");
+            constexpr uint32_t kXUnitsPerItem = kIBTokBytes / 16 / kSplit;
+            DG_STATIC_ASSERT(kXUnitsPerItem * 16 * kSplit == kIBTokBytes, "IB forward x split");
+            for (uint32_t item = global_warp; item < nt * kSplit; item += num_global_warps) {
+                const uint32_t t = item / kSplit, qtr = item % kSplit;
                 const int e = lane_idx < kNumTopk ? static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + t * kNumTopk + lane_idx))) : -1;
                 const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
                 const bool on = e >= 0 and r / ib_lsa == ib_my_node;
@@ -453,43 +461,66 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     comm::wait_until([&]() { return __all_sync(0xffffffffu, not on or ptx::ld_acq_sys(flag_ptr) == fwd_grid_idx); },
                                      [&]() { printf("DeepGEMM IB forward-combine flags timeout: rank=%u, source=%u, token=%u\n", sym_buffer.rank_idx, s, t); });
                 }
-                // Rule A: this token's x / SF rows have landed (normally long ago)
-                for (uint32_t u = lane_idx; u < kIBTokBytes / 16; u += 32)
-                    while (ib_is_sentinel4(ib_ldv4(mir + static_cast<int64_t>(t) * kIBTokBytes + u * 16)));
-                for (uint32_t u = lane_idx; u < kIBSFBytes / 16; u += 32)
-                    while (ib_is_sentinel4(ib_ldv4(mir + kIBOffSF + static_cast<int64_t>(t) * kIBSFBytes + u * 16)));
-                // Reduce node-local slots in top-k order (fp32), write the record
-                const auto rec = fst + static_cast<int64_t>(t) * kIBRecBytes;
-                constexpr uint32_t kPieces = kHidden * 2 / (32 * 16);
-                DG_STATIC_ASSERT(kPieces * 32 * 16 == kHidden * 2, "IB forward piece");
-                #pragma unroll 2
-                for (uint32_t p = 0; p < kPieces; ++ p) {
-                    float2 acc[4] = {};
-                    uint32_t m = on_mask;
-                    while (m) {
-                        const uint32_t k = __ffs(m) - 1;
-                        m &= m - 1;
-                        const auto ptr = pc + (static_cast<int64_t>(k) * kIBT + t) * kHidden * 2 + (p * 32 + lane_idx) * 16;
-                        uint4 v;
+                // Rule A: this item's part of the token's x row (and, for quarter 0, its SF row) has landed
+                {
+                    constexpr uint32_t kU = (kXUnitsPerItem + 31) / 32;
+                    const auto xrow = mir + static_cast<int64_t>(t) * kIBTokBytes + static_cast<int64_t>(qtr) * kXUnitsPerItem * 16;
+                    uint4 v[kU];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kU; ++ u)
+                        v[u] = u * 32 + lane_idx < kXUnitsPerItem ? ib_ldv4(xrow + (u * 32 + lane_idx) * 16) : uint4{0, 0, 0, 0};
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kU; ++ u)
+                        while (ib_is_sentinel4(v[u]))
+                            v[u] = ib_ldv4(xrow + (u * 32 + lane_idx) * 16);
+                    if (qtr == 0 and lane_idx < kIBSFBytes / 16) {
+                        const auto sfp = mir + kIBOffSF + static_cast<int64_t>(t) * kIBSFBytes + lane_idx * 16;
+                        while (ib_is_sentinel4(ib_ldv4(sfp)));
+                    }
+                }
+                // Reduce node-local slots in top-k order (fp32): per slot, the item's pieces are loaded together
+                float2 acc[kPPI][4];
+                #pragma unroll
+                for (uint32_t i = 0; i < kPPI; ++ i)
+                    #pragma unroll
+                    for (uint32_t l = 0; l < 4; ++ l)
+                        acc[i][l] = {0.f, 0.f};
+                uint32_t m = on_mask;
+                while (m) {
+                    const uint32_t k = __ffs(m) - 1;
+                    m &= m - 1;
+                    const auto row = pc + (static_cast<int64_t>(k) * kIBT + t) * kHidden * 2;
+                    uint4 v[kPPI];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kPPI; ++ i) {
+                        const auto ptr = row + ((qtr * kPPI + i) * 32 + lane_idx) * 16;
+                        if constexpr (kIBReduceOnArrival) v[i] = ib_ldv4(ptr);
+                        else v[i] = __ldcg(reinterpret_cast<const uint4*>(ptr));
+                    }
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kPPI; ++ i) {
+                        const auto ptr = row + ((qtr * kPPI + i) * 32 + lane_idx) * 16;
                         if constexpr (kIBReduceOnArrival) {
-                            v = ib_ldv4(ptr);
-                            while (ib_is_sentinel4(v))
-                                v = ib_ldv4(ptr);
+                            while (ib_is_sentinel4(v[i]))
+                                v[i] = ib_ldv4(ptr);
                             *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
-                        } else {
-                            v = __ldcg(reinterpret_cast<const uint4*>(ptr));
                         }
-                        const auto b = reinterpret_cast<const nv_bfloat162*>(&v);
+                        const auto b = reinterpret_cast<const nv_bfloat162*>(&v[i]);
                         #pragma unroll
                         for (uint32_t l = 0; l < 4; ++ l)
-                            ptx::accumulate(acc[l], b[l]);
+                            ptx::accumulate(acc[i][l], b[l]);
                     }
+                }
+                const auto rec = fst + static_cast<int64_t>(t) * kIBRecBytes;
+                #pragma unroll
+                for (uint32_t i = 0; i < kPPI; ++ i) {
+                    const uint32_t p = qtr * kPPI + i;
                     if constexpr (kIBFp8Combine) {
                         // 8 columns per lane, 16 lanes per 128-column block: amax over the half-warp
                         float amax = 0.f;
                         #pragma unroll
                         for (uint32_t l = 0; l < 4; ++ l)
-                            amax = fmaxf(amax, fmaxf(fabsf(acc[l].x), fabsf(acc[l].y)));
+                            amax = fmaxf(amax, fmaxf(fabsf(acc[i][l].x), fabsf(acc[i][l].y)));
                         #pragma unroll
                         for (uint32_t d = 1; d < 16; d <<= 1)
                             amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
@@ -499,7 +530,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         auto qs = reinterpret_cast<__nv_fp8x2_storage_t*>(&q);
                         #pragma unroll
                         for (uint32_t l = 0; l < 4; ++ l)
-                            qs[l] = __nv_cvt_float2_to_fp8x2(make_float2(acc[l].x * inv, acc[l].y * inv), __NV_SATFINITE, __NV_E4M3);
+                            qs[l] = __nv_cvt_float2_to_fp8x2(make_float2(acc[i][l].x * inv, acc[i][l].y * inv), __NV_SATFINITE, __NV_E4M3);
                         const uint32_t col = (p * 32 + lane_idx) * 8;
                         *reinterpret_cast<uint2*>(rec + col) = q;
                         if (lane_idx % 16 == 0)
@@ -509,7 +540,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         auto ob = reinterpret_cast<nv_bfloat162*>(&o);
                         #pragma unroll
                         for (uint32_t l = 0; l < 4; ++ l)
-                            ob[l] = __float22bfloat162_rn(acc[l]);
+                            ob[l] = __float22bfloat162_rn(acc[i][l]);
                         *reinterpret_cast<uint4*>(rec + (p * 32 + lane_idx) * 16) = o;
                     }
                 }
@@ -517,7 +548,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (lane_idx == 0) {
                     __threadfence();
                     const uint32_t c = t / kIBChunk, size = cute::min(kIBChunk, nt - c * kIBChunk);
-                    if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][c], 1u) + 1 == size) {
+                    if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][c], 1u) + 1 == size * kSplit) {
                         const auto gin = make_gin(c + nr);
                         const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
                         gin.put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
@@ -819,16 +850,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (ib_rem) {
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
+                constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = 5;
                 #pragma unroll
-                for (uint32_t u = 0; u < kIBTokBytes / (32 * 16); u += 2) {
-                    const uint32_t o0 = (u * 32 + lane_idx) * 16, o1 = ((u + 1) * 32 + lane_idx) * 16;
-                    uint4 v0 = ib_ldv4(src_base_ptr + o0);
-                    uint4 v1 = (u + 1) * 32 * 16 < kIBTokBytes ? ib_ldv4(src_base_ptr + o1) : uint4{0, 0, 0, 0};
-                    while (ib_is_sentinel4(v0)) v0 = ib_ldv4(src_base_ptr + o0);
-                    while (ib_is_sentinel4(v1)) v1 = ib_ldv4(src_base_ptr + o1);
-                    *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o0) = v0;
-                    if ((u + 1) * 32 * 16 < kIBTokBytes)
-                        *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o1) = v1;
+                for (uint32_t u0 = 0; u0 < kUnits; u0 += kBatch) {
+                    uint4 v[kBatch];
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kBatch; ++ b)
+                        if (u0 + b < kUnits) v[b] = ib_ldv4(src_base_ptr + ((u0 + b) * 32 + lane_idx) * 16);
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kBatch; ++ b) {
+                        if (u0 + b < kUnits) {
+                            const uint32_t o = ((u0 + b) * 32 + lane_idx) * 16;
+                            while (ib_is_sentinel4(v[b])) v[b] = ib_ldv4(src_base_ptr + o);
+                            *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o) = v[b];
+                        }
+                    }
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");  // generic stores, read by the GEMM's TMA
             }
@@ -1350,9 +1386,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
             const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
-            for (uint32_t i = epilogue_thread_idx; i < nt * kNumTopk; i += kNumEpilogueThreads) {
-                while (ptx::ld_volatile(idx + i) == kIBIdxSentinel);
-                while (ptx::ld_volatile(wts + i) == 0xffffffffu);
+            // The GEMM stages of this SM are unused until the first task, which needs these counts: stage the
+            // polled top-k (as u16 expert + 1, 0 = masked) in smem_b so the slot loop runs from shared memory
+            auto e_smem = reinterpret_cast<uint16_t*>(&shared_storage.smem_b);
+            DG_STATIC_ASSERT(kNumMaxTokensPerRank * kNumTopk * 2 <= sizeof(shared_storage.smem_b), "IB D1 smem");
+            DG_STATIC_ASSERT(kNumExperts < 65535, "IB D1 u16 experts");
+            for (uint32_t i0 = 0; i0 < nt * kNumTopk; i0 += kNumEpilogueThreads * 4) {
+                uint64_t v[4];
+                uint32_t wv[4];
+                #pragma unroll
+                for (uint32_t u = 0; u < 4; ++ u) {
+                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                    v[u] = i < nt * kNumTopk ? ptx::ld_volatile(idx + i) : 0ull;
+                    wv[u] = i < nt * kNumTopk ? ptx::ld_volatile(wts + i) : 0u;
+                }
+                #pragma unroll
+                for (uint32_t u = 0; u < 4; ++ u) {
+                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                    if (i < nt * kNumTopk) {
+                        while (v[u] == kIBIdxSentinel)
+                            v[u] = ptx::ld_volatile(idx + i);
+                        while (wv[u] == 0xffffffffu)
+                            wv[u] = ptx::ld_volatile(wts + i);
+                        e_smem[i] = static_cast<int64_t>(v[u]) >= 0 ? static_cast<uint16_t>(v[u] + 1) : 0;
+                    }
+                }
             }
             auto cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
             const uint32_t num_node_experts = ib_lsa * kNumExpertsPerRank;
@@ -1366,7 +1424,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (epilogue_warp_idx == 0) {
                 for (uint32_t b = 0; b < nt * kNumTopk; b += 32) {
                     const uint32_t j = b + lane_idx;
-                    const int e = j < nt * kNumTopk ? static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + j))) : -1;
+                    const int e = j < nt * kNumTopk ? static_cast<int>(e_smem[j]) - 1 : -1;
                     const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
                     const bool on = e >= 0 and r / ib_lsa == ib_my_node;
                     const uint32_t key = on ? static_cast<uint32_t>(e) : (0x80000000u | lane_idx);
@@ -1954,15 +2012,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const bool hit = (ib_nodes_hit >> n) & 1u;
                 if constexpr (kIBFp8Combine) {
                     const auto rec = ib_ret(ib_parity, n) + static_cast<int64_t>(token_idx) * kIBRecBytes;
+                    // All loads of the record part first (independent), then the sentinel checks
+                    uint64_t qv[kNumUint4PerLane];
+                    uint32_t sv[kNumUint4PerLane];
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
+                        qv[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(rec + col));
+                        sv[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4));
+                    }
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
                         const auto qptr = reinterpret_cast<uint64_t*>(rec + col);
                         const auto sptr = reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4);
-                        uint64_t q = ptx::ld_volatile(qptr);
+                        uint64_t q = qv[j];
                         while (q == ~0ull)
                             q = ptx::ld_volatile(qptr);
-                        uint32_t sbits = ptx::ld_volatile(sptr);
+                        uint32_t sbits = sv[j];
                         while (sbits == 0xffffffffu)
                             sbits = ptx::ld_volatile(sptr);
                         if (hit) {
@@ -1987,10 +2054,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     continue;
                 }
                 const auto rec = ib_ret(ib_parity, n) + static_cast<int64_t>(token_idx) * kIBRecBytes + chunk_byte_offset;
+                uint4 vv[kNumUint4PerLane];
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j)
+                    vv[j] = ib_ldv4(rec + (j * 32 + lane_idx) * 16);
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                     const auto ptr = rec + (j * 32 + lane_idx) * 16;
-                    uint4 v = ib_ldv4(ptr);
+                    uint4 v = vv[j];
                     while (ib_is_sentinel4(v))
                         v = ib_ldv4(ptr);
                     if (hit) {

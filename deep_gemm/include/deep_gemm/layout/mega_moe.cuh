@@ -107,6 +107,12 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
     alignas(128) uint64_t ib_landing_expected[kNumMaxRanks];  // local: cumulative signals expected from each source (v3a)
     alignas(128) uint32_t ib_pack_count[2][kNumMaxRanks];  // local: rows packed per peer this launch, by epoch parity (v4)
+    static constexpr uint32_t kIBMaxExpertsPerRank = 128;
+    static constexpr uint32_t kIBNumCombineGroups = 4;
+    alignas(128) uint32_t ib_src_prefix[kNumMaxRanks][kIBMaxExpertsPerRank + 1];  // v5b: row offset of (source, local expert) in the combine staging / landing
+    alignas(128) uint32_t ib_group_total[2][kIBNumCombineGroups];  // v5b: staged row-tiles expected per expert group, by epoch parity
+    alignas(128) uint32_t ib_group_done[2][kIBNumCombineGroups];
+    alignas(128) uint64_t ib_combine_expected[kNumMaxRanks];  // v5b: cumulative combine signals expected from each expert rank
     alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
     alignas(128) uint32_t ib_pool_combine_idx[kNumMaxIBPoolTokens];
     alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
@@ -237,6 +243,26 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_ib_pack_count_ptr(const uint32_t& parity, const uint32_t& peer) const {
         return signals->ib_pack_count[parity] + peer;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_ib_src_prefix_ptr(const uint32_t& src_rank_idx, const uint32_t& local_expert_idx) const {
+        return signals->ib_src_prefix[src_rank_idx] + local_expert_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_ib_group_total_ptr(const uint32_t& parity, const uint32_t& group) const {
+        return signals->ib_group_total[parity] + group;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_ib_group_done_ptr(const uint32_t& parity, const uint32_t& group) const {
+        return signals->ib_group_done[parity] + group;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_combine_expected_ptr(const uint32_t& rank_idx) const {
+        return signals->ib_combine_expected + rank_idx;
     }
 
     CUTLASS_DEVICE

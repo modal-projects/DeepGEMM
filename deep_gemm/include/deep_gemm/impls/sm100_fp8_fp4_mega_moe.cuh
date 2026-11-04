@@ -175,6 +175,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_combine_landing = ib_landing + kNumRanks * ib_landing_stride;
     // v5a: per-peer pack blocks (gathered rows + map) with the landing layout; own region, so no reuse hazard
     const auto ib_pack = ib_combine_landing + kNumRanks * kIBCombineLandingBytes;
+    const uint32_t ib_parity = static_cast<uint32_t>(ib_epoch & 1);
+    // v5b: combine rows are staged in (source, local expert, slot) order and sent per expert group as the group's
+    // last L2 row-tile lands (one put + strong signal per group and source)
+    constexpr uint32_t kIBNumCombineGroups = layout::MegaMoESignals::kIBNumCombineGroups;
+    constexpr uint32_t kIBNumL2NTiles = L2_SHAPE_N / BLOCK_N;
+    DG_STATIC_ASSERT(kNumExpertsPerRank <= layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB prefix table too small");
+    const auto ib_group_of = [](const uint32_t& local_expert_idx) { return local_expert_idx * kIBNumCombineGroups / kNumExpertsPerRank; };
+    const auto ib_group_begin = [](const uint32_t& g) { return (g * kNumExpertsPerRank + kIBNumCombineGroups - 1) / kIBNumCombineGroups; };
 #else
     constexpr bool kIsIB = false;
     constexpr int64_t ib_token_bytes = 0, ib_off_sf = 0, ib_sf_bytes = 0;  // unused without IB
@@ -511,6 +519,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // strong signal on context `piece`
         if (sm_idx == 0 and thread_idx < kNumRanks)
             *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1) ^ 1u, thread_idx) = 0;
+        if (sm_idx == 0 and thread_idx < kIBNumCombineGroups) {
+            *workspace.get_ib_group_total_ptr(ib_parity ^ 1u, thread_idx) = 0;
+            *workspace.get_ib_group_done_ptr(ib_parity ^ 1u, thread_idx) = 0;
+        }
         if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
             const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
             const auto stage_p = ib_pack + peer * ib_landing_stride;
@@ -645,7 +657,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             reinterpret_cast<unsigned long long*>(workspace.get_expert_recv_count_ptr(r, le)), 1ull));
                     }
                     if (mine)
-                        *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j | (idx << 16);
+                        *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j;
                     num_pairs += __popc(ballot);
                   }
                 }
@@ -654,31 +666,128 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     *workspace.get_expert_recv_count_ptr(r, lane_idx) = cnt;
                 if (lane_idx == 0)
                     *workspace.get_ib_pairs_from_ptr(r) = num_pairs;
+                __syncwarp();
+                // v5b: exclusive prefix of the per-expert counts = row offset of (r, expert) in the combine staging;
+                // the group totals count row-tiles (rows x L2 N tiles) the epilogue will stage
+                {
+                    uint32_t run = 0;
+                    for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
+                        const uint32_t e = e0 + lane_idx;
+                        uint32_t c = 0;
+                        if (e < kNumExpertsPerRank)
+                            c = kIBRegisterCounters ? cnt : static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(r, e));
+                        uint32_t incl = c;
+                        #pragma unroll
+                        for (uint32_t d = 1; d < 32; d <<= 1) {
+                            const uint32_t v = __shfl_up_sync(0xffffffff, incl, d);
+                            if (lane_idx >= d) incl += v;
+                        }
+                        if (e < kNumExpertsPerRank) {
+                            *workspace.get_ib_src_prefix_ptr(r, e) = run + incl - c;
+                            if (c > 0)
+                                atomicAdd(workspace.get_ib_group_total_ptr(ib_parity, ib_group_of(e)), c * kIBNumL2NTiles);
+                        }
+                        run += __shfl_sync(0xffffffff, incl, 31);
+                    }
+                    if (lane_idx == 0)
+                        *workspace.get_ib_src_prefix_ptr(r, kNumExpertsPerRank) = run;
+                }
             }
             if (do_b) {
-                // (b) our own pairs routed to rank r
+                // (b) our own pairs routed to rank r: ib_combine_idx[j] = prefix_r(expert) + slot among my pairs to that
+                // expert (pair order), which is exactly where r stages the row (v5b). Pass 1 counts per expert, pass 2
+                // assigns; counters live in lane registers (<= 32 experts) or in a scratch slot (atomics)
                 const auto own = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-                uint32_t num_own = 0;
-                for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll) {
-                  int es[kIBScanUnroll];
-                  #pragma unroll
-                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
-                    const uint32_t j = base0 + u * 32 + lane_idx;
-                    es[u] = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
-                  }
-                  #pragma unroll
-                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
-                    const uint32_t base = base0 + u * 32;
-                    if (base >= num_tokens * kNumTopk)
-                        break;
-                    const uint32_t j = base + lane_idx;
-                    const int e = es[u];
-                    const bool to_r = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r;
-                    const uint32_t ballot = __ballot_sync(0xffffffff, to_r);
-                    if (to_r)
-                        *workspace.get_ib_combine_idx_ptr(j) = num_own + __popc(ballot & ((1u << lane_idx) - 1));
-                    num_own += __popc(ballot);
-                  }
+                constexpr bool kReg = kNumExpertsPerRank <= 32;
+                DG_STATIC_ASSERT(layout::MegaMoESignals::kNumIBScratchBytes >= 4 * layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB scratch too small");
+                DG_STATIC_ASSERT(2 * kNumRanks <= layout::MegaMoESignals::kNumMaxIBScratchSlots, "IB scratch slots");
+                auto* scratch_cnt = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[r]);
+                auto* scratch_pre = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[kNumRanks + r]);
+                const uint32_t lt_mask_b = (1u << lane_idx) - 1;
+                uint32_t reg_cnt = 0, reg_pre_ = 0;
+                const auto assign = [&](const uint32_t& le, const bool& mine) -> uint32_t {
+                    uint32_t slot = 0;
+                    if constexpr (kReg) {
+                        if (__ballot_sync(0xffffffff, mine) != 0) {
+                            #pragma unroll 1
+                            for (uint32_t l = 0; l < kNumExpertsPerRank; ++l) {
+                                const uint32_t m = __ballot_sync(0xffffffff, le == l);
+                                const uint32_t base_l = __shfl_sync(0xffffffff, reg_cnt, l);
+                                if (le == l)
+                                    slot = base_l + __popc(m & lt_mask_b);
+                                if (lane_idx == l)
+                                    reg_cnt += __popc(m);
+                            }
+                        }
+                    } else if (mine) {
+                        slot = atomicAdd(scratch_cnt + le, 1u);
+                    }
+                    return slot;
+                };
+                if constexpr (not kReg) {
+                    for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
+                        scratch_cnt[e] = 0;
+                    __syncwarp();
+                }
+                #pragma unroll 1
+                for (uint32_t pass = 0; pass < 2; ++pass) {
+                    for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll) {
+                      int es[kIBScanUnroll];
+                      #pragma unroll
+                      for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
+                        const uint32_t j = base0 + u * 32 + lane_idx;
+                        es[u] = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
+                      }
+                      #pragma unroll
+                      for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
+                        const uint32_t base = base0 + u * 32;
+                        if (base >= num_tokens * kNumTopk)
+                            break;
+                        const uint32_t j = base + lane_idx;
+                        const int e = es[u];
+                        const bool to_r = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r;
+                        const uint32_t le = to_r ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
+                        const uint32_t slot = assign(le, to_r);
+                        if (pass == 1 and to_r) {
+                            uint32_t pre;
+                            if constexpr (kReg) pre = __shfl_sync(0xffffffff, reg_pre_, le); else pre = scratch_pre[le];
+                            *workspace.get_ib_combine_idx_ptr(j) = pre + slot;
+                        }
+                      }
+                    }
+                    if (pass == 0) {
+                        // prefix over experts + the number of non-empty groups r will signal us for
+                        __syncwarp();
+                        uint32_t run = 0, group_mask = 0;
+                        for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
+                            const uint32_t e = e0 + lane_idx;
+                            uint32_t c = 0;
+                            if (e < kNumExpertsPerRank)
+                                c = kReg ? reg_cnt : scratch_cnt[e];
+                            uint32_t incl = c;
+                            #pragma unroll
+                            for (uint32_t d = 1; d < 32; d <<= 1) {
+                                const uint32_t v = __shfl_up_sync(0xffffffff, incl, d);
+                                if (lane_idx >= d) incl += v;
+                            }
+                            if (e < kNumExpertsPerRank) {
+                                if constexpr (kReg) reg_pre_ = run + incl - c; else scratch_pre[e] = run + incl - c;
+                                if (c > 0)
+                                    group_mask |= 1u << ib_group_of(e);
+                            }
+                            run += __shfl_sync(0xffffffff, incl, 31);
+                        }
+                        group_mask = __reduce_or_sync(0xffffffff, group_mask);
+                        if (lane_idx == 0)
+                            *workspace.get_ib_combine_expected_ptr(r) += __popc(group_mask);
+                        // reset the counters for pass 2
+                        reg_cnt = 0;
+                        if constexpr (not kReg) {
+                            for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
+                                scratch_cnt[e] = 0;
+                        }
+                        __syncwarp();
+                    }
                 }
             }
             __threadfence();
@@ -805,11 +914,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             if (is_remote(current_rank_in_expert_idx)) {
-                // v2d: high 16 bits = this row's index in the source's contiguous combine chunk
+                // v5b: this row's staging index = prefix of (source, local expert) + slot (pair order on both sides)
                 if (cute::elect_one_sync())
                     *workspace.get_ib_pool_combine_idx_ptr(expert_pool_block_offset * BLOCK_M + (token_idx - expert_start_idx)) =
-                        src_token_topk_idx >> 16;
-                src_token_topk_idx &= 0xffffu;
+                        *workspace.get_ib_src_prefix_ptr(current_rank_in_expert_idx, current_expert_idx) + token_idx_in_rank;
             }
 #endif
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
@@ -1593,6 +1701,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 prefetch_prologue(num_valid_store_blocks, raw_values);
 
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                uint32_t ib_staged_rows = 0;
+#endif
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumStoreBlocks; ++ s) {
                     if (s >= num_valid_store_blocks)
@@ -1680,13 +1791,50 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const auto chunk_idx = *workspace.get_ib_pool_combine_idx_ptr(pool_m_idx + m_idx_in_block);
                             const auto staging_ptr = reinterpret_cast<float4*>(
                                 ib_combine_staging + dst_rank_idx * ib_combine_bytes + static_cast<int64_t>(chunk_idx) * kIBRowBytes + offset_in_row);
-                            *staging_ptr = packed;  // sent as whole rows after the L2 grid sync (v2a)
+                            *staging_ptr = packed;  // sent per expert group once the group's rows are all staged (v5b)
+                            if (lane_idx % 16 == 0)
+                                ++ib_staged_rows;
                         }
 #endif
                         if (not is_remote_row)
                             *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
                 }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                {
+                    // v5b: account this warp's staged row-tiles; the warp that completes an expert group sends the
+                    // group's rows (contiguous per source in staging and in the source's landing) with a strong signal
+                    const uint32_t n_staged = __reduce_add_sync(0xffffffff, ib_staged_rows);
+                    ib_staged_rows = 0;
+                    if (n_staged > 0 and not task_info.is_shared()) {
+                        __threadfence();
+                        const uint32_t g = ib_group_of(task_info.local_expert_idx);
+                        uint32_t old = 0;
+                        if (lane_idx == 0)
+                            old = atomicAdd(workspace.get_ib_group_done_ptr(ib_parity, g), n_staged);
+                        old = __shfl_sync(0xffffffff, old, 0);
+                        if (old + n_staged == ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g)) and lane_idx == 0) {
+                            const auto gin = make_gin();
+                            const uint32_t gb = ib_group_begin(g), ge = ib_group_begin(g + 1);
+                            for (uint32_t s = 0; s < kNumRanks; ++s) {
+                                if (not is_remote(s))
+                                    continue;
+                                const uint32_t r0 = *workspace.get_ib_src_prefix_ptr(s, gb), r1 = *workspace.get_ib_src_prefix_ptr(s, ge);
+                                if (r1 > r0) {
+                                    gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes + static_cast<int64_t>(r0) * kIBRowBytes,
+                                            ib_combine_staging + s * ib_combine_bytes + static_cast<int64_t>(r0) * kIBRowBytes,
+                                            static_cast<uint64_t>(r1 - r0) * kIBRowBytes, s);
+                                    gin.signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), s);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
+                                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(r1 - r0) * kIBRowBytes);
+#endif
+                                }
+                            }
+                        }
+                    }
+                }
+#endif
 
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -1757,23 +1905,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         {
             IB_TRACE(6, sm_idx == 0 and epilogue_thread_idx == 0);
-            // v2d combine: every staged row is complete after the grid sync; SM 0 sends each remote source its
-            // whole chunk (rows ordered by the source's (token, top-k)) as one put, then a strong signal on the
-            // same context, which settles it
-            // v2f: SM `src` posts source src's chunk from one lane, on context src % contexts
-            if (sm_idx < kNumRanks and epilogue_thread_idx == 0 and is_remote(sm_idx)) {
-                const uint32_t src = sm_idx;
-                const auto num_rows = static_cast<uint32_t>(*workspace.get_ib_pairs_from_ptr(src));
-                const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, src);
-                if (num_rows > 0)
-                    gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes,
-                            ib_combine_staging + src * ib_combine_bytes, static_cast<uint64_t>(num_rows) * kIBRowBytes, src);
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(num_rows) * kIBRowBytes);
-#endif
-                gin.signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), src);
-            }
+            // v5b: combine rows were sent per expert group from the L2 epilogue; nothing left to send here
 
             // Every SM must finish reading the per-expert counts above before any SM's dispatch warps clear them
             // (that cleanup only waits for its own SM's epilogue); the sync also orders all row puts before the signals
@@ -1819,7 +1951,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool ib_peer_remote = is_routed and is_remote(ib_peer_rank);
             const auto ib_peer_ready_ptr = workspace.get_ib_combine_ready_ptr(ib_peer_rank);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
-                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) == ib_epoch : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
+                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) >= *workspace.get_ib_combine_expected_ptr(ib_peer_rank)
+                                : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
 #else
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
 #endif

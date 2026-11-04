@@ -361,17 +361,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     }
     cute::cluster_sync();
 
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-    // Warm the Gin path (the first op of a launch costs ~10 us) while the previous kernel may still be finishing:
-    // one 8-byte put per (context, counterpart) into a scratch word nobody reads (it carries no data, so a late
-    // landing is harmless); the real meta put after the staging then pays only the steady-state issue cost
-    if (sm_idx == kNumSMs - 1 and warp_idx == 0 and lane_idx < DG_MEGA_MOE_IB_CONTEXTS * (ib_num_nodes - 1)) {
-        const uint32_t n = ib_node_of_slot(lane_idx / DG_MEGA_MOE_IB_CONTEXTS);
-        make_gin(lane_idx % DG_MEGA_MOE_IB_CONTEXTS).put_value(&workspace.signals->ib_o_scratch, ib_epoch, ib_cp(sym_buffer.rank_idx, n));
-    }
-    __syncwarp();
-#endif
-
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
     IB_TRACE(16, sm_idx == 0 and thread_idx == 0);

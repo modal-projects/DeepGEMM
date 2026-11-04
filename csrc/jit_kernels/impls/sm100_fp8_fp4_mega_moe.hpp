@@ -152,6 +152,8 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(std::getenv("DG_MEGA_MOE_IB_TRACE") != nullptr ? "#define DG_MEGA_MOE_IB_TRACE 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_BF16_COMBINE") != nullptr ? "#define DG_MEGA_MOE_IB_BF16_COMBINE 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_FLAG_REDUCE") != nullptr ? "#define DG_MEGA_MOE_IB_FLAG_REDUCE 1\n" : "") +
+        std::string(std::getenv("DG_MEGA_MOE_IB_META_FIRST") != nullptr ? "#define DG_MEGA_MOE_IB_META_FIRST 1\n" : "") +
+        std::string(std::getenv("DG_MEGA_MOE_IB_NO_BACKOFF") != nullptr ? "#define DG_MEGA_MOE_IB_NO_BACKOFF 1\n" : "") +
         (std::getenv("DG_MEGA_MOE_IB_DIAG") != nullptr ? std::format("#define DG_MEGA_MOE_IB_DIAG {}\n", std::getenv("DG_MEGA_MOE_IB_DIAG")) : std::string()) + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 

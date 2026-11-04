@@ -748,10 +748,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const bool to_r = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r;
                         const uint32_t le = to_r ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
                         const uint32_t slot = assign(le, to_r);
-                        if (pass == 1 and to_r) {
-                            uint32_t pre;
-                            if constexpr (kReg) pre = __shfl_sync(0xffffffff, reg_pre_, le); else pre = scratch_pre[le];
-                            *workspace.get_ib_combine_idx_ptr(j) = pre + slot;
+                        if (pass == 1) {
+                            // the shuffle is warp-collective: every lane takes part (source lane 0 when not routed)
+                            uint32_t pre = 0;
+                            if constexpr (kReg) pre = __shfl_sync(0xffffffff, reg_pre_, to_r ? le : 0u);
+                            else if (to_r) pre = scratch_pre[le];
+                            if (to_r)
+                                *workspace.get_ib_combine_idx_ptr(j) = pre + slot;
                         }
                       }
                     }
@@ -1832,6 +1835,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             }
                         }
+                        __syncwarp();  // lane 0 may have been posting; the named barrier below needs the whole warp
                     }
                 }
 #endif

@@ -1347,6 +1347,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                            sym_buffer.rank_idx, s, (unsigned long long) h, (unsigned long long) ib_epoch);
             });
             const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
+            IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
             const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
             for (uint32_t i = epilogue_thread_idx; i < nt * kNumTopk; i += kNumEpilogueThreads) {
@@ -1361,6 +1362,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (epilogue_thread_idx == 0)
                 workspace.signals->ib_o_nt[n] = nt;
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            IB_TRACE(21, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             if (epilogue_warp_idx == 0) {
                 for (uint32_t b = 0; b < nt * kNumTopk; b += 32) {
                     const uint32_t j = b + lane_idx;
@@ -1383,6 +1385,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __threadfence_system();
             }
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             for (uint32_t i = epilogue_thread_idx; i < num_node_experts; i += kNumEpilogueThreads) {
                 const uint32_t d = ib_my_node * ib_lsa + i / kNumExpertsPerRank, e = i % kNumExpertsPerRank;
                 *sym_buffer.map(workspace.get_expert_recv_count_ptr(s, e), d) = cnt[i];
@@ -2047,8 +2050,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: posted=%.1f pre_pull_barrier=%.1f counts=%.1f proxy_d1(sm last)=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(0), us(2), us(3), us(19), us(5), us(6), us(9), t[18] / 1e3);
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_polled=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(0), us(2), us(20), us(21), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3);
         }
 #endif
     }

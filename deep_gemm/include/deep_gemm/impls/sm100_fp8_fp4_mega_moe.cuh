@@ -183,6 +183,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumExpertsPerRank <= layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB prefix table too small");
     const auto ib_group_of = [](const uint32_t& local_expert_idx) { return local_expert_idx * kIBNumCombineGroups / kNumExpertsPerRank; };
     const auto ib_group_begin = [](const uint32_t& g) { return (g * kNumExpertsPerRank + kIBNumCombineGroups - 1) / kIBNumCombineGroups; };
+    const auto ib_atom_add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
+        uint32_t old;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(v) : "memory");
+        return old;
+    };
 #else
     constexpr bool kIsIB = false;
     constexpr int64_t ib_token_bytes = 0, ib_off_sf = 0, ib_sf_bytes = 0;  // unused without IB
@@ -270,6 +275,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier task_info_full_barriers[kNumScheduleStages];
         Barrier task_info_empty_barriers[kNumScheduleStages];
         uint32_t tmem_ptr_in_smem;
+        uint32_t ib_post_group;  // v5c: (generation << 8) | expert group whose combine rows this CTA must send
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -1387,6 +1393,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // GEMM epilogue warps
         const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        uint32_t ib_post_seen = 0;
+        if (epilogue_warp_idx == 0 and lane_idx == 0)
+            shared_storage.ib_post_group = 0;
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+#endif
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
         const auto epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
         const auto warp_idx_in_wg = epilogue_warp_idx % 4;
@@ -1805,21 +1817,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 {
-                    // v5b: account this warp's staged row-tiles; the warp that completes an expert group sends the
-                    // group's rows (contiguous per source in staging and in the source's landing) with a strong signal
+                    // v5c: per task, each warp adds its staged row-tiles to the expert group's counter (acq_rel
+                    // atomic: this warp's row stores are released, the finisher acquires everyone's). The warp
+                    // that completes the group publishes it in shared memory; after the task barrier every
+                    // epilogue warp sends that group's rows to the sources it owns (one put + strong signal each)
                     const uint32_t n_staged = __reduce_add_sync(0xffffffff, ib_staged_rows);
                     ib_staged_rows = 0;
                     if (n_staged > 0 and not task_info.is_shared()) {
-                        __threadfence();
                         const uint32_t g = ib_group_of(task_info.local_expert_idx);
                         uint32_t old = 0;
                         if (lane_idx == 0)
-                            old = atomicAdd(workspace.get_ib_group_done_ptr(ib_parity, g), n_staged);
+                            old = ib_atom_add_acq_rel(workspace.get_ib_group_done_ptr(ib_parity, g), n_staged);
                         old = __shfl_sync(0xffffffff, old, 0);
-                        if (old + n_staged == ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g)) and lane_idx == 0) {
+                        if (lane_idx == 0 and old + n_staged == ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g)))
+                            shared_storage.ib_post_group = g | (((shared_storage.ib_post_group >> 8) + 1u) << 8);
+                    }
+                }
+#endif
+                // Ensure the next epilogue safe to use shared memory
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                {
+                    const uint32_t v = shared_storage.ib_post_group;
+                    if (v != ib_post_seen) {
+                        ib_post_seen = v;
+                        const uint32_t g = v & 0xffu;
+                        const uint32_t gb = ib_group_begin(g), ge = ib_group_begin(g + 1);
+                        if (lane_idx == 0) {
                             const auto gin = make_gin();
-                            const uint32_t gb = ib_group_begin(g), ge = ib_group_begin(g + 1);
-                            for (uint32_t s = 0; s < kNumRanks; ++s) {
+                            for (uint32_t s = epilogue_warp_idx; s < kNumRanks; s += kNumEpilogueWarps) {
                                 if (not is_remote(s))
                                     continue;
                                 const uint32_t r0 = *workspace.get_ib_src_prefix_ptr(s, gb), r1 = *workspace.get_ib_src_prefix_ptr(s, ge);
@@ -1835,13 +1861,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             }
                         }
-                        __syncwarp();  // lane 0 may have been posting; the named barrier below needs the whole warp
+                        __syncwarp();
                     }
+                    // every warp has read the published group before the next task's finisher can overwrite it
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
 #endif
-
-                // Ensure the next epilogue safe to use shared memory
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
         }
 

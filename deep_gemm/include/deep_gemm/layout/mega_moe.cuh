@@ -108,7 +108,7 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_landing_expected[kNumMaxRanks];  // local: cumulative signals expected from each source (v3a)
     alignas(128) uint32_t ib_pack_count[2][kNumMaxRanks];  // local: rows packed per peer this launch, by epoch parity (v4)
     static constexpr uint32_t kIBMaxExpertsPerRank = 128;
-    static constexpr uint32_t kIBNumCombineGroups = 4;
+    static constexpr uint32_t kIBNumCombineGroups = 8;
     alignas(128) uint32_t ib_src_prefix[kNumMaxRanks][kIBMaxExpertsPerRank + 1];  // v5b: row offset of (source, local expert) in the combine staging / landing
     alignas(128) uint32_t ib_group_total[2][kIBNumCombineGroups];  // v5b: staged row-tiles expected per expert group, by epoch parity
     alignas(128) uint32_t ib_group_done[2][kIBNumCombineGroups];

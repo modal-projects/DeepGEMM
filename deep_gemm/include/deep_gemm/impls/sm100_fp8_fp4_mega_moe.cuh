@@ -179,7 +179,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kIBPCombStride = static_cast<int64_t>(kNumTopk) * kIBT * kHidden * 2;
     constexpr int64_t kIBFStageStride = kIBT * kIBRecAlloc;
     DG_STATIC_ASSERT(kIBRecBytes % 16 == 0, "IB record alignment");
-    constexpr int64_t kIBNodeStride = 2 * kIBMirrorStride + 2 * kIBRetStride + kIBPCombStride + kIBFStageStride;
+    // Proxy-local slot table: entry (node-local rank, local expert, slot) -> pair index; the expert hosts read it over
+    // NVLink in their pull (one load per row) instead of the proxy writing ~K x T scattered entries over NVLink
+    constexpr int64_t kIBPTabStride = static_cast<int64_t>(kNumRanks) * kNumExpertsPerRank * kIBT * 4;
+    constexpr int64_t kIBNodeStride = 2 * kIBMirrorStride + 2 * kIBRetStride + kIBPCombStride + kIBFStageStride + kIBPTabStride;
     constexpr uint32_t kIBChunk = 32;  // tokens per dispatch x put and per return put
     DG_STATIC_ASSERT(kIBT <= kIBChunk * layout::MegaMoESignals::kIBOMaxChunks, "IB chunk table");
     const auto ib_tail = math::advance_ptr<uint8_t>(sym_buffer.get_base_ptr(), math::align<int64_t>(buffer.get_num_bytes(), 128));
@@ -187,6 +190,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_ret = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + p * kIBRetStride; };
     const auto ib_pcomb = [&](const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + 2 * kIBRetStride; };
     const auto ib_fstage = [&](const uint32_t& n) { return ib_pcomb(n) + kIBPCombStride; };
+    const auto ib_ptab = [&](const uint32_t& n) { return reinterpret_cast<uint32_t*>(ib_fstage(n) + kIBFStageStride); };
     const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
     const auto ib_atom_add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
         uint32_t old;
@@ -790,8 +794,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Proxied sources: the slot table lives on the proxy (written by its D1 before the count release)
+            const uint32_t src_token_topk_idx = is_remote(current_rank_in_expert_idx) ?
+                *sym_buffer.map(ib_ptab(current_rank_in_expert_idx / ib_lsa) +
+                                (static_cast<int64_t>(sym_buffer.rank_idx % ib_lsa) * kNumExpertsPerRank + current_expert_idx) * kIBT + token_idx_in_rank,
+                                ib_cp(current_rank_in_expert_idx, ib_my_node)) :
+                *workspace.get_src_token_topk_idx_ptr(current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+#else
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+#endif
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -1362,12 +1375,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                        static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
             }
             __syncwarp();
+            // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire
+            if (epilogue_thread_idx == 0)
+                ptx::st_rel_sys(&workspace.signals->ib_o_meta_posted, ib_epoch);
         }
         {
             const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
             for (uint32_t q = kNumSMs - 2 - sm_idx; sm_idx + 2 <= kNumSMs and q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {
                 if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
+                    while (ptx::ld_acq_sys(&workspace.signals->ib_o_meta_posted) < ib_epoch);
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
                     int64_t off = 0, bytes = 0;
                     if (piece == 0) {
@@ -1456,7 +1473,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t pre = __popc(m & ((1u << lane_idx) - 1u));
                     if (on) {
                         const uint32_t slot = cnt[le] + pre;
-                        *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(static_cast<uint32_t>(e) % kNumExpertsPerRank, s, slot), r) = j;
+                        ib_ptab(n)[(static_cast<int64_t>(r % ib_lsa) * kNumExpertsPerRank + static_cast<uint32_t>(e) % kNumExpertsPerRank) * kIBT + slot] = j;
                     }
                     __syncwarp();
                     if (on and pre == 0)

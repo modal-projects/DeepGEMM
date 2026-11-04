@@ -58,7 +58,7 @@ class SymmBuffer:
             off_idx = T * H + T * (H // 32)
             mirror_stride = a128(off_idx + T * K * 8 + T * K * 4) + 128
             ret_stride = T * H * 2 + 128
-            node_stride = 2 * mirror_stride + 2 * ret_stride + K * T * H * 2 + T * H * 2
+            node_stride = 2 * mirror_stride + 2 * ret_stride + K * T * H * 2 + T * H * 2 + group.size() * (num_experts // group.size()) * T * 4
             lsa_guess = int(_os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0')) or min(group.size(), torch.cuda.device_count())
             num_nodes = (group.size() + lsa_guess - 1) // lsa_guess
             tail = a128(num_bytes)

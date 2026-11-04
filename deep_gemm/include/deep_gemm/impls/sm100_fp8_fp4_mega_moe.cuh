@@ -525,12 +525,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // v2c: our token count, on context 0 like the landing put; the pre-pull barrier's strong signal
             // (also SM 0, context 0) settles both at each remote rank
-            // v2f: one posting lane, looping over peers
-            if (thread_idx == 0) {
-                for (uint32_t r = 0; r < kNumRanks; ++r)
-                    if (is_remote(r))
-                        make_gin().put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), r);
-            }
+            // v2h: one lane per peer (each peer is its own QP, so lanes do not contend; v2f's one-lane loop
+            // serialized ~5 us per op)
+            if (thread_idx < kNumRanks and is_remote(thread_idx))
+                make_gin().put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), thread_idx);
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -558,21 +556,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * kIBNumLandingPieces);
                 const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
                 const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
-                uint32_t num_pairs = 0;
+                // v2h: per-expert slot counters live in lane registers (lane l counts local expert l) instead of
+                // a global atomic per pair (~1 us each, serialized): ballots + shuffles only
+                DG_STATIC_ASSERT(kNumExpertsPerRank <= 32, "IB scan keeps one expert counter per lane");
+                uint32_t num_pairs = 0, cnt = 0;
+                const uint32_t lt_mask = (1u << lane_idx) - 1;
                 for (uint32_t base = 0; base < n * kNumTopk; base += 32) {
                     const uint32_t j = base + lane_idx;
                     const int e = j < n * kNumTopk ? static_cast<int>(topk[j]) : -1;
                     const bool mine = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx;
                     const uint32_t ballot = __ballot_sync(0xffffffff, mine);
-                    if (mine) {
-                        const uint32_t idx = num_pairs + __popc(ballot & ((1u << lane_idx) - 1));
-                        const auto le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                        const auto slot = static_cast<uint32_t>(atomicAdd(
-                            reinterpret_cast<unsigned long long*>(workspace.get_expert_recv_count_ptr(r, le)), 1ull));
-                        *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j | (idx << 16);
+                    const uint32_t le = mine ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
+                    const uint32_t idx = num_pairs + __popc(ballot & lt_mask);
+                    uint32_t slot = 0;
+                    if (ballot != 0) {
+                        #pragma unroll 1
+                        for (uint32_t l = 0; l < kNumExpertsPerRank; ++l) {
+                            const uint32_t m = __ballot_sync(0xffffffff, le == l);
+                            const uint32_t base_l = __shfl_sync(0xffffffff, cnt, l);
+                            if (le == l)
+                                slot = base_l + __popc(m & lt_mask);
+                            if (lane_idx == l)
+                                cnt += __popc(m);
+                        }
                     }
+                    if (mine)
+                        *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j | (idx << 16);
                     num_pairs += __popc(ballot);
                 }
+                // only this warp touches the (remote r, local expert) counters: plain stores replace the atomics
+                if (lane_idx < kNumExpertsPerRank)
+                    *workspace.get_expert_recv_count_ptr(r, lane_idx) = cnt;
                 if (lane_idx == 0)
                     *workspace.get_ib_pairs_from_ptr(r) = num_pairs;
                 // (b) our own pairs routed to rank r

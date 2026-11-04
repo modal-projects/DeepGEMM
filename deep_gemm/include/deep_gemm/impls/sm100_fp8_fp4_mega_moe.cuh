@@ -1758,7 +1758,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
         IB_TRACE(9, sm_idx == 0 and epilogue_thread_idx == 0);
-        if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 64 == 0) {
+        if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             printf("IB_TRACE rank=%u epoch=%llu us: idx=%.1f barrier=%.1f scan=%.1f pull_end=%.1f l2_done=%.1f l2_sync=%.1f combine_put=%.1f first_wait=%.1f end=%.1f\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch,

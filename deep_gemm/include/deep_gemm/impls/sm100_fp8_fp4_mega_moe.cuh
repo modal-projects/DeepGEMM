@@ -363,6 +363,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
+    IB_TRACE(16, sm_idx == 0 and thread_idx == 0);  // opus: kernel start (after the cluster sync)
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -1182,6 +1183,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 #endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        IB_TRACE(17, sm_idx == 0 and thread_idx == 0);  // opus: cleanup barrier done
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+        if (sm_idx == 0 and thread_idx == 0)
+            workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
+#endif
         if (sm_idx == 0 and thread_idx == 0)
             *workspace.get_ib_epoch_ptr() = ib_epoch;
 #endif
@@ -2117,6 +2123,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch,
                    (t[1] - t[0]) / 1e3, (t[10] - t[0]) / 1e3, (t[11] - t[0]) / 1e3, (t[2] - t[0]) / 1e3, (t[3] - t[0]) / 1e3, (t[4] - t[0]) / 1e3,
                    (t[5] - t[0]) / 1e3, (t[6] - t[0]) / 1e3, (t[7] - t[0]) / 1e3, (t[8] - t[0]) / 1e3, (t[9] - t[0]) / 1e3);
+            printf("IB_TRACE2 rank=%u epoch=%llu us (rel. to gather end): kernel_start=%.1f combine_end_since_start=%.1f prev_launch_cleanup_end_since_start=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, ((int64_t) t[16] - (int64_t) t[0]) / 1e3,
+                   ((int64_t) t[9] - (int64_t) t[16]) / 1e3, t[18] / 1e3);
             printf("IB_PUTS rank=%u since_last_print: landing_puts=%llu landing_bytes=%llu combine_puts=%llu combine_bytes=%llu landing_region=%lld\n",
                    sym_buffer.rank_idx, (unsigned long long) t[14], (unsigned long long) t[15], (unsigned long long) t[12],
                    (unsigned long long) t[13], (long long) ib_landing_bytes);

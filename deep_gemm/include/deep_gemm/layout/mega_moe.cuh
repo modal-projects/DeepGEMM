@@ -98,6 +98,13 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_barrier_flag[2][kNumMaxRanks];
     alignas(128) uint64_t ib_combine_ready[kNumMaxRanks];  // +1 per expert-side SM per launch
     alignas(128) uint64_t ib_counts_ready;  // local: remote counts/index table built for this epoch (v2c)
+    // v2d contiguous combine: pairs from each source routed to this rank, the ordered index of each of our own
+    // (token, top-k) pairs within its expert rank's chunk, and the same index for each pool token
+    static constexpr uint32_t kNumMaxIBPairs = 1u << 16;      // max tokens x top-k per rank
+    static constexpr uint32_t kNumMaxIBPoolTokens = 1u << 20;
+    alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
+    alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
+    alignas(128) uint32_t ib_pool_combine_idx[kNumMaxIBPoolTokens];
     alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
@@ -221,6 +228,21 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_ib_barrier_flag_ptr(const uint32_t& tag_idx, const uint32_t& src_rank_idx = 0) const {
         return signals->ib_barrier_flag[tag_idx % 2] + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_pairs_from_ptr(const uint32_t& src_rank_idx) const {
+        return signals->ib_pairs_from + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_ib_combine_idx_ptr(const uint32_t& token_topk_idx) const {
+        return signals->ib_combine_idx + token_topk_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_ib_pool_combine_idx_ptr(const uint32_t& pool_token_idx) const {
+        return signals->ib_pool_combine_idx + pool_token_idx;
     }
 
     CUTLASS_DEVICE

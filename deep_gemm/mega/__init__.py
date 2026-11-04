@@ -214,6 +214,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
                   fast_math: bool = True):
+    from . import ib as _ib
+    assert not _ib.enabled(), 'bf16xbf16 Mega MoE is not supported over IB (DG_MEGA_MOE_IB): sm100_bf16_mega_moe.cuh is NVLink-only'
     _C.bf16_mega_moe(
         y,
         l1_weights,

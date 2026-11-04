@@ -322,8 +322,8 @@ struct MegaMoEScheduler {
             for (uint32_t r = 0; r < kNumRanks; ++ r) {
                 if (not ib_is_remote(r))
                     continue;
-                // the source's SM 0 strong-signals once per Gin context per launch (v2a')
-                while (ptx::ld_acq_sys(workspace.get_ib_arrival_ptr(r)) != ib_epoch * DG_MEGA_MOE_IB_CONTEXTS);
+                // v2c: SM 0 builds remote counts from the landing copies, then publishes ib_counts_ready
+                while (ptx::ld_acq_sys(workspace.get_ib_counts_ready_ptr()) != ib_epoch);
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
                     const auto expert_idx = i * 32 + ptx::get_lane_idx();

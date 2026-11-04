@@ -422,10 +422,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if (is_remote(dst_rank_idx)) {
-                make_gin().put_value(dst_ptr, static_cast<uint32_t>(token_topk_idx), dst_rank_idx);
-                return;
-            }
+            if (is_remote(dst_rank_idx))
+                return;  // v2c: the receiver builds this entry from our landing copy
 #endif
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
@@ -446,8 +444,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (thread_idx < kNumRanks) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (is_remote(thread_idx))
-                    make_gin().put_value(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx),
-                                         static_cast<uint64_t>(ptx::get_grid_idx() + 1), thread_idx);
+                    ;  // v2c: remote readiness uses ib_combine_ready
                 else
 #endif
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
@@ -460,12 +457,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                if (is_remote(dst_rank_idx)) {
-                    // Plain put into the per-source slot; never the GPU-atomic sum (DESIGN-v1 rule)
-                    make_gin().put_value(workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                                         static_cast<uint64_t>(expert_status & 0xffffffff), dst_rank_idx);
-                    continue;
-                }
+                if (is_remote(dst_rank_idx))
+                    continue;  // v2c: the receiver counts our tokens from the landing copy
 #endif
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
@@ -475,13 +468,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     expert_status);
             }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // One strong signal per (Gin context, remote peer): every SM's index puts were posted before the grid
-            // sync above and SM 0's count puts before this sync, so each context's signal settles all of them
-            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumDispatchThreads, "Insufficient threads for IB signals");
-            if (thread_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(thread_idx % kNumRanks))
-                comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, thread_idx / kNumRanks)
-                    .signal_inc(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), thread_idx % kNumRanks);
+            // v2c: our token count, on context 0 like the landing put; the pre-pull barrier's strong signal
+            // (also SM 0, context 0) settles both at each remote rank
+            if (thread_idx < kNumRanks and is_remote(thread_idx))
+                make_gin().put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), thread_idx);
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -493,6 +483,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             make_gin, ib_epoch, false, true);
+        if (sm_idx == 0) {
+            // v2c: every remote source's landing copy (tokens, SF, top-k idx, weights) and token count have
+            // settled (barrier). Count the tokens routed to our experts and fill the source-index table locally.
+            const auto ib_topk_offset = reinterpret_cast<uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr()) - ib_input_base;
+            for (uint32_t r = 0; r < kNumRanks; ++ r) {
+                if (not is_remote(r))
+                    continue;
+                const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
+                const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
+                for (uint32_t j = thread_idx; j < n * kNumTopk; j += kNumDispatchThreads) {
+                    const auto e = static_cast<int>(topk[j]);
+                    if (e < 0 or static_cast<uint32_t>(e) / kNumExpertsPerRank != sym_buffer.rank_idx)
+                        continue;
+                    const auto le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                    const auto slot = static_cast<uint32_t>(atomicAdd(
+                        reinterpret_cast<unsigned long long*>(workspace.get_expert_recv_count_ptr(r, le)), 1ull));
+                    *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j;
+                }
+            }
+            __threadfence();
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0)
+                ptx::st_rel_sys(workspace.get_ib_counts_ready_ptr(), ib_epoch);
+        }
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(

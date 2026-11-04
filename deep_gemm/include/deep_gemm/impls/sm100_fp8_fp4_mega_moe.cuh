@@ -417,8 +417,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const int64_t chunk = math::align<int64_t>(math::ceil_div<int64_t>(ib_landing_bytes, DG_MEGA_MOE_IB_CONTEXTS), 128);
             const int64_t begin = ctx * chunk, size = cute::min(chunk, ib_landing_bytes - begin);
             const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx);
-            if (size > 0)
-                gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, size, peer);
+#ifndef DG_MEGA_MOE_IB_DIAG
+#define DG_MEGA_MOE_IB_DIAG 0
+#endif
+            // DIAG bit 0: skip the landing payload (timing only; results wrong); bit 1: cap it at 4 KB per chunk
+            const int64_t sent = (DG_MEGA_MOE_IB_DIAG & 1) ? 0 : ((DG_MEGA_MOE_IB_DIAG & 2) ? cute::min<int64_t>(size, 4096) : size);
+            if (sent > 0)
+                gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, sent, peer);
             gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
         }
 #endif

@@ -407,8 +407,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // v2a: one put per remote rank of this rank's input region into its landing zone; SM 0's arrival
         // strong signal (same context) later settles it before the receiver pulls
-        if (sm_idx == 0 and thread_idx < kNumRanks and is_remote(thread_idx))
-            make_gin().put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes, ib_input_base, ib_landing_bytes, thread_idx);
+        // v2e: each peer's region goes as DG_MEGA_MOE_IB_CONTEXTS chunks, one per Gin context (parallel proxy
+        // queues), each followed by a strong signal on its context; the receiver waits for all of them
+        DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumDispatchThreads, "Insufficient threads for IB landing puts");
+        if (sm_idx == 0 and thread_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(thread_idx % kNumRanks)) {
+            const uint32_t peer = thread_idx % kNumRanks, ctx = thread_idx / kNumRanks;
+            const int64_t chunk = math::align<int64_t>(math::ceil_div<int64_t>(ib_landing_bytes, DG_MEGA_MOE_IB_CONTEXTS), 128);
+            const int64_t begin = ctx * chunk, size = cute::min(chunk, ib_landing_bytes - begin);
+            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx);
+            if (size > 0)
+                gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, size, peer);
+            gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
+        }
 #endif
         IB_TRACE(0, sm_idx == 0 and thread_idx == 0);
         // Count experts' tokens
@@ -506,6 +516,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t r = warp_idx; r < kNumRanks; r += kNumDispatchWarps) {
                 if (not is_remote(r))
                     continue;
+                // the landing chunks from all of r's contexts have settled
+                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * DG_MEGA_MOE_IB_CONTEXTS);
                 const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
                 const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
                 uint32_t num_pairs = 0;

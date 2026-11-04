@@ -102,6 +102,7 @@ struct alignas(128) MegaMoESignals {
     // (token, top-k) pairs within its expert rank's chunk, and the same index for each pool token
     static constexpr uint32_t kNumMaxIBPairs = 1u << 16;      // max tokens x top-k per rank
     static constexpr uint32_t kNumMaxIBPoolTokens = 1u << 20;
+    alignas(128) uint64_t ib_landing_ready[kNumMaxRanks];  // +1 per Gin context per launch per source (v2e)
     alignas(128) uint64_t ib_trace[16];  // DG_MEGA_MOE_IB_TRACE: %globaltimer per stage (SM 0)
     alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
     alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
@@ -229,6 +230,11 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_ib_barrier_flag_ptr(const uint32_t& tag_idx, const uint32_t& src_rank_idx = 0) const {
         return signals->ib_barrier_flag[tag_idx % 2] + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_landing_ready_ptr(const uint32_t& src_rank_idx) const {
+        return signals->ib_landing_ready + src_rank_idx;
     }
 
     CUTLASS_DEVICE

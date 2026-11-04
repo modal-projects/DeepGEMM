@@ -133,6 +133,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+#define IB_TRACE(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_trace[i] = t_; } } while (0)
+#else
+#define IB_TRACE(i, cond) do {} while (0)
+#endif
 
     // Mega MoE over IB: ranks outside this NVLink domain are reached with NCCL Gin (DESIGN-v1.md)
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -405,6 +410,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and thread_idx < kNumRanks and is_remote(thread_idx))
             make_gin().put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes, ib_input_base, ib_landing_bytes, thread_idx);
 #endif
+        IB_TRACE(0, sm_idx == 0 and thread_idx == 0);
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -442,6 +448,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
 
+        IB_TRACE(1, sm_idx == 0 and thread_idx == 0);
         // Write expert count
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
@@ -488,6 +495,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             make_gin, ib_epoch, false, true);
+        IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
         if (sm_idx == 0) {
             // v2c: every remote source's landing copy (tokens, SF, top-k idx, weights) and token count have
             // settled (barrier). Count the tokens routed to our experts and fill the source-index table locally.
@@ -534,6 +542,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
             if (thread_idx == 0)
                 ptx::st_rel_sys(workspace.get_ib_counts_ready_ptr(), ib_epoch);
+            IB_TRACE(3, thread_idx == 0);
         }
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -757,6 +766,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
+        IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1580,6 +1590,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         __threadfence();  // staged rows reach L2 before the grid sync; the NIC reads them after it
 #endif
+        IB_TRACE(5, sm_idx == 0 and epilogue_thread_idx == 0);
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
@@ -1588,6 +1599,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         {
+            IB_TRACE(6, sm_idx == 0 and epilogue_thread_idx == 0);
             // v2d combine: every staged row is complete after the grid sync; SM 0 sends each remote source its
             // whole chunk (rows ordered by the source's (token, top-k)) as one put, then a strong signal on the
             // same context, which settles it
@@ -1610,6 +1622,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         }
 #endif
+        IB_TRACE(7, sm_idx == 0 and epilogue_thread_idx == 0);
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -1652,6 +1665,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             asm volatile("fence.proxy.async.global;" ::: "memory");  // NIC-written rows are read by TMA below
 #endif
+            IB_TRACE(8, sm_idx == 0 and epilogue_warp_idx == 0 and lane_idx == 0 and token_chunk_idx == sm_idx);
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 
@@ -1742,6 +1756,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+        IB_TRACE(9, sm_idx == 0 and epilogue_thread_idx == 0);
+        if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 64 == 0) {
+            const auto* t = workspace.signals->ib_trace;
+            printf("IB_TRACE rank=%u epoch=%llu us: idx=%.1f barrier=%.1f scan=%.1f pull_end=%.1f l2_done=%.1f l2_sync=%.1f combine_put=%.1f first_wait=%.1f end=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch,
+                   (t[1] - t[0]) / 1e3, (t[2] - t[0]) / 1e3, (t[3] - t[0]) / 1e3, (t[4] - t[0]) / 1e3,
+                   (t[5] - t[0]) / 1e3, (t[6] - t[0]) / 1e3, (t[7] - t[0]) / 1e3, (t[8] - t[0]) / 1e3, (t[9] - t[0]) / 1e3);
+        }
+#endif
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

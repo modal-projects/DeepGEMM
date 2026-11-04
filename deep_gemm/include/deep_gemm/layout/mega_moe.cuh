@@ -102,6 +102,7 @@ struct alignas(128) MegaMoESignals {
     // (token, top-k) pairs within its expert rank's chunk, and the same index for each pool token
     static constexpr uint32_t kNumMaxIBPairs = 1u << 16;      // max tokens x top-k per rank
     static constexpr uint32_t kNumMaxIBPoolTokens = 1u << 20;
+    alignas(128) uint64_t ib_trace[16];  // DG_MEGA_MOE_IB_TRACE: %globaltimer per stage (SM 0)
     alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
     alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
     alignas(128) uint32_t ib_pool_combine_idx[kNumMaxIBPoolTokens];

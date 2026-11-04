@@ -1418,14 +1418,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
             for (uint32_t q = kNumSMs - 2 - sm_idx; sm_idx + 2 <= kNumSMs and q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {
                 if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
-                    // Meta first (x / SF posted only after the meta put) on 2 nodes: the meta lands ~10 us earlier on
-                    // 400G; with 3+ counterparts it convoys the posters (EP32 measured ~7 ms), so never there
-#if defined(DG_MEGA_MOE_IB_NO_META_FIRST) and DG_MEGA_MOE_IB_NO_META_FIRST
-                    constexpr bool kMetaFirst = false;
-#elif defined(DG_MEGA_MOE_IB_META_FIRST_ALL) and DG_MEGA_MOE_IB_META_FIRST_ALL
+                    // Meta first (x / SF posted only after the meta put): opt-in only; on GB200 it turns into ms-scale
+                    // stalls (EP32 with the proxy D1, EP16 with the host scan; mechanism not identified)
+#if defined(DG_MEGA_MOE_IB_META_FIRST_ALL) and DG_MEGA_MOE_IB_META_FIRST_ALL
                     constexpr bool kMetaFirst = true;
 #else
-                    const bool kMetaFirst = ib_num_nodes == 2;
+                    constexpr bool kMetaFirst = false;  // measured harmful with the host scan (GB200: ms-scale stalls)
 #endif
                     while (kMetaFirst and ptx::ld_acq_sys(&workspace.signals->ib_o_meta_posted) < ib_epoch);
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
@@ -2181,8 +2179,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_polled=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(21), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3);
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3);
         }
 #endif
     }

@@ -146,6 +146,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_combine_staging = math::advance_ptr<uint8_t>(
         sym_buffer.get_base_ptr(), math::align<int64_t>(buffer.get_num_bytes(), 128));
     const auto ib_combine_bytes = static_cast<int64_t>(buffer.combine_token_buffer.get_num_bytes());
+    // v2a landing zone: per source rank, a copy of its contiguous input region (tokens, SF, top-k idx, weights)
+    const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
+    const auto ib_landing_bytes = math::align<int64_t>(
+        reinterpret_cast<uint8_t*>(buffer.input_topk_weights_buffer.get_end_ptr()) - ib_input_base, 128);
+    const auto ib_landing = ib_combine_staging + kNumRanks * ib_combine_bytes;
 #else
     constexpr bool kIsIB = false;
 #endif
@@ -385,6 +390,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         };
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // v2a: one put per remote rank of this rank's input region into its landing zone; SM 0's arrival
+        // strong signal (same context) later settles it before the receiver pulls
+        if (sm_idx == 0 and thread_idx < kNumRanks and is_remote(thread_idx))
+            make_gin().put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes, ib_input_base, ib_landing_bytes, thread_idx);
+#endif
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -505,6 +516,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+#endif
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
@@ -612,54 +626,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if (is_remote(current_rank_in_expert_idx)) {
-                // RDMA-read token bytes straight into the pool slot; SF and top-k weight into this warp's scratch
-                constexpr uint32_t kNumSFBytes = (kHidden / 128) * sizeof(uint32_t);
-                DG_STATIC_ASSERT(kNumSFBytes <= layout::MegaMoESignals::kIBScratchWeightOffset, "IB scratch too small for SF");
-                const auto scratch = workspace.get_ib_scratch_ptr(sm_idx * kNumDispatchWarps + warp_idx);
-                const auto src_rank = current_rank_in_expert_idx;
-                if (cute::elect_one_sync()) {
-                    const auto gin = make_gin();
-                    gin.get(dst_base_ptr, buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), kHidden, src_rank);
-                    gin.get(scratch, buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr(), kNumSFBytes, src_rank);
-                    gin.get(scratch + layout::MegaMoESignals::kIBScratchWeightOffset,
-                            buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, sizeof(float), src_rank);
-                    gin.flush();
+            // Remote-node sources: read the landing copy pushed at kernel start (v2a); same-node: NVLink peer
+            const auto src_ptr = [&](auto local_ptr) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if (is_remote(current_rank_in_expert_idx)) {
+                    using ptr_t = decltype(local_ptr);
+                    const auto offset = reinterpret_cast<const uint8_t*>(local_ptr) - ib_input_base;
+                    return reinterpret_cast<ptr_t>(ib_landing + current_rank_in_expert_idx * ib_landing_bytes + offset);
                 }
-                __syncwarp();
-
-                // SF scatter (same transposed layout as the NVLink path) and weight
-                const auto ib_local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
-                const uint32_t ib_ring_block_idx = pool_block_idx % kNumRingBlocks;
-                const auto ib_sf_ring_token_idx = ib_ring_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_idx_in_expert % BLOCK_M);
-                const auto scratch_sf = reinterpret_cast<const uint32_t*>(scratch);
-                #pragma unroll
-                for (uint32_t i = 0; i < math::constexpr_ceil_div(kHidden / 128, 32u); ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    if (j < kHidden / 128)
-                        ib_local_sf_ptr[j * kNumSFRingTokens + ib_sf_ring_token_idx] = ptx::ld_volatile(scratch_sf + j);
-                }
-                __syncwarp();
-
-                if (cute::elect_one_sync()) {
-                    *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() =
-                        *reinterpret_cast<const volatile float*>(scratch + layout::MegaMoESignals::kIBScratchWeightOffset);
-                    *workspace.get_token_src_metadata_ptr(pool_token_idx) =
-                        {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
-                    // NIC-written token bytes are read by the GEMM's TMA (async proxy)
-                    asm volatile("fence.proxy.async.global;" ::: "memory");
-                    const bool is_last_token = (token_idx == expert_end_idx - 1);
-                    ptx::red_add_rel(
-                        workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
-                        is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
-                    );
-                }
-                __syncwarp();
-                continue;
-            }
 #endif
-            const auto src_base_ptr = sym_buffer.map(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+                return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
+            };
+            const auto src_base_ptr = src_ptr(
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr());
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -684,16 +663,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load the weight first, so that its remote latency overlaps with the SF copy below
-            const auto weight = *sym_buffer.map(
-                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
+            const auto weight = *src_ptr(
+                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx);
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
-                current_rank_in_expert_idx);
+            const auto remote_sf_ptr = src_ptr(
+                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>());
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
@@ -1480,14 +1457,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 reinterpret_cast<int64_t>(buffer.combine_token_buffer.get_base_ptr());
                             const auto staging_ptr = reinterpret_cast<float4*>(
                                 ib_combine_staging + dst_rank_idx * ib_combine_bytes + offset_in_combine);
-                            *staging_ptr = packed;
-                            // 16 lanes wrote one contiguous 256 B row segment; its first lane puts it
-                            const uint32_t half_mask = 0xffffu << (lane_idx / 16 * 16);
-                            __syncwarp(half_mask);
-                            if (lane_idx % 16 == 0) {
-                                __threadfence();
-                                make_gin().put(dst_ptr, staging_ptr, 16 * sizeof(float4), dst_rank_idx);
-                            }
+                            *staging_ptr = packed;  // sent as whole rows after the L2 grid sync (v2a)
                         }
 #endif
                         if (not is_remote_row)
@@ -1552,11 +1522,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // Each SM strong-signals every remote rank once its combine puts are posted: the source waits for
-        // kNumSMs signals per launch, which settles all of this rank's combine rows (every context)
-        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-        if (epilogue_thread_idx < kNumRanks and is_remote(epilogue_thread_idx))
-            make_gin().signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), epilogue_thread_idx);
+        __threadfence();  // staged rows reach L2 before the grid sync; the NIC reads them after it
 #endif
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
@@ -1564,6 +1530,39 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        {
+            // v2a combine: every staged remote row is complete after the grid sync; send each as one put.
+            // Rows are spread over all epilogue threads of all SMs in pool order. Counts are still valid here
+            // (dispatch warps clear them only after the dispatch/epilogue barrier below).
+            constexpr uint32_t kNumAllThreads = kNumSMs * kNumEpilogueThreads;
+            constexpr uint32_t kNumRowBytes = kHidden * sizeof(nv_bfloat16);
+            const uint32_t my_id = sm_idx * kNumEpilogueThreads + epilogue_thread_idx;
+            uint32_t pool_block_offset = 0, rows_before = 0;
+            for (uint32_t e = 0; e < kNumExpertsPerRank; ++ e) {
+                uint32_t n = static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(e));
+                for (uint32_t r = 0; r < kNumRanks; ++ r)
+                    n += is_remote(r) ? static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(r, e)) : 0u;
+                const uint32_t first = (my_id + kNumAllThreads - rows_before % kNumAllThreads) % kNumAllThreads;
+                for (uint32_t i = first; i < n; i += kNumAllThreads) {
+                    const auto meta = *workspace.get_token_src_metadata_ptr(pool_block_offset * BLOCK_M + i);
+                    if (not is_remote(meta.rank_idx))
+                        continue;
+                    const auto dst = buffer.combine_token_buffer.get_rank_buffer(meta.topk_idx)
+                                     .get_data_buffer(meta.token_idx).template get_base_ptr<uint8_t>();
+                    const auto staged = ib_combine_staging + meta.rank_idx * ib_combine_bytes +
+                        (dst - reinterpret_cast<uint8_t*>(buffer.combine_token_buffer.get_base_ptr()));
+                    make_gin().put(dst, staged, kNumRowBytes, meta.rank_idx);
+                }
+                rows_before += n;
+                pool_block_offset += math::ceil_div(n, BLOCK_M);
+            }
+            // Each SM strong-signals every remote rank after its row puts; the source waits for kNumSMs signals
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if (epilogue_thread_idx < kNumRanks and is_remote(epilogue_thread_idx))
+                make_gin().signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), epilogue_thread_idx);
+        }
+#endif
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB

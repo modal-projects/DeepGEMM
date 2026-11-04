@@ -52,7 +52,9 @@ class SymmBuffer:
             # Mega MoE over IB: one NCCL window; extra tail holds per-destination combine staging
             # (num_ranks copies of the combine buffer, see kernel `ib_combine_staging`)
             combine_bytes = (num_topk + 1) * num_max_tokens_per_rank * hidden * 2
-            num_bytes = ((num_bytes + 127) // 128) * 128 + group.size() * combine_bytes
+            # v2a landing zone: per source rank, its input region (tokens, SF, top-k idx + weights), generous
+            landing_bytes = num_max_tokens_per_rank * (hidden * 2 + hidden // 16 + num_topk * 16 + 64) + 4096
+            num_bytes = ((num_bytes + 127) // 128) * 128 + group.size() * (combine_bytes + landing_bytes)
             self.buffer, self.handle = _ib.allocate(group, num_bytes)
             self.group.barrier()
             torch.cuda.synchronize()

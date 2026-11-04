@@ -511,7 +511,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
                                                     static_cast<uint64_t>(kIBChunkRows) * ib_sf_bytes, p,
                                                     workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, c));
-                            gin.flush();  // the pack block doubles as combine staging later; sources must be reusable
+                            // v10b: no flush here (it stalls the gather ~tens of us per chunk); SM 0 flushes every
+                            // context once after the dispatch grid sync, before the pre-pull barrier
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                             atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
                             atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(kIBChunkRows) * (ib_token_bytes + ib_sf_bytes));
@@ -627,7 +628,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
                                             static_cast<uint64_t>(rem) * ib_sf_bytes, peer,
                                             workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, full));
-                    gin.flush();
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
                     atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(rem) * (ib_token_bytes + ib_sf_bytes));
@@ -638,7 +638,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const int64_t size = (ib_off_meta_w - ib_off_meta) + static_cast<int64_t>(num_tokens) * kNumTopk * 4;
                     gin.put_signal_weak(dst + ib_off_meta, stage_p + ib_off_meta, static_cast<uint64_t>(size), peer,
                                         workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx));
-                    gin.flush();
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
                     atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
@@ -647,6 +646,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+        // v10b: the chunk puts issued during the gather read their sources (the pack blocks, reused as combine
+        // staging by the L2 epilogue) asynchronously; one flush per Gin context here makes every source reusable
+        if (sm_idx == 0 and lane_idx == 0 and warp_idx < DG_MEGA_MOE_IB_CONTEXTS) {
+            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, warp_idx);
+            gin.flush();
+        }
+        __syncwarp();
 #endif
 
         // Write expert count

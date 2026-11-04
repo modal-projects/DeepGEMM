@@ -550,17 +550,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
+                // The warp completing a chunk posts it (lane 0); if it was the last chunk, lane 1 posts the return header
+                // at the same time on another context (Gin ops cost ~10 us of issue each: never serialize two)
+                const uint32_t c = t / kIBChunk, size = cute::min(kIBChunk, nt - c * kIBChunk);
+                uint32_t state = 0;
                 if (lane_idx == 0) {
                     __threadfence();
-                    const uint32_t c = t / kIBChunk, size = cute::min(kIBChunk, nt - c * kIBChunk);
-                    if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][c], 1u) + 1 == size * kSplit) {
-                        const auto gin = make_gin(c + nr);
-                        const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
-                        gin.put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
-                        if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fdone[ib_parity][n], 1u) + 1 == nchunks)
-                            gin.put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
-                    }
+                    if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][c], 1u) + 1 == size * kSplit)
+                        state = ib_atom_add_acq_rel(&workspace.signals->ib_o_fdone[ib_parity][n], 1u) + 1 == nchunks ? 2u : 1u;
                 }
+                state = __shfl_sync(0xffffffffu, state, 0);
+                if (state > 0 and lane_idx == 0) {
+                    const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
+                    make_gin(c + nr).put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                }
+                if (state == 2 and lane_idx == 1)
+                    make_gin(c + nr + 1).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
                 __syncwarp();
             }
         }

@@ -12,7 +12,7 @@
 namespace deep_gemm::comm {
 
 #ifndef DG_MEGA_MOE_IB_CONTEXTS
-#define DG_MEGA_MOE_IB_CONTEXTS 16
+#define DG_MEGA_MOE_IB_CONTEXTS 4
 #endif
 
 struct GinIB {

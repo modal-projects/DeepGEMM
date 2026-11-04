@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 _ext = None
 IB_MAGIC = 0x1B1B1B1B1B1B1B1B
-NUM_GIN_CONTEXTS = int(os.environ.get('DG_MEGA_MOE_IB_CONTEXTS', '16'))
+NUM_GIN_CONTEXTS = int(os.environ.get('DG_MEGA_MOE_IB_CONTEXTS', '4'))
 
 _CPP = r'''
 #include <torch/extension.h>

@@ -200,6 +200,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     };
     const auto ib_is_sentinel4 = [](const uint4& v) { return (v.x & v.y & v.z & v.w) == 0xffffffffu; };
     constexpr uint64_t kIBIdxSentinel = 0x8000000000000000ull;
+#define IB_POLL(cond, reload, tag, a, b) do { const long long t0_ = clock64(); while (cond) { reload; \
+        if (clock64() - t0_ > (1ll << 34)) { printf("OPUS_HANG %s rank=%u sm=%u warp=%u lane=%u a=%u b=%u epoch=%llu\n", tag, \
+            sym_buffer.rank_idx, sm_idx, warp_idx, lane_idx, (unsigned) (a), (unsigned) (b), (unsigned long long) ib_epoch); asm volatile("trap;"); } } } while (0)
 #endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
@@ -471,11 +474,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         v[u] = u * 32 + lane_idx < kXUnitsPerItem ? ib_ldv4(xrow + (u * 32 + lane_idx) * 16) : uint4{0, 0, 0, 0};
                     #pragma unroll
                     for (uint32_t u = 0; u < kU; ++ u)
-                        while (ib_is_sentinel4(v[u]))
-                            v[u] = ib_ldv4(xrow + (u * 32 + lane_idx) * 16);
+                        IB_POLL(ib_is_sentinel4(v[u]), v[u] = ib_ldv4(xrow + (u * 32 + lane_idx) * 16), "c2_x", s, t);
                     if (qtr == 0 and lane_idx < kIBSFBytes / 16) {
                         const auto sfp = mir + kIBOffSF + static_cast<int64_t>(t) * kIBSFBytes + lane_idx * 16;
-                        while (ib_is_sentinel4(ib_ldv4(sfp)));
+                        IB_POLL(ib_is_sentinel4(ib_ldv4(sfp)), (void) 0, "c2_sf", s, t);
                     }
                 }
                 // Reduce node-local slots in top-k order (fp32): per slot, the item's pieces are loaded together
@@ -501,8 +503,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < kPPI; ++ i) {
                         const auto ptr = row + ((qtr * kPPI + i) * 32 + lane_idx) * 16;
                         if constexpr (kIBReduceOnArrival) {
-                            while (ib_is_sentinel4(v[i]))
-                                v[i] = ib_ldv4(ptr);
+                            IB_POLL(ib_is_sentinel4(v[i]), v[i] = ib_ldv4(ptr), "c2_pcomb", t, k);
                             *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
                         }
                         const auto b = reinterpret_cast<const nv_bfloat162*>(&v[i]);
@@ -590,34 +591,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         };
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // D0: post the slices of our input region to the mirror of our slot on each counterpart. Pieces per remote
-        // node: 0 header (epoch | num_tokens), 1 top-k idx, 2 weights, 3 SF, 4.. x rows in chunks of kIBChunk.
-        // Data-only puts; nothing to wait for (the input region is written before the launch). One SM per piece.
         {
-            const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
-            const uint32_t num_pieces = 4 + num_x_chunks;
-            for (uint32_t q = kNumSMs - 1 - sm_idx; q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {  // last SMs first (SM 0 has upstream roles)
-                if (warp_idx == 0 and lane_idx == 0) {
-                    const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
-                    const uint32_t c = ib_cp(sym_buffer.rank_idx, n);
-                    const auto gin = make_gin(q);
-                    const auto dst = ib_mirror(ib_parity, ib_my_node);
-                    if (piece == 0) {
-                        gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, c);
-                    } else if (num_tokens > 0) {
-                        int64_t off = 0, bytes = 0;
-                        if (piece == 1) off = kIBOffIdx, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 8;
-                        else if (piece == 2) off = kIBOffW, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 4;
-                        else if (piece == 3) off = kIBOffSF, bytes = static_cast<int64_t>(num_tokens) * kIBSFBytes;
-                        else {
-                            const uint32_t t0 = (piece - 4) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
-                            off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
-                        }
-                        gin.put(dst + off, ib_input_base + off, static_cast<uint64_t>(bytes), c);
-                    }
-                }
-                __syncwarp();
-            }
             // Next launch's forward-combine counters (the other parity was last used by the previous launch)
             if (sm_idx == 1) {
                 for (uint32_t i = thread_idx; i < layout::MegaMoESignals::kIBOMaxNodes * layout::MegaMoESignals::kIBOMaxChunks; i += kNumDispatchThreads)
@@ -626,7 +600,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     workspace.signals->ib_o_fdone[ib_parity ^ 1][thread_idx] = 0;
             }
         }
-        IB_TRACE(0, sm_idx == 0 and thread_idx == 0);
 #endif
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -861,7 +834,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t b = 0; b < kBatch; ++ b) {
                         if (u0 + b < kUnits) {
                             const uint32_t o = ((u0 + b) * 32 + lane_idx) * 16;
-                            while (ib_is_sentinel4(v[b])) v[b] = ib_ldv4(src_base_ptr + o);
+                            IB_POLL(ib_is_sentinel4(v[b]), v[b] = ib_ldv4(src_base_ptr + o), "pull_x", current_rank_in_expert_idx, src_token_idx);
                             *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o) = v[b];
                         }
                     }
@@ -931,8 +904,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (j < kNumSFUint32) {
                     uint32_t sf = ib_rem ? ptx::ld_volatile(remote_sf_ptr + j) : remote_sf_ptr[j];
-                    while (ib_rem and sf == 0xffffffffu)  // four NaN UE8M0 scales: not landed yet
-                        sf = ptx::ld_volatile(remote_sf_ptr + j);
+                    IB_POLL(ib_rem and sf == 0xffffffffu, sf = ptx::ld_volatile(remote_sf_ptr + j), "pull_sf", current_rank_in_expert_idx, src_token_idx);
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf;
                 }
 #else
@@ -1046,7 +1018,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             if (thread_idx == 0)
-                while (ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks);
+                IB_POLL(ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks, (void) 0, "e_fdone", n, nchunks);
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
             const auto mir = ib_mirror(ib_parity, n);
             const uint32_t gtid = sm_idx * kNumDispatchThreads + thread_idx;
@@ -1367,6 +1339,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // D0 (on the epilogue warps, which are idle until the first task, so the dispatch grid sync never waits
+        // for Gin posting): post the slices of our input region to the mirror of our slot on each counterpart. Pieces per remote
+        // node: 0 header (epoch | num_tokens), 1 top-k idx, 2 weights, 3 SF, 4.. x rows in chunks of kIBChunk.
+        // Data-only puts; nothing to wait for (the input region is written before the launch). One SM per piece.
+        {
+            const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
+            const uint32_t num_pieces = 4 + num_x_chunks;
+            for (uint32_t q = kNumSMs - 1 - sm_idx; q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {  // last SMs first (SM 0 has upstream roles)
+                if (epilogue_warp_idx == 0 and lane_idx == 0) {
+                    const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
+                    const uint32_t c = ib_cp(sym_buffer.rank_idx, n);
+                    const auto gin = make_gin(q);
+                    const auto dst = ib_mirror(ib_parity, ib_my_node);
+                    if (piece == 0) {
+                        gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, c);
+                    } else if (num_tokens > 0) {
+                        int64_t off = 0, bytes = 0;
+                        if (piece == 1) off = kIBOffIdx, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 8;
+                        else if (piece == 2) off = kIBOffW, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 4;
+                        else if (piece == 3) off = kIBOffSF, bytes = static_cast<int64_t>(num_tokens) * kIBSFBytes;
+                        else {
+                            const uint32_t t0 = (piece - 4) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
+                            off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
+                        }
+                        gin.put(dst + off, ib_input_base + off, static_cast<uint64_t>(bytes), c);
+                    }
+                }
+                __syncwarp();
+            }
+        }
+        IB_TRACE(0, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
         // D1 (proxy-dispatch): the last SMs' epilogue warps (idle until the first task, which needs these counts)
         // act for the counterpart source of one remote node each: poll its header, top-k idx and weights in the
         // mirror, assign slots deterministically in pair order, write the entries and per-source counts into the
@@ -1404,10 +1407,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t u = 0; u < 4; ++ u) {
                     const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                     if (i < nt * kNumTopk) {
-                        while (v[u] == kIBIdxSentinel)
-                            v[u] = ptx::ld_volatile(idx + i);
-                        while (wv[u] == 0xffffffffu)
-                            wv[u] = ptx::ld_volatile(wts + i);
+                        IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "d1_idx", s, i);
+                        IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "d1_w", s, i);
                         e_smem[i] = static_cast<int64_t>(v[u]) >= 0 ? static_cast<uint16_t>(v[u] + 1) : 0;
                     }
                 }
@@ -2027,11 +2028,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto qptr = reinterpret_cast<uint64_t*>(rec + col);
                         const auto sptr = reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4);
                         uint64_t q = qv[j];
-                        while (q == ~0ull)
-                            q = ptx::ld_volatile(qptr);
+                        IB_POLL(q == ~0ull, q = ptx::ld_volatile(qptr), "c3_q", n, token_idx);
                         uint32_t sbits = sv[j];
-                        while (sbits == 0xffffffffu)
-                            sbits = ptx::ld_volatile(sptr);
+                        IB_POLL(sbits == 0xffffffffu, sbits = ptx::ld_volatile(sptr), "c3_s", n, token_idx);
                         if (hit) {
                             const float scale = __uint_as_float(sbits);
                             const auto qs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&q);
@@ -2062,8 +2061,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                     const auto ptr = rec + (j * 32 + lane_idx) * 16;
                     uint4 v = vv[j];
-                    while (ib_is_sentinel4(v))
-                        v = ib_ldv4(ptr);
+                    IB_POLL(ib_is_sentinel4(v), v = ib_ldv4(ptr), "c3_bf16", n, token_idx);
                     if (hit) {
                         const auto b = reinterpret_cast<const nv_bfloat162*>(&v);
                         #pragma unroll

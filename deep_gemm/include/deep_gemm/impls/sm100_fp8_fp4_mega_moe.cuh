@@ -167,7 +167,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const int64_t ib_idx_bytes = buffer.input_topk_idx_buffer.data_layout.template get_num_bytes<int64_t>();
     const int64_t ib_w_bytes = buffer.input_topk_weights_buffer.data_layout.template get_num_bytes<int64_t>();
     const int64_t ib_off_map = ib_landing_bytes;  // right after the mirrored input region
-    const int64_t ib_landing_stride = math::align<int64_t>(ib_off_map + static_cast<int64_t>(kNumMaxTokensPerRank) * 2, 128);
+    // v7 meta block: [per-expert pair counts: kIBMaxExpertsPerRank x u32][num pairs: u32, padded to 128][entries:
+    // (j | local_expert << 16, slot) x pairs]; sent first on its own signal so the receiver's tables need no scan
+    const int64_t ib_off_meta = math::align<int64_t>(ib_off_map + static_cast<int64_t>(kNumMaxTokensPerRank) * 2, 128);
+    const int64_t ib_off_meta_pairs = ib_off_meta + layout::MegaMoESignals::kIBMaxExpertsPerRank * 4;
+    const int64_t ib_off_meta_entries = ib_off_meta_pairs + 128;
+    const int64_t ib_landing_stride = math::align<int64_t>(
+        ib_off_meta_entries + static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * 8, 128);
+    constexpr uint32_t kIBMetaPieceSM = kNumRanks * kIBNumLandingPieces;  // SMs posting the meta piece: this + peer
     // v2d: per expert rank, a contiguous chunk of our combine rows, ordered by (token, top-k)
     constexpr uint32_t kIBRowBytes = kHidden * sizeof(nv_bfloat16);
     constexpr int64_t kIBCombineLandingBytes = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * kIBRowBytes;
@@ -451,8 +458,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t t = sm_idx * kNumDispatchWarps + warp_idx; t < num_tokens; t += kNumSMs * kNumDispatchWarps) {
                 const int e = lane_idx < kNumTopk ? static_cast<int>(own_topk[t * kNumTopk + lane_idx]) : -1;
                 const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0;
-                const uint32_t bit = (e >= 0 and is_remote(r)) ? (1u << r) : 0u;
+                const bool pair_remote = e >= 0 and is_remote(r);
+                const uint32_t bit = pair_remote ? (1u << r) : 0u;
                 uint32_t peers = __reduce_or_sync(0xffffffff, bit);
+                // v7: every remote pair takes a slot in its (peer, expert) list and an entry in the peer's meta block;
+                // the slot is also parked in ib_combine_idx[j] (finalized with the per-expert prefix after the sync)
+                if (pair_remote) {
+                    const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                    const uint32_t j = t * kNumTopk + lane_idx;
+                    const uint32_t slot = atomicAdd(workspace.get_ib_pack_slot_ptr(parity, r, le), 1u);
+                    const uint32_t idx = atomicAdd(workspace.get_ib_pack_pairs_ptr(parity, r), 1u);
+                    auto entries = reinterpret_cast<uint32_t*>(ib_pack + r * ib_landing_stride + ib_off_meta_entries);
+                    entries[2 * idx] = j | (le << 16);
+                    entries[2 * idx + 1] = slot;
+                    *workspace.get_ib_combine_idx_ptr(j) = slot;
+                }
                 while (peers != 0) {
                     const uint32_t p = __ffs(peers) - 1;
                     peers &= peers - 1;
@@ -528,6 +548,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and thread_idx < kIBNumCombineGroups) {
             *workspace.get_ib_group_total_ptr(ib_parity ^ 1u, thread_idx) = 0;
             *workspace.get_ib_group_done_ptr(ib_parity ^ 1u, thread_idx) = 0;
+        }
+        if (sm_idx == 1) {  // v7: next launch's per-(peer, expert) slot counters and pair counters
+            for (uint32_t i = thread_idx; i < kNumRanks * kNumExpertsPerRank; i += kNumDispatchThreads)
+                *workspace.get_ib_pack_slot_ptr(ib_parity ^ 1u, i / kNumExpertsPerRank, i % kNumExpertsPerRank) = 0;
+            if (thread_idx < kNumRanks)
+                *workspace.get_ib_pack_pairs_ptr(ib_parity ^ 1u, thread_idx) = 0;
+        }
+        DG_STATIC_ASSERT(kIBMetaPieceSM + kNumRanks <= kNumSMs, "Insufficient SMs for the IB meta piece");
+        if (sm_idx >= kIBMetaPieceSM and sm_idx < kIBMetaPieceSM + kNumRanks and is_remote(sm_idx - kIBMetaPieceSM)) {
+            // v7: the meta piece (counts + slot table) goes first, on its own signal; the receiver can build its
+            // index table and start local work while the token rows are still landing
+            const uint32_t peer = sm_idx - kIBMetaPieceSM;
+            const auto stage_p = ib_pack + peer * ib_landing_stride;
+            const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
+            auto counts = reinterpret_cast<uint32_t*>(stage_p + ib_off_meta);
+            if (thread_idx < kNumExpertsPerRank)
+                counts[thread_idx] = *workspace.get_ib_pack_slot_ptr(ib_parity, peer, thread_idx);
+            const uint32_t npairs = *workspace.get_ib_pack_pairs_ptr(ib_parity, peer);
+            if (thread_idx == 0)
+                *reinterpret_cast<uint32_t*>(stage_p + ib_off_meta_pairs) = npairs;
+            __threadfence();
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0) {
+                const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, peer);
+                const int64_t size = (ib_off_meta_entries - ib_off_meta) + static_cast<int64_t>(npairs) * 8;
+                gin.put(dst + ib_off_meta, stage_p + ib_off_meta, static_cast<uint64_t>(size), peer);
+                gin.signal_inc(workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx), peer);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
+                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
+#endif
+            }
         }
         if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
             const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
@@ -615,73 +667,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool do_a = warp_idx == 0, do_b = kNumDispatchWarps > 1 ? warp_idx == 1 : warp_idx == 0;
             constexpr uint32_t kIBScanUnroll = 8;
             if (do_a) {
-                // v2g: one strong signal per landing piece per launch from r settles r's landing puts
-                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * kIBNumLandingPieces);
-                const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
-                const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_stride + ib_off_idx);
-                // v2h: per-expert slot counters live in lane registers (lane l counts local expert l) instead of
-                // a global atomic per pair (~1 us each, serialized): ballots + shuffles only
-                // (shapes with > 32 experts per rank, e.g. MegaSeek, fall back to a global atomic per pair)
-                constexpr bool kIBRegisterCounters = kNumExpertsPerRank <= 32;
-                uint32_t num_pairs = 0, cnt = 0;
-                const uint32_t lt_mask = (1u << lane_idx) - 1;
-                // v3b: the landing top-k lives in memory the NIC just wrote (uncached): batch the loads so one
-                // memory latency covers kIBScanUnroll iterations instead of one
-                for (uint32_t base0 = 0; base0 < n * kNumTopk; base0 += 32 * kIBScanUnroll) {
-                  int es[kIBScanUnroll];
-                  #pragma unroll
-                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
-                    const uint32_t j = base0 + u * 32 + lane_idx;
-                    es[u] = j < n * kNumTopk ? static_cast<int>(topk[j]) : -1;
-                  }
-                  #pragma unroll
-                  for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
-                    const uint32_t base = base0 + u * 32;
-                    if (base >= n * kNumTopk)
-                        break;
-                    const uint32_t j = base + lane_idx;
-                    const int e = es[u];
-                    const bool mine = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx;
-                    const uint32_t ballot = __ballot_sync(0xffffffff, mine);
-                    const uint32_t le = mine ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
-                    const uint32_t idx = num_pairs + __popc(ballot & lt_mask);
-                    uint32_t slot = 0;
-                    if constexpr (kIBRegisterCounters) {
-                        if (ballot != 0) {
-                            #pragma unroll 1
-                            for (uint32_t l = 0; l < kNumExpertsPerRank; ++l) {
-                                const uint32_t m = __ballot_sync(0xffffffff, le == l);
-                                const uint32_t base_l = __shfl_sync(0xffffffff, cnt, l);
-                                if (le == l)
-                                    slot = base_l + __popc(m & lt_mask);
-                                if (lane_idx == l)
-                                    cnt += __popc(m);
-                            }
-                        }
-                    } else if (mine) {
-                        slot = static_cast<uint32_t>(atomicAdd(
-                            reinterpret_cast<unsigned long long*>(workspace.get_expert_recv_count_ptr(r, le)), 1ull));
-                    }
-                    if (mine)
-                        *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j;
-                    num_pairs += __popc(ballot);
-                  }
+                // v7 (a): source r's meta piece carries its per-expert pair counts and the (pair, expert, slot)
+                // table: no scan of its top-k is needed. Counts -> expert_recv_count / prefix / group totals;
+                // entries -> src_token_topk_idx(expert, r, slot) = pair.
+                while (ptx::ld_acq_sys(workspace.get_ib_meta_ready_ptr(r)) != ib_epoch);
+                const auto meta = ib_landing + r * ib_landing_stride;
+                const auto counts = reinterpret_cast<const uint32_t*>(meta + ib_off_meta);
+                const uint32_t npairs = *reinterpret_cast<const uint32_t*>(meta + ib_off_meta_pairs);
+                const auto entries = reinterpret_cast<const uint32_t*>(meta + ib_off_meta_entries);
+                for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
+                    *workspace.get_expert_recv_count_ptr(r, e) = counts[e];
+                for (uint32_t i = lane_idx; i < npairs; i += 32) {
+                    const uint32_t e0 = entries[2 * i], slot = entries[2 * i + 1];
+                    *workspace.get_src_token_topk_idx_ptr(e0 >> 16, r, slot) = e0 & 0xffffu;
                 }
-                // only this warp touches the (remote r, local expert) counters: plain stores replace the atomics
-                if (kIBRegisterCounters and lane_idx < kNumExpertsPerRank)
-                    *workspace.get_expert_recv_count_ptr(r, lane_idx) = cnt;
                 if (lane_idx == 0)
-                    *workspace.get_ib_pairs_from_ptr(r) = num_pairs;
+                    *workspace.get_ib_pairs_from_ptr(r) = npairs;
                 __syncwarp();
-                // v5b: exclusive prefix of the per-expert counts = row offset of (r, expert) in the combine staging;
+                // exclusive prefix of the per-expert counts = row offset of (r, expert) in the combine staging;
                 // the group totals count row-tiles (rows x L2 N tiles) the epilogue will stage
                 {
                     uint32_t run = 0;
                     for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
                         const uint32_t e = e0 + lane_idx;
-                        uint32_t c = 0;
-                        if (e < kNumExpertsPerRank)
-                            c = kIBRegisterCounters ? cnt : static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(r, e));
+                        const uint32_t c = e < kNumExpertsPerRank ? counts[e] : 0u;
                         uint32_t incl = c;
                         #pragma unroll
                         for (uint32_t d = 1; d < 32; d <<= 1) {
@@ -700,103 +709,49 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             if (do_b) {
-                // (b) our own pairs routed to rank r: ib_combine_idx[j] = prefix_r(expert) + slot among my pairs to that
-                // expert (pair order), which is exactly where r stages the row (v5b). Pass 1 counts per expert, pass 2
-                // assigns; counters live in lane registers (<= 32 experts) or in a scratch slot (atomics)
+                // v7 (b): our pairs routed to rank r already hold their slot in ib_combine_idx (gather); add the
+                // per-expert prefix of OUR pair counts to r (final after the dispatch grid sync) and count the groups
+                // r will signal us for
                 const auto own = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-                constexpr bool kReg = kNumExpertsPerRank <= 32;
+                auto* scratch_pre = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[kNumRanks + r]);
                 DG_STATIC_ASSERT(layout::MegaMoESignals::kNumIBScratchBytes >= 4 * layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB scratch too small");
                 DG_STATIC_ASSERT(2 * kNumRanks <= layout::MegaMoESignals::kNumMaxIBScratchSlots, "IB scratch slots");
-                auto* scratch_cnt = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[r]);
-                auto* scratch_pre = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[kNumRanks + r]);
-                const uint32_t lt_mask_b = (1u << lane_idx) - 1;
-                uint32_t reg_cnt = 0, reg_pre_ = 0;
-                const auto assign = [&](const uint32_t& le, const bool& mine) -> uint32_t {
-                    uint32_t slot = 0;
-                    if constexpr (kReg) {
-                        if (__ballot_sync(0xffffffff, mine) != 0) {
-                            #pragma unroll 1
-                            for (uint32_t l = 0; l < kNumExpertsPerRank; ++l) {
-                                const uint32_t m = __ballot_sync(0xffffffff, le == l);
-                                const uint32_t base_l = __shfl_sync(0xffffffff, reg_cnt, l);
-                                if (le == l)
-                                    slot = base_l + __popc(m & lt_mask_b);
-                                if (lane_idx == l)
-                                    reg_cnt += __popc(m);
-                            }
-                        }
-                    } else if (mine) {
-                        slot = atomicAdd(scratch_cnt + le, 1u);
+                uint32_t run = 0, group_mask = 0;
+                for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
+                    const uint32_t e = e0 + lane_idx;
+                    const uint32_t c = e < kNumExpertsPerRank ? *workspace.get_ib_pack_slot_ptr(ib_parity, r, e) : 0u;
+                    uint32_t incl = c;
+                    #pragma unroll
+                    for (uint32_t d = 1; d < 32; d <<= 1) {
+                        const uint32_t v = __shfl_up_sync(0xffffffff, incl, d);
+                        if (lane_idx >= d) incl += v;
                     }
-                    return slot;
-                };
-                if constexpr (not kReg) {
-                    for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
-                        scratch_cnt[e] = 0;
-                    __syncwarp();
+                    if (e < kNumExpertsPerRank) {
+                        scratch_pre[e] = run + incl - c;
+                        if (c > 0)
+                            group_mask |= 1u << ib_group_of(e);
+                    }
+                    run += __shfl_sync(0xffffffff, incl, 31);
                 }
-                #pragma unroll 1
-                for (uint32_t pass = 0; pass < 2; ++pass) {
-                    for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll) {
-                      int es[kIBScanUnroll];
-                      #pragma unroll
-                      for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
-                        const uint32_t j = base0 + u * 32 + lane_idx;
-                        es[u] = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
-                      }
-                      #pragma unroll
-                      for (uint32_t u = 0; u < kIBScanUnroll; ++u) {
-                        const uint32_t base = base0 + u * 32;
-                        if (base >= num_tokens * kNumTopk)
-                            break;
-                        const uint32_t j = base + lane_idx;
-                        const int e = es[u];
-                        const bool to_r = e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r;
-                        const uint32_t le = to_r ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
-                        const uint32_t slot = assign(le, to_r);
-                        if (pass == 1) {
-                            // the shuffle is warp-collective: every lane takes part (source lane 0 when not routed)
-                            uint32_t pre = 0;
-                            if constexpr (kReg) pre = __shfl_sync(0xffffffff, reg_pre_, to_r ? le : 0u);
-                            else if (to_r) pre = scratch_pre[le];
-                            if (to_r)
-                                *workspace.get_ib_combine_idx_ptr(j) = pre + slot;
-                        }
-                      }
-                    }
-                    if (pass == 0) {
-                        // prefix over experts + the number of non-empty groups r will signal us for
-                        __syncwarp();
-                        uint32_t run = 0, group_mask = 0;
-                        for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
-                            const uint32_t e = e0 + lane_idx;
-                            uint32_t c = 0;
-                            if (e < kNumExpertsPerRank)
-                                c = kReg ? reg_cnt : scratch_cnt[e];
-                            uint32_t incl = c;
-                            #pragma unroll
-                            for (uint32_t d = 1; d < 32; d <<= 1) {
-                                const uint32_t v = __shfl_up_sync(0xffffffff, incl, d);
-                                if (lane_idx >= d) incl += v;
-                            }
-                            if (e < kNumExpertsPerRank) {
-                                if constexpr (kReg) reg_pre_ = run + incl - c; else scratch_pre[e] = run + incl - c;
-                                if (c > 0)
-                                    group_mask |= 1u << ib_group_of(e);
-                            }
-                            run += __shfl_sync(0xffffffff, incl, 31);
-                        }
-                        group_mask = __reduce_or_sync(0xffffffff, group_mask);
-                        if (lane_idx == 0)
-                            *workspace.get_ib_combine_expected_ptr(r) += __popc(group_mask);
-                        // reset the counters for pass 2
-                        reg_cnt = 0;
-                        if constexpr (not kReg) {
-                            for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
-                                scratch_cnt[e] = 0;
-                        }
-                        __syncwarp();
-                    }
+                group_mask = __reduce_or_sync(0xffffffff, group_mask);
+                if (lane_idx == 0)
+                    *workspace.get_ib_combine_expected_ptr(r) += __popc(group_mask);
+                __syncwarp();
+                constexpr uint32_t kIBScanUnroll2 = 8;
+                for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll2) {
+                  int es[kIBScanUnroll2];
+                  #pragma unroll
+                  for (uint32_t u = 0; u < kIBScanUnroll2; ++u) {
+                    const uint32_t j = base0 + u * 32 + lane_idx;
+                    es[u] = j < num_tokens * kNumTopk ? static_cast<int>(own[j]) : -1;
+                  }
+                  #pragma unroll
+                  for (uint32_t u = 0; u < kIBScanUnroll2; ++u) {
+                    const uint32_t j = base0 + u * 32 + lane_idx;
+                    const int e = es[u];
+                    if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == r)
+                        *workspace.get_ib_combine_idx_ptr(j) += scratch_pre[static_cast<uint32_t>(e) % kNumExpertsPerRank];
+                  }
                 }
             }
             __threadfence();
@@ -837,6 +792,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        uint32_t ib_landed_mask = 0;  // v7: remote sources whose rows this warp has seen land
+#endif
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
@@ -961,6 +919,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
             };
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // v7: the counts/table arrived with the meta piece; the rows (map, x, SF, weights) arrive later under
+            // landing_ready. Wait once per source per warp (bitmask), only when first touching a remote source.
+            if (is_remote(current_rank_in_expert_idx) and not ((ib_landed_mask >> current_rank_in_expert_idx) & 1u)) {
+                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(current_rank_in_expert_idx)) != ib_epoch * kIBNumLandingPieces);
+                ib_landed_mask |= 1u << current_rank_in_expert_idx;
+            }
             // v4: token / SF rows of remote sources are packed; the map gives the packed index of this token
             const uint32_t ib_packed = is_remote(current_rank_in_expert_idx) ? reinterpret_cast<const uint16_t*>(
                 ib_landing + current_rank_in_expert_idx * ib_landing_stride + ib_off_map)[src_token_idx] : 0u;

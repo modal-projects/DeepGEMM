@@ -805,17 +805,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // Proxied sources: the slot table lives on the proxy (written by its D1 before the count release)
-            const uint32_t src_token_topk_idx = is_remote(current_rank_in_expert_idx) ?
-                *sym_buffer.map(ib_ptab(current_rank_in_expert_idx / ib_lsa) +
-                                (static_cast<int64_t>(sym_buffer.rank_idx % ib_lsa) * kNumExpertsPerRank + current_expert_idx) * kIBT + token_idx_in_rank,
-                                ib_cp(current_rank_in_expert_idx, ib_my_node)) :
-                *workspace.get_src_token_topk_idx_ptr(current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
-#else
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
-#endif
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -1450,89 +1441,73 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
         IB_TRACE(0, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
-        // D1 (proxy-dispatch): the last SMs' epilogue warps (idle until the first task, which needs these counts)
-        // act for the counterpart source of one remote node each: poll its header, top-k idx and weights in the
-        // mirror, assign slots deterministically in pair order, write the entries and per-source counts into the
-        // node's tables over NVLink, then publish with the upstream count-arrival add (kNumSMs << 32 | count).
-        if (sm_idx + ib_num_nodes >= kNumSMs + 1) {
-            const uint32_t n = ib_node_of_slot(kNumSMs - 1 - sm_idx);
-            const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
-            const auto mir = ib_mirror(ib_parity, n);
-            const auto hdr = reinterpret_cast<const uint64_t*>(mir + kIBOffHdr);
-            uint64_t h = 0;
-            comm::wait_until([&]() { h = ptx::ld_volatile(hdr); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
-                if (epilogue_thread_idx == 0)
-                    printf("DeepGEMM IB proxy header timeout: rank=%u, source=%u, header=%llx, epoch=%llu\n",
-                           sym_buffer.rank_idx, s, (unsigned long long) h, (unsigned long long) ib_epoch);
-            });
-            const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
-            IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-            const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
-            const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
-            // NOTES: smem_b can NOT be used as scratch here: shared-expert tasks do not wait for the routed counts
-            for (uint32_t i0 = 0; i0 < nt * kNumTopk; i0 += kNumEpilogueThreads * 4) {
-                uint64_t v[4];
-                uint32_t wv[4];
-                #pragma unroll
-                for (uint32_t u = 0; u < 4; ++ u) {
-                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                    v[u] = i < nt * kNumTopk ? ptx::ld_volatile(idx + i) : 0ull;
-                    wv[u] = i < nt * kNumTopk ? ptx::ld_volatile(wts + i) : 0u;
-                }
-                #pragma unroll
-                for (uint32_t u = 0; u < 4; ++ u) {
-                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                    if (i < nt * kNumTopk) {
-                        IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "d1_idx", s, i);
-                        IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "d1_w", s, i);
-                    }
-                }
-            }
-            auto cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
-            const uint32_t num_node_experts = ib_lsa * kNumExpertsPerRank;
-            DG_DEVICE_ASSERT(num_node_experts * 4 <= sizeof(shared_storage.smem_d));
-            for (uint32_t i = epilogue_thread_idx; i < num_node_experts; i += kNumEpilogueThreads)
-                cnt[i] = 0;
-            if (epilogue_thread_idx == 0)
-                workspace.signals->ib_o_nt[n] = nt;
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-            IB_TRACE(21, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-            {
-                // Slots by shared-memory atomics (the slot order inside an (expert, source) list is irrelevant: the
-                // combine addresses rows by token), all 256 threads, loads issued in blocks
-                constexpr uint32_t kBlk = 4;
-                for (uint32_t j0 = 0; j0 < nt * kNumTopk; j0 += kNumEpilogueThreads * kBlk) {
-                    int ev[kBlk];
+        // D1 (host scan; v1 had the proxy do this and push tables over NVLink, measured ~20 us slower): every GPU scans,
+        // for each remote source r, r's mirror on r's counterpart in this node (over NVLink, or locally when that is
+        // us) and builds its OWN tables for its own experts exactly like the upstream receiver-side state: per-source
+        // counts, slot entries (local stores), then the upstream count-arrival add (kNumSMs << 32 | count). One SM's
+        // epilogue warps per remote source (the last SMs; idle until the first routed task, which needs these counts).
+        {
+            const uint32_t num_remote = kNumRanks - ib_lsa;
+            if (sm_idx + num_remote >= kNumSMs) {
+                const uint32_t k = kNumSMs - 1 - sm_idx;                    // k-th remote source
+                const uint32_t r = ib_node_of_slot(k / ib_lsa) * ib_lsa + k % ib_lsa;
+                const uint32_t proxy = ib_cp(r, ib_my_node);
+                const auto mir = sym_buffer.map(ib_mirror(ib_parity, r / ib_lsa), proxy);
+                const auto hdr = reinterpret_cast<const uint64_t*>(mir + kIBOffHdr);
+                uint64_t h = 0;
+                comm::wait_until([&]() { h = ptx::ld_volatile(hdr); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
+                    if (epilogue_thread_idx == 0)
+                        printf("DeepGEMM IB header timeout: rank=%u, source=%u, proxy=%u, header=%llx, epoch=%llu\n",
+                               sym_buffer.rank_idx, r, proxy, (unsigned long long) h, (unsigned long long) ib_epoch);
+                });
+                const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
+                IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
+                const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
+                const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
+                auto cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+                for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads)
+                    cnt[i] = 0;
+                if (proxy == sym_buffer.rank_idx and epilogue_thread_idx == 0)
+                    workspace.signals->ib_o_nt[r / ib_lsa] = nt;  // the proxy's forward-combine and re-arm need it
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // Poll (top-k idx and weights; rule A for the weights the pull reads unchecked), then slots for the
+                // pairs routed to OUR experts by shared-memory atomics; entries are local stores
+                constexpr uint32_t kB = 4;
+                for (uint32_t i0 = 0; i0 < nt * kNumTopk; i0 += kNumEpilogueThreads * kB) {
+                    uint64_t v[kB];
+                    uint32_t wv[kB];
                     #pragma unroll
-                    for (uint32_t u = 0; u < kBlk; ++ u) {
-                        const uint32_t j = j0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        ev[u] = j < nt * kNumTopk ? static_cast<int>(static_cast<int64_t>(__ldcg(reinterpret_cast<const unsigned long long*>(idx) + j))) : -1;
+                    for (uint32_t u = 0; u < kB; ++ u) {
+                        const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                        v[u] = i < nt * kNumTopk ? ptx::ld_volatile(idx + i) : 0ull;
+                        wv[u] = i < nt * kNumTopk ? ptx::ld_volatile(wts + i) : 0u;
                     }
                     #pragma unroll
-                    for (uint32_t u = 0; u < kBlk; ++ u) {
-                        const uint32_t j = j0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        const int e = ev[u];
-                        const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
-                        if (e >= 0 and r / ib_lsa == ib_my_node) {
-                            const uint32_t le = (r % ib_lsa) * kNumExpertsPerRank + static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                            const uint32_t slot = atomicAdd_block(cnt + le, 1u);
-                            ib_ptab(n)[static_cast<int64_t>(le) * kIBT + slot] = j;
+                    for (uint32_t u = 0; u < kB; ++ u) {
+                        const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                        if (i < nt * kNumTopk) {
+                            IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "d1_idx", r, i);
+                            IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "d1_w", r, i);
+                            const int e = static_cast<int>(static_cast<int64_t>(v[u]));
+                            if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
+                                const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                                const uint32_t slot = atomicAdd_block(cnt + le, 1u);
+                                *workspace.get_src_token_topk_idx_ptr(le, r, slot) = i;
+                            }
                         }
                     }
                 }
-                __threadfence_system();
-            }
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-            IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-            for (uint32_t i = epilogue_thread_idx; i < num_node_experts; i += kNumEpilogueThreads) {
-                const uint32_t d = ib_my_node * ib_lsa + i / kNumExpertsPerRank, e = i % kNumExpertsPerRank;
-                *sym_buffer.map(workspace.get_expert_recv_count_ptr(s, e), d) = cnt[i];
-                __threadfence_system();
-                ptx::atomic_add_sys(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(e), d),
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
+                for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
+                    *workspace.get_expert_recv_count_ptr(r, i) = cnt[i];
+                    __threadfence();
+                    ptx::atomic_add(workspace.get_expert_recv_count_sum_ptr(i),
                                     (static_cast<uint64_t>(kNumSMs) << 32) | static_cast<uint64_t>(cnt[i]));
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                IB_TRACE(19, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             }
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-            IB_TRACE(19, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
         }
 #endif
 

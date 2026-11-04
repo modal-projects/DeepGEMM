@@ -204,10 +204,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     };
     const auto ib_is_sentinel4 = [](const uint4& v) { return (v.x & v.y & v.z & v.w) == 0xffffffffu; };
     constexpr uint64_t kIBIdxSentinel = 0x8000000000000000ull;
-#if defined(DG_MEGA_MOE_IB_NO_BACKOFF) and DG_MEGA_MOE_IB_NO_BACKOFF
-#define IB_BACKOFF(n) do {} while (0)
-#else
+// Spin back-off on failed sentinel re-polls: measured neutral-to-negative (EP16 +5-7 us), off by default
+#if defined(DG_MEGA_MOE_IB_BACKOFF) and DG_MEGA_MOE_IB_BACKOFF
 #define IB_BACKOFF(n) do { if ((n) > 8) __nanosleep(256); } while (0)
+#else
+#define IB_BACKOFF(n) do {} while (0)
 #endif
 #define IB_POLL(cond, reload, tag, a, b) do { const long long t0_ = clock64(); uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; \
         if (clock64() - t0_ > (1ll << 34)) { printf("OPUS_HANG %s rank=%u sm=%u warp=%u lane=%u a=%u b=%u epoch=%llu\n", tag, \
@@ -1426,9 +1427,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
             for (uint32_t q = kNumSMs - 2 - sm_idx; sm_idx + 2 <= kNumSMs and q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {
                 if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
-#if defined(DG_MEGA_MOE_IB_META_FIRST) and DG_MEGA_MOE_IB_META_FIRST
-                    while (ptx::ld_acq_sys(&workspace.signals->ib_o_meta_posted) < ib_epoch);
+                    // Meta first (x / SF posted only after the meta put) on 2 nodes: the meta lands ~10 us earlier on
+                    // 400G; with 3+ counterparts it convoys the posters (EP32 measured ~7 ms), so never there
+#if defined(DG_MEGA_MOE_IB_NO_META_FIRST) and DG_MEGA_MOE_IB_NO_META_FIRST
+                    constexpr bool kMetaFirst = false;
+#else
+                    const bool kMetaFirst = ib_num_nodes == 2;
 #endif
+                    while (kMetaFirst and ptx::ld_acq_sys(&workspace.signals->ib_o_meta_posted) < ib_epoch);
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
                     int64_t off = 0, bytes = 0;
                     if (piece == 0) {

@@ -427,6 +427,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sent > 0)
                 gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, sent, peer);
             gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
+            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(sent));
+#endif
             // DIAG bit 2: flush after posting (forces local completion processing on this context)
             if (DG_MEGA_MOE_IB_DIAG & 4)
                 gin.flush();
@@ -1641,6 +1645,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (num_rows > 0)
                     gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes,
                             ib_combine_staging + src * ib_combine_bytes, static_cast<uint64_t>(num_rows) * kIBRowBytes, src);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
+                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(num_rows) * kIBRowBytes);
+#endif
                 gin.signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), src);
             }
 
@@ -1795,6 +1803,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch,
                    (t[1] - t[0]) / 1e3, (t[10] - t[0]) / 1e3, (t[11] - t[0]) / 1e3, (t[2] - t[0]) / 1e3, (t[3] - t[0]) / 1e3, (t[4] - t[0]) / 1e3,
                    (t[5] - t[0]) / 1e3, (t[6] - t[0]) / 1e3, (t[7] - t[0]) / 1e3, (t[8] - t[0]) / 1e3, (t[9] - t[0]) / 1e3);
+            printf("IB_PUTS rank=%u since_last_print: landing_puts=%llu landing_bytes=%llu combine_puts=%llu combine_bytes=%llu landing_region=%lld\n",
+                   sym_buffer.rank_idx, (unsigned long long) t[14], (unsigned long long) t[15], (unsigned long long) t[12],
+                   (unsigned long long) t[13], (long long) ib_landing_bytes);
+            workspace.signals->ib_trace[12] = workspace.signals->ib_trace[13] = workspace.signals->ib_trace[14] = workspace.signals->ib_trace[15] = 0;
         }
 #endif
     }

@@ -406,53 +406,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         };
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v3d: per-token routed-only push with aggregated signals. Gin ops issued by lanes of one warp serialize
-        // (~2.5 us each), so: every dispatch warp handles tokens t = (sm * warps + warp) + k * (SMs * warps) and
-        // puts each token's row (one put per remote rank in its top-k) into that rank's landing copy of our input
-        // region (mirrored offsets), on this SM's context. The SF / top-k idx / top-k weight arrays (first
-        // num_tokens rows) go whole as pieces 1-3 from SMs kNumRanks..3*kNumRanks-1. No signals here: after the
-        // dispatch grid sync below, SM (peer + kNumRanks * ctx) posts ONE strong signal per (context, peer) QP,
-        // which settles every put posted on that QP before the sync. Receiver: landing_ready(r) == epoch * contexts.
-        DG_STATIC_ASSERT(kNumRanks <= 32, "IB push keeps a peer bitmask in 32 bits");
-        DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumSMs, "Insufficient SMs for IB landing signals");
-        DG_STATIC_ASSERT(kNumRanks * kIBNumLandingPieces <= kNumSMs, "Insufficient SMs for IB landing pieces");
+        // v2g: the input region is sized for kNumMaxTokensPerRank (1920 at Flash shapes) but only `num_tokens`
+        // rows are live; pushing the whole region sent 15x the bytes. Each peer now gets 4 pieces (tokens, SF,
+        // top-k idx, top-k weights), each only its first `num_tokens` rows, piece i on context i % contexts,
+        // each followed by a strong signal; the receiver waits for kIBNumLandingPieces signals per source.
+        DG_STATIC_ASSERT(kNumRanks * kIBNumLandingPieces <= kNumSMs, "Insufficient SMs for IB landing puts");
+        if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
+            const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
+            const uint8_t* piece_base = nullptr;
+            int64_t size = 0;
+            switch (piece) {
+                case 0: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_token_buffer.get_base_ptr());
+                        size = buffer.input_token_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+                case 1: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_sf_buffer.get_base_ptr());
+                        size = buffer.input_sf_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+                case 2: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr());
+                        size = buffer.input_topk_idx_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+                default: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_topk_weights_buffer.get_base_ptr());
+                        size = buffer.input_topk_weights_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+            }
+            const int64_t begin = piece_base - ib_input_base;
+            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
 #ifndef DG_MEGA_MOE_IB_DIAG
 #define DG_MEGA_MOE_IB_DIAG 0
 #endif
-        {
-            const auto gin = make_gin();
-            const auto token_bytes = buffer.input_token_buffer.data_layout.template get_num_bytes<int64_t>();
-            const int64_t token_off = reinterpret_cast<const uint8_t*>(buffer.input_token_buffer.get_base_ptr()) - ib_input_base;
-            const auto own_topk = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-            const auto dst_base = ib_landing + sym_buffer.rank_idx * ib_landing_bytes;
-            for (uint32_t t = sm_idx * kNumDispatchWarps + warp_idx; t < num_tokens; t += kNumSMs * kNumDispatchWarps) {
-                const int e = lane_idx < kNumTopk ? static_cast<int>(own_topk[t * kNumTopk + lane_idx]) : -1;
-                const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0;
-                const uint32_t bit = (e >= 0 and is_remote(r)) ? (1u << r) : 0u;
-                const uint32_t peers = __reduce_or_sync(0xffffffff, bit);
-                if (lane_idx < kNumRanks and ((peers >> lane_idx) & 1) and not (DG_MEGA_MOE_IB_DIAG & 1)) {
-                    gin.put(dst_base + token_off + t * token_bytes, ib_input_base + token_off + t * token_bytes,
-                            static_cast<uint64_t>(token_bytes), lane_idx);
+            // DIAG bit 0: skip the landing payload (timing only; results wrong); bit 1: cap it at 4 KB per piece
+            // bit 3: only the first half of the ranks (node 0) sends its payload (unidirectional in-kernel push)
+            const bool skip = (DG_MEGA_MOE_IB_DIAG & 1) or ((DG_MEGA_MOE_IB_DIAG & 8) and sym_buffer.rank_idx >= kNumRanks / 2);
+            const int64_t sent = skip ? 0 : ((DG_MEGA_MOE_IB_DIAG & 2) ? cute::min<int64_t>(size, 4096) : size);
+            if (sent > 0)
+                gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, sent, peer);
+            gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
-                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(token_bytes));
+            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
+            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(sent));
 #endif
-                }
-            }
-        }
-        if (thread_idx == 0 and sm_idx >= kNumRanks and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
-            const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;  // 1: SF, 2: top-k idx, 3: top-k weights
-            const auto& pb = piece == 1 ? buffer.input_sf_buffer : piece == 2 ? buffer.input_topk_idx_buffer : buffer.input_topk_weights_buffer;
-            const uint8_t* piece_base = reinterpret_cast<const uint8_t*>(pb.get_base_ptr());
-            const int64_t size = pb.data_layout.template get_num_bytes<int64_t>() * num_tokens;
-            const int64_t begin = piece_base - ib_input_base;
-            if (size > 0 and not (DG_MEGA_MOE_IB_DIAG & 1)) {
-                make_gin().put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, size, peer);
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
-#endif
-            }
+            // DIAG bit 2: flush after posting (forces local completion processing on this context)
+            if (DG_MEGA_MOE_IB_DIAG & 4)
+                gin.flush();
         }
 #endif
         IB_TRACE(0, sm_idx == 0 and thread_idx == 0);
@@ -495,13 +486,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
         IB_TRACE(10, sm_idx == 0 and thread_idx == 0);  // after the dispatch grid sync
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v3d: one strong signal per (context, peer) QP, after every SM's landing puts were posted (grid sync above)
-        if (thread_idx == 0 and sm_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(sm_idx % kNumRanks)) {
-            const uint32_t peer = sm_idx % kNumRanks, ctx = sm_idx / kNumRanks;
-            comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx).signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
-        }
-#endif
+
         // Write expert count
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
@@ -561,8 +546,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool do_a = warp_idx == 0, do_b = kNumDispatchWarps > 1 ? warp_idx == 1 : warp_idx == 0;
             constexpr uint32_t kIBScanUnroll = 8;
             if (do_a) {
-                // v3d: one strong signal per context per launch from r settles all of r's landing puts
-                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * DG_MEGA_MOE_IB_CONTEXTS);
+                // v2g: one strong signal per landing piece per launch from r settles r's landing puts
+                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * kIBNumLandingPieces);
                 const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
                 const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
                 // v2h: per-expert slot counters live in lane registers (lane l counts local expert l) instead of

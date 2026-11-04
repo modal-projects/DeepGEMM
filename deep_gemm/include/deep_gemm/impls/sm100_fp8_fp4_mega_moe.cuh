@@ -1339,32 +1339,45 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // D0 (on the epilogue warps, which are idle until the first task, so the dispatch grid sync never waits
-        // for Gin posting): post the slices of our input region to the mirror of our slot on each counterpart. Pieces per remote
-        // node: 0 header (epoch | num_tokens), 1 top-k idx, 2 weights, 3 SF, 4.. x rows in chunks of kIBChunk.
-        // Data-only puts; nothing to wait for (the input region is written before the launch). One SM per piece.
+        // D0 (on the epilogue warps, which are idle until the first task, so the dispatch grid sync never waits for
+        // Gin posting). The meta (top-k idx, weights, header) is staged by the last SM into the mirror slot of our own
+        // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
+        // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
+        IB_TRACE(23, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
+        if (sm_idx == kNumSMs - 1) {
+            const auto stg = ib_mirror(ib_parity, ib_my_node);
+            const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);
+            const auto in_w = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffW);
+            for (uint32_t i = epilogue_thread_idx; i < kIBT * kNumTopk; i += kNumEpilogueThreads) {
+                reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = i < num_tokens * kNumTopk ? in_idx[i] : kIBIdxSentinel;
+                reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = i < num_tokens * kNumTopk ? in_w[i] : 0xffffffffu;
+            }
+            if (epilogue_thread_idx == 0)
+                *reinterpret_cast<uint64_t*>(stg + kIBOffHdr) = (ib_epoch << 32) | num_tokens;
+            __threadfence();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+                const uint32_t n = ib_node_of_slot(lane_idx);
+                make_gin(lane_idx).put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
+                                       static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
+            }
+            __syncwarp();
+        }
         {
             const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
-            const uint32_t num_pieces = 4 + num_x_chunks;
-            for (uint32_t q = kNumSMs - 1 - sm_idx; q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {  // last SMs first (SM 0 has upstream roles)
-                if (epilogue_warp_idx == 0 and lane_idx == 0) {
+            const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
+            for (uint32_t q = kNumSMs - 2 - sm_idx; sm_idx + 2 <= kNumSMs and q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {
+                if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
-                    const uint32_t c = ib_cp(sym_buffer.rank_idx, n);
-                    const auto gin = make_gin(q);
-                    const auto dst = ib_mirror(ib_parity, ib_my_node);
+                    int64_t off = 0, bytes = 0;
                     if (piece == 0) {
-                        gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, c);
-                    } else if (num_tokens > 0) {
-                        int64_t off = 0, bytes = 0;
-                        if (piece == 1) off = kIBOffIdx, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 8;
-                        else if (piece == 2) off = kIBOffW, bytes = static_cast<int64_t>(num_tokens) * kNumTopk * 4;
-                        else if (piece == 3) off = kIBOffSF, bytes = static_cast<int64_t>(num_tokens) * kIBSFBytes;
-                        else {
-                            const uint32_t t0 = (piece - 4) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
-                            off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
-                        }
-                        gin.put(dst + off, ib_input_base + off, static_cast<uint64_t>(bytes), c);
+                        off = kIBOffSF, bytes = static_cast<int64_t>(num_tokens) * kIBSFBytes;
+                    } else {
+                        const uint32_t t0 = (piece - 1) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
+                        off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
+                    make_gin(q + 1).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
+                                        ib_cp(sym_buffer.rank_idx, n));
                 }
                 __syncwarp();
             }
@@ -1417,7 +1430,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 workspace.signals->ib_o_nt[n] = nt;
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             IB_TRACE(21, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-            if (epilogue_warp_idx == 0) {
+            {
+                // Every warp scans all pairs but owns the experts with le % warps == warp (no shared counters)
                 // The top-k values were polled above; load 16 iterations' worth at once (independent loads)
                 constexpr uint32_t kBlk = 16;
                 int ev[kBlk];
@@ -1435,11 +1449,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t u = 1; u < kBlk; ++ u)
                         if ((b / 32) % kBlk == u) e = ev[u];
                     const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
-                    const bool on = e >= 0 and r / ib_lsa == ib_my_node;
+                    const uint32_t le = (r % ib_lsa) * kNumExpertsPerRank + static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                    const bool on = e >= 0 and r / ib_lsa == ib_my_node and le % kNumEpilogueWarps == epilogue_warp_idx;
                     const uint32_t key = on ? static_cast<uint32_t>(e) : (0x80000000u | lane_idx);
                     const uint32_t m = __match_any_sync(0xffffffffu, key);
                     const uint32_t pre = __popc(m & ((1u << lane_idx) - 1u));
-                    const uint32_t le = (r % ib_lsa) * kNumExpertsPerRank + static_cast<uint32_t>(e) % kNumExpertsPerRank;
                     if (on) {
                         const uint32_t slot = cnt[le] + pre;
                         *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(static_cast<uint32_t>(e) % kNumExpertsPerRank, s, slot), r) = j;
@@ -2127,8 +2141,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_polled=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(0), us(2), us(20), us(21), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3);
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_polled=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(0), us(2), us(20), us(21), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3);
         }
 #endif
     }

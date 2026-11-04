@@ -421,7 +421,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_DIAG 0
 #endif
             // DIAG bit 0: skip the landing payload (timing only; results wrong); bit 1: cap it at 4 KB per chunk
-            const int64_t sent = (DG_MEGA_MOE_IB_DIAG & 1) ? 0 : ((DG_MEGA_MOE_IB_DIAG & 2) ? cute::min<int64_t>(size, 4096) : size);
+            // bit 3: only the first half of the ranks (node 0) sends its payload (unidirectional in-kernel push)
+            const bool skip = (DG_MEGA_MOE_IB_DIAG & 1) or ((DG_MEGA_MOE_IB_DIAG & 8) and sym_buffer.rank_idx >= kNumRanks / 2);
+            const int64_t sent = skip ? 0 : ((DG_MEGA_MOE_IB_DIAG & 2) ? cute::min<int64_t>(size, 4096) : size);
             if (sent > 0)
                 gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, sent, peer);
             gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);

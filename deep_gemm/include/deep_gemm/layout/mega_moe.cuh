@@ -136,6 +136,7 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint32_t ib_o_fchunk[2][kIBOMaxNodes][kIBOMaxChunks];
     alignas(128) uint32_t ib_o_fdone[2][kIBOMaxNodes];
     alignas(128) uint64_t ib_o_meta_posted;
+    alignas(128) uint64_t ib_o_scratch;  // Gin warm-up target (never read)
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 

@@ -171,10 +171,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // (j | local_expert << 16, slot) x pairs]; sent first on its own signal so the receiver's tables need no scan
     const int64_t ib_off_meta = math::align<int64_t>(ib_off_map + static_cast<int64_t>(kNumMaxTokensPerRank) * 2, 128);
     const int64_t ib_off_meta_pairs = ib_off_meta + layout::MegaMoESignals::kIBMaxExpertsPerRank * 4;
+    const int64_t ib_off_meta_count = ib_off_meta_pairs + 4;  // v10: rows packed for this peer (chunk count)
     const int64_t ib_off_meta_entries = ib_off_meta_pairs + 128;
+    // v10: the whole top-k weight array rides in the meta piece (entries carry the packed row index), so the only
+    // landing pieces are the streamed x/SF chunks and the meta block
+    const int64_t ib_off_meta_w = ib_off_meta_entries + static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * 8;
     const int64_t ib_landing_stride = math::align<int64_t>(
-        ib_off_meta_entries + static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * 8, 128);
-    constexpr uint32_t kIBMetaPieceSM = kNumRanks * kIBNumLandingPieces;  // SMs posting the meta piece: this + peer
+        ib_off_meta_w + static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * 4, 128);
+    constexpr uint32_t kIBChunkRows = layout::MegaMoESignals::kIBChunkRows;
+    DG_STATIC_ASSERT(kNumMaxTokensPerRank <= kIBChunkRows * layout::MegaMoESignals::kIBMaxChunks, "IB chunk table too small");
     // v2d: per expert rank, a contiguous chunk of our combine rows, ordered by (token, top-k)
     constexpr uint32_t kIBRowBytes = kHidden * sizeof(nv_bfloat16);
     constexpr int64_t kIBCombineLandingBytes = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * kIBRowBytes;
@@ -465,16 +470,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t peers = __reduce_or_sync(0xffffffff, bit);
                 // v7: every remote pair takes a slot in its (peer, expert) list and an entry in the peer's meta block;
                 // the slot is also parked in ib_combine_idx[j] (finalized with the per-expert prefix after the sync)
-                if (pair_remote) {
-                    const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                    const uint32_t j = t * kNumTopk + lane_idx;
-                    const uint32_t slot = atomicAdd(workspace.get_ib_pack_slot_ptr(parity, r, le), 1u);
-                    const uint32_t idx = atomicAdd(workspace.get_ib_pack_pairs_ptr(parity, r), 1u);
-                    auto entries = reinterpret_cast<uint32_t*>(ib_pack + r * ib_landing_stride + ib_off_meta_entries);
-                    entries[2 * idx] = j | (le << 16);
-                    entries[2 * idx + 1] = slot;
-                    *workspace.get_ib_combine_idx_ptr(j) = slot;
-                }
+                uint32_t my_kk = 0;  // v10: packed row index of this token at my pair's peer
                 while (peers != 0) {
                     const uint32_t p = __ffs(peers) - 1;
                     peers &= peers - 1;
@@ -482,6 +478,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (lane_idx == 0)
                         kk = atomicAdd(workspace.get_ib_pack_count_ptr(parity, p), 1u);
                     kk = __shfl_sync(0xffffffff, kk, 0);
+                    if (pair_remote and r == p)
+                        my_kk = kk;
                     // peer p's pack block = our combine staging slot for p (free until the L2 epilogue; the puts are
                     // flushed before the pre-pull barrier), laid out like p's landing copy of our region
                     const auto stage_p = ib_pack + p * ib_landing_stride;
@@ -495,8 +493,42 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (int64_t o = lane_idx * 16; o < ib_sf_bytes; o += 32 * 16)
                             *reinterpret_cast<int4*>(dst_sf + o) = *reinterpret_cast<const int4*>(src_sf + o);
                     }
-                    if (lane_idx == 0)
-                        reinterpret_cast<uint16_t*>(stage_p + ib_off_map)[t] = static_cast<uint16_t>(kk);
+                    // v10: the warp that completes a chunk of kIBChunkRows packed rows for p sends it now: one put
+                    // + bundled weak signal per piece (x, SF) on p's (our rank, chunk) word; the other warps' rows
+                    // were released by their acq_rel adds, ours by the fence
+                    __syncwarp();
+                    if (lane_idx == 0) {
+                        __threadfence();
+                        const uint32_t c = kk / kIBChunkRows;
+                        if (ib_atom_add_acq_rel(workspace.get_ib_chunk_fill_ptr(parity, p, c), 1u) + 1 == kIBChunkRows) {
+                            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, p);
+                            const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
+                            const int64_t r0 = static_cast<int64_t>(c) * kIBChunkRows;
+                            gin.put_signal_weak(dst + r0 * ib_token_bytes, stage_p + r0 * ib_token_bytes,
+                                                static_cast<uint64_t>(kIBChunkRows) * ib_token_bytes, p,
+                                                workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, c));
+                            if (ib_sf_bytes > 0)
+                                gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
+                                                    static_cast<uint64_t>(kIBChunkRows) * ib_sf_bytes, p,
+                                                    workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, c));
+                            gin.flush();  // the pack block doubles as combine staging later; sources must be reusable
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
+                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(kIBChunkRows) * (ib_token_bytes + ib_sf_bytes));
+#endif
+                        }
+                    }
+                    __syncwarp();
+                }
+                if (pair_remote) {
+                    const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                    const uint32_t j = t * kNumTopk + lane_idx;
+                    const uint32_t slot = atomicAdd(workspace.get_ib_pack_slot_ptr(parity, r, le), 1u);
+                    const uint32_t idx = atomicAdd(workspace.get_ib_pack_pairs_ptr(parity, r), 1u);
+                    auto entries = reinterpret_cast<uint32_t*>(ib_pack + r * ib_landing_stride + ib_off_meta_entries);
+                    entries[2 * idx] = j | (le << 16);
+                    entries[2 * idx + 1] = slot | (my_kk << 16);  // v10: slot and the packed row index
+                    *workspace.get_ib_combine_idx_ptr(j) = slot;
                 }
             }
         }
@@ -556,6 +588,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_ib_pack_slot_ptr(ib_parity ^ 1u, i / kNumExpertsPerRank, i % kNumExpertsPerRank) = 0;
             if (thread_idx < kNumRanks)
                 *workspace.get_ib_pack_pairs_ptr(ib_parity ^ 1u, thread_idx) = 0;
+            constexpr uint32_t kIBNumChunkSlots = (kNumMaxTokensPerRank + kIBChunkRows - 1) / kIBChunkRows;
+            for (uint32_t i = thread_idx; i < kNumRanks * kIBNumChunkSlots; i += kNumDispatchThreads)
+                *workspace.get_ib_chunk_fill_ptr(ib_parity ^ 1u, i / kIBNumChunkSlots, i % kIBNumChunkSlots) = 0;
         }
         DG_STATIC_ASSERT(kNumRanks <= kNumSMs, "Insufficient SMs for IB landing pieces");
         if (sm_idx < kNumRanks and is_remote(sm_idx)) {
@@ -569,31 +604,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (thread_idx < kNumExpertsPerRank)
                 counts[thread_idx] = *workspace.get_ib_pack_slot_ptr(ib_parity, peer, thread_idx);
             const uint32_t npairs = *workspace.get_ib_pack_pairs_ptr(ib_parity, peer);
-            if (thread_idx == 0)
+            if (thread_idx == 0) {
                 *reinterpret_cast<uint32_t*>(stage_p + ib_off_meta_pairs) = npairs;
+                *reinterpret_cast<uint32_t*>(stage_p + ib_off_meta_count) = static_cast<uint32_t>(cnt);
+            }
+            // v10: the top-k weights ride in the meta block
+            for (uint32_t i = thread_idx; i < num_tokens * kNumTopk; i += kNumDispatchThreads)
+                reinterpret_cast<float*>(stage_p + ib_off_meta_w)[i] = reinterpret_cast<const float*>(ib_input_base + ib_off_w)[i];
             __threadfence();
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
             if (lane_idx == 0) {
-                for (uint32_t piece = warp_idx; piece <= kIBNumLandingPieces; piece += kNumDispatchWarps) {
-                    const uint8_t* src = nullptr; const uint8_t* dst_sym = nullptr; int64_t size = 0;
-                    switch (piece) {
-                        case 0: src = stage_p; dst_sym = dst; size = cnt * ib_token_bytes; break;
-                        case 1: src = stage_p + ib_off_sf; dst_sym = dst + ib_off_sf; size = cnt * ib_sf_bytes; break;
-                        case 2: src = ib_input_base + ib_off_idx; dst_sym = dst + ib_off_idx; size = num_tokens * ib_idx_bytes; break;
-                        case 3: src = ib_input_base + ib_off_w; dst_sym = dst + ib_off_w; size = num_tokens * ib_w_bytes; break;
-                        case 4: src = stage_p + ib_off_map; dst_sym = dst + ib_off_map; size = num_tokens * 2; break;
-                        default: src = stage_p + ib_off_meta; dst_sym = dst + ib_off_meta;
-                                 size = (ib_off_meta_entries - ib_off_meta) + static_cast<int64_t>(npairs) * 8; break;
-                    }
-                    const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
-                    if (piece == kIBNumLandingPieces - 1)  // the token count rides on the map piece's context
-                        gin.put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), peer);
-                    if (size > 0 and not (DG_MEGA_MOE_IB_DIAG & 1))
-                        gin.put(dst_sym, src, static_cast<uint64_t>(size), peer);
-                    if (piece < kIBNumLandingPieces)
-                        gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
-                    else
-                        gin.signal_inc(workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx), peer);
+                // v10: warp 0 sends the partial last chunk (full chunks went out during the gather), warp 1 the
+                // meta block; every piece is one put with its own bundled weak signal
+                const uint32_t full = static_cast<uint32_t>(cnt) / kIBChunkRows, rem = static_cast<uint32_t>(cnt) % kIBChunkRows;
+                if (warp_idx == 0 and rem > 0) {
+                    const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, peer);
+                    const int64_t r0 = static_cast<int64_t>(full) * kIBChunkRows;
+                    gin.put_signal_weak(dst + r0 * ib_token_bytes, stage_p + r0 * ib_token_bytes,
+                                        static_cast<uint64_t>(rem) * ib_token_bytes, peer,
+                                        workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, full));
+                    if (ib_sf_bytes > 0)
+                        gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
+                                            static_cast<uint64_t>(rem) * ib_sf_bytes, peer,
+                                            workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, full));
+                    gin.flush();
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
+                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(rem) * (ib_token_bytes + ib_sf_bytes));
+#endif
+                }
+                if (warp_idx == (kNumDispatchWarps > 1 ? 1u : 0u)) {
+                    const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, peer + 1);
+                    const int64_t size = (ib_off_meta_w - ib_off_meta) + static_cast<int64_t>(num_tokens) * kNumTopk * 4;
+                    gin.put_signal_weak(dst + ib_off_meta, stage_p + ib_off_meta, static_cast<uint64_t>(size), peer,
+                                        workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx));
+                    gin.flush();
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
                     atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
@@ -674,8 +719,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
                     *workspace.get_expert_recv_count_ptr(r, e) = counts[e];
                 for (uint32_t i = lane_idx; i < npairs; i += 32) {
-                    const uint32_t e0 = entries[2 * i], slot = entries[2 * i + 1];
-                    *workspace.get_src_token_topk_idx_ptr(e0 >> 16, r, slot) = e0 & 0xffffu;
+                    const uint32_t e0 = entries[2 * i], s1 = entries[2 * i + 1];
+                    // v10: (packed row index << 16) | pair index
+                    *workspace.get_src_token_topk_idx_ptr(e0 >> 16, r, s1 & 0xffffu) = (e0 & 0xffffu) | (s1 & 0xffff0000u);
+                }
+                {
+                    // v10: pieces expected per chunk of source r this launch (x + SF per chunk)
+                    const uint32_t cnt_r = *reinterpret_cast<const uint32_t*>(meta + ib_off_meta_count);
+                    const uint32_t pieces = ib_sf_bytes > 0 ? 2u : 1u;
+                    for (uint32_t c = lane_idx; c < (cnt_r + kIBChunkRows - 1) / kIBChunkRows; c += 32)
+                        *workspace.get_ib_chunk_expected_ptr(r, c) += pieces;
                 }
                 if (lane_idx == 0)
                     *workspace.get_ib_pairs_from_ptr(r) = npairs;
@@ -787,7 +840,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        uint32_t ib_landed_mask = 0;  // v7: remote sources whose rows this warp has seen land
+        uint32_t ib_last_src = 0xffffffffu, ib_last_chunk = 0;  // v10: last (source, chunk) this warp saw land
 #endif
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
@@ -871,8 +924,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
-            uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+            const uint32_t src_entry = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+            const uint32_t src_token_topk_idx = src_entry & 0xffffu;  // v10: remote entries carry the packed row index above
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             if (is_remote(current_rank_in_expert_idx)) {
                 // v5b: this row's staging index = prefix of (source, local expert) + slot (pair order on both sides)
@@ -913,15 +967,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
             };
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // v7: the counts/table arrived with the meta piece; the rows (map, x, SF, weights) arrive later under
-            // landing_ready. Wait once per source per warp (bitmask), only when first touching a remote source.
-            if (is_remote(current_rank_in_expert_idx) and not ((ib_landed_mask >> current_rank_in_expert_idx) & 1u)) {
-                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(current_rank_in_expert_idx)) != ib_epoch * kIBNumLandingPieces);
-                ib_landed_mask |= 1u << current_rank_in_expert_idx;
+            // v10: token / SF rows of remote sources arrive in chunks with their own weak signals; wait for the
+            // chunk holding this row (cached per warp: consecutive rows usually share it)
+            const uint32_t ib_packed = is_remote(current_rank_in_expert_idx) ? (src_entry >> 16) : 0u;
+            if (is_remote(current_rank_in_expert_idx)) {
+                const uint32_t c = ib_packed / kIBChunkRows;
+                if (current_rank_in_expert_idx != ib_last_src or c != ib_last_chunk) {
+                    const auto ready_ptr = workspace.get_ib_chunk_ready_ptr(current_rank_in_expert_idx, c);
+                    const uint64_t want = *workspace.get_ib_chunk_expected_ptr(current_rank_in_expert_idx, c);
+                    while (ptx::ld_acq_sys(ready_ptr) < want);
+                    ib_last_src = current_rank_in_expert_idx; ib_last_chunk = c;
+                }
             }
-            // v4: token / SF rows of remote sources are packed; the map gives the packed index of this token
-            const uint32_t ib_packed = is_remote(current_rank_in_expert_idx) ? reinterpret_cast<const uint16_t*>(
-                ib_landing + current_rank_in_expert_idx * ib_landing_stride + ib_off_map)[src_token_idx] : 0u;
 #endif
             const auto src_row_ptr = [&](auto local_ptr, const int64_t& off, const int64_t& row_bytes) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -958,8 +1015,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load the weight first, so that its remote latency overlaps with the SF copy below
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            const auto weight = is_remote(current_rank_in_expert_idx) ?
+                reinterpret_cast<const float*>(ib_landing + current_rank_in_expert_idx * ib_landing_stride + ib_off_meta_w)[src_token_topk_idx] :
+                *sym_buffer.map(buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
+#else
             const auto weight = *src_ptr(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx);
+#endif
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;

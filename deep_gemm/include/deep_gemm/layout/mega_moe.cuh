@@ -118,6 +118,13 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint32_t ib_pack_slot[2][kNumMaxRanks][kIBMaxExpertsPerRank];  // v7: pairs packed per (peer, expert) this launch, by parity
     alignas(128) uint32_t ib_pack_pairs[2][kNumMaxRanks];  // v7: pairs packed per peer this launch, by parity
     alignas(128) uint64_t ib_meta_ready[kNumMaxRanks];  // v7: +1 per launch per source once its counts/slot table landed
+    // v10: streamed dispatch. Rows packed for a peer are sent in chunks of kIBChunkRows as soon as the chunk is
+    // full (gather warps post them, one put + bundled weak signal per piece); the receiver waits per chunk.
+    static constexpr uint32_t kIBChunkRows = 16;
+    static constexpr uint32_t kIBMaxChunks = 256;
+    alignas(128) uint32_t ib_chunk_fill[2][kNumMaxRanks][kIBMaxChunks];   // local: rows packed into (peer, chunk), by parity
+    alignas(128) uint64_t ib_chunk_ready[kNumMaxRanks][kIBMaxChunks];     // NIC weak signals: pieces of (source, chunk) landed
+    alignas(128) uint32_t ib_chunk_expected[kNumMaxRanks][kIBMaxChunks];  // local: cumulative pieces expected per (source, chunk)
     alignas(128) uint32_t ib_combine_idx[kNumMaxIBPairs];
     alignas(128) uint32_t ib_pool_combine_idx[kNumMaxIBPoolTokens];
     alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
@@ -291,6 +298,18 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_ib_meta_ready_ptr(const uint32_t& src_rank_idx) const {
         return signals->ib_meta_ready + src_rank_idx;
+    }
+    CUTLASS_DEVICE
+    uint32_t* get_ib_chunk_fill_ptr(const uint32_t& parity, const uint32_t& peer, const uint32_t& chunk) const {
+        return signals->ib_chunk_fill[parity][peer] + chunk;
+    }
+    CUTLASS_DEVICE
+    uint64_t* get_ib_chunk_ready_ptr(const uint32_t& src_rank_idx, const uint32_t& chunk) const {
+        return signals->ib_chunk_ready[src_rank_idx] + chunk;
+    }
+    CUTLASS_DEVICE
+    uint32_t* get_ib_chunk_expected_ptr(const uint32_t& src_rank_idx, const uint32_t& chunk) const {
+        return signals->ib_chunk_expected[src_rank_idx] + chunk;
     }
 
     CUTLASS_DEVICE

@@ -114,13 +114,14 @@ CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
         const auto signal_phase = status & 1, signal_sign = status >> 1;
         auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
 
-        if (thread_idx < kNumRanks) {
-            if (sym_buffer.is_lsa(thread_idx)) {
-                ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
-            } else {
-                // One strong signal per launch per tag: the counter equals `epoch` once this rank arrived
-                make_gin().signal_inc(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), thread_idx);
-            }
+        if (thread_idx < kNumRanks and sym_buffer.is_lsa(thread_idx))
+            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+        // One strong signal per launch per tag per remote rank: the counter equals `epoch` once this rank
+        // arrived. v2f: posted from one lane in a loop (contending lanes serialize on GDAKI queues)
+        if (thread_idx == 0) {
+            for (uint32_t r = 0; r < kNumRanks; ++r)
+                if (not sym_buffer.is_lsa(r))  // Gin built lazily: LSA-only runs have no device communicator
+                    make_gin().signal_inc(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), r);
         }
         sync_scope();
 

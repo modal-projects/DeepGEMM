@@ -409,9 +409,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // strong signal (same context) later settles it before the receiver pulls
         // v2e: each peer's region goes as DG_MEGA_MOE_IB_CONTEXTS chunks, one per Gin context (parallel proxy
         // queues), each followed by a strong signal on its context; the receiver waits for all of them
-        DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumDispatchThreads, "Insufficient threads for IB landing puts");
-        if (sm_idx == 0 and thread_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(thread_idx % kNumRanks)) {
-            const uint32_t peer = thread_idx % kNumRanks, ctx = thread_idx / kNumRanks;
+        // v2f: one (peer, context) chunk per SM, posted by that SM's thread 0 (lanes of one warp contending on
+        // GDAKI queues serialize; DeepEP posts one lane per warp too)
+        DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumSMs, "Insufficient SMs for IB landing puts");
+        if (thread_idx == 0 and sm_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(sm_idx % kNumRanks)) {
+            const uint32_t peer = sm_idx % kNumRanks, ctx = sm_idx / kNumRanks;
             const int64_t chunk = math::align<int64_t>(math::ceil_div<int64_t>(ib_landing_bytes, DG_MEGA_MOE_IB_CONTEXTS), 128);
             const int64_t begin = ctx * chunk, size = cute::min(chunk, ib_landing_bytes - begin);
             const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx);
@@ -493,8 +495,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // v2c: our token count, on context 0 like the landing put; the pre-pull barrier's strong signal
             // (also SM 0, context 0) settles both at each remote rank
-            if (thread_idx < kNumRanks and is_remote(thread_idx))
-                make_gin().put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), thread_idx);
+            // v2f: one posting lane, looping over peers
+            if (thread_idx == 0) {
+                for (uint32_t r = 0; r < kNumRanks; ++r)
+                    if (is_remote(r))
+                        make_gin().put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), r);
+            }
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -1617,10 +1623,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // v2d combine: every staged row is complete after the grid sync; SM 0 sends each remote source its
             // whole chunk (rows ordered by the source's (token, top-k)) as one put, then a strong signal on the
             // same context, which settles it
-            if (sm_idx == 0 and epilogue_thread_idx < kNumRanks and is_remote(epilogue_thread_idx)) {
-                const uint32_t src = epilogue_thread_idx;
+            // v2f: SM `src` posts source src's chunk from one lane, on context src % contexts
+            if (sm_idx < kNumRanks and epilogue_thread_idx == 0 and is_remote(sm_idx)) {
+                const uint32_t src = sm_idx;
                 const auto num_rows = static_cast<uint32_t>(*workspace.get_ib_pairs_from_ptr(src));
-                const auto gin = make_gin();
+                const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, src);
                 if (num_rows > 0)
                     gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes,
                             ib_combine_staging + src * ib_combine_bytes, static_cast<uint64_t>(num_rows) * kIBRowBytes, src);

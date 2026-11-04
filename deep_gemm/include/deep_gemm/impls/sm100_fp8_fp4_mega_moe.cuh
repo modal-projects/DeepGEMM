@@ -425,6 +425,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sent > 0)
                 gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, sent, peer);
             gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
+            // DIAG bit 2: flush after posting (forces local completion processing on this context)
+            if (DG_MEGA_MOE_IB_DIAG & 4)
+                gin.flush();
         }
 #endif
         IB_TRACE(0, sm_idx == 0 and thread_idx == 0);

@@ -54,6 +54,15 @@ struct GinIB {
                 ncclCoopThread(), ncclGin_None(), ncclGinOptFlagsDefault, ncclGin_SegmentDevice());
     }
 
+    // Put with a bundled WEAK signal: +1 on the 64-bit counter at `signal_sym_ptr` (local layout) on `dst_rank_idx`
+    // once THIS put has settled (no ordering with respect to other puts, no fence). One NIC op.
+    __device__ __forceinline__ void put_signal_weak(const void* dst_sym_ptr, const void* src_ptr, const uint64_t& num_bytes,
+                                                    const uint32_t& dst_rank_idx, const uint64_t* signal_sym_ptr) const {
+        gin.put(world, static_cast<int>(dst_rank_idx), window, offset(dst_sym_ptr), window, offset(src_ptr), num_bytes,
+                ncclGin_WeakVASignalInc{window, static_cast<size_t>(offset(signal_sym_ptr))}, ncclGin_None(), ncclCoopThread(), ncclGin_None(),
+                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+    }
+
     // Strong signal: +1 on the 64-bit counter at `sym_ptr` (local layout) on `dst_rank_idx`. Its visibility
     // implies every preceding put on this context to that peer has settled. Only NIC signals may touch the
     // counter (never GPU atomics).

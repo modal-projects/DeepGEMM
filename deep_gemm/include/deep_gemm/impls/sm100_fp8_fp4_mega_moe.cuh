@@ -188,8 +188,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kIBNumCombineGroups = layout::MegaMoESignals::kIBNumCombineGroups;
     constexpr uint32_t kIBNumL2NTiles = L2_SHAPE_N / BLOCK_N;
     DG_STATIC_ASSERT(kNumExpertsPerRank <= layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB prefix table too small");
-    const auto ib_group_of = [](const uint32_t& local_expert_idx) { return local_expert_idx * kIBNumCombineGroups / kNumExpertsPerRank; };
-    const auto ib_group_begin = [](const uint32_t& g) { return (g * kNumExpertsPerRank + kIBNumCombineGroups - 1) / kIBNumCombineGroups; };
+    // v9: one combine group per local expert; its rows go out (one put + bundled weak signal per source) as soon
+    // as the expert's L2 tiles are staged, and the combine waits per (expert rank, local expert) of each token
+    DG_STATIC_ASSERT(kNumExpertsPerRank <= kIBNumCombineGroups and kNumExpertsPerRank <= kNumSMs, "v9 needs one posting SM per local expert");
+    const auto ib_group_of = [](const uint32_t& local_expert_idx) { return local_expert_idx; };
+    const auto ib_group_begin = [](const uint32_t& g) { return g; };
     const auto ib_atom_add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
         uint32_t old;
         asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(v) : "memory");
@@ -544,7 +547,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // strong signal on context `piece`
         if (sm_idx == 0 and thread_idx < kNumRanks)
             *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1) ^ 1u, thread_idx) = 0;
-        if (sm_idx == 0 and thread_idx < kIBNumCombineGroups) {
+        if (sm_idx == 0 and thread_idx < kNumExpertsPerRank) {
             *workspace.get_ib_group_total_ptr(ib_parity ^ 1u, thread_idx) = 0;
             *workspace.get_ib_group_done_ptr(ib_parity ^ 1u, thread_idx) = 0;
         }
@@ -709,7 +712,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto* scratch_pre = reinterpret_cast<uint32_t*>(workspace.signals->ib_scratch[kNumRanks + r]);
                 DG_STATIC_ASSERT(layout::MegaMoESignals::kNumIBScratchBytes >= 4 * layout::MegaMoESignals::kIBMaxExpertsPerRank, "IB scratch too small");
                 DG_STATIC_ASSERT(2 * kNumRanks <= layout::MegaMoESignals::kNumMaxIBScratchSlots, "IB scratch slots");
-                uint32_t run = 0, group_mask = 0;
+                uint32_t run = 0;
                 for (uint32_t e0 = 0; e0 < kNumExpertsPerRank; e0 += 32) {
                     const uint32_t e = e0 + lane_idx;
                     const uint32_t c = e < kNumExpertsPerRank ? *workspace.get_ib_pack_slot_ptr(ib_parity, r, e) : 0u;
@@ -721,14 +724,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     if (e < kNumExpertsPerRank) {
                         scratch_pre[e] = run + incl - c;
+                        // v9: rank r will send expert e's rows for our pairs with one weak-signalled put
                         if (c > 0)
-                            group_mask |= 1u << ib_group_of(e);
+                            *workspace.get_ib_combine_expected_e_ptr(r, e) += 1;
                     }
                     run += __shfl_sync(0xffffffff, incl, 31);
                 }
-                group_mask = __reduce_or_sync(0xffffffff, group_mask);
-                if (lane_idx == 0)
-                    *workspace.get_ib_combine_expected_ptr(r) += __popc(group_mask);
                 __syncwarp();
                 constexpr uint32_t kIBScanUnroll2 = 8;
                 for (uint32_t base0 = 0; base0 < num_tokens * kNumTopk; base0 += 32 * kIBScanUnroll2) {
@@ -1002,7 +1003,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // v8: the dispatch warps are idle from here until the cleanup; SM g (g < groups) waits for expert group g's
         // staged row-tiles to reach the group total, then its warps send the group's rows to the remote sources
         // (warp w: sources w, w + warps, ...; one put + one strong signal each), off the epilogue's critical path
-        if (sm_idx < kIBNumCombineGroups) {
+        if (sm_idx < kNumExpertsPerRank) {
             const uint32_t g = sm_idx;
             const uint32_t total = ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g));
             if (total > 0) {
@@ -1018,10 +1019,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             continue;
                         const uint32_t r0 = *workspace.get_ib_src_prefix_ptr(s, gb), r1 = *workspace.get_ib_src_prefix_ptr(s, ge);
                         if (r1 > r0) {
-                            gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes + static_cast<int64_t>(r0) * kIBRowBytes,
-                                    ib_combine_staging + s * ib_combine_bytes + static_cast<int64_t>(r0) * kIBRowBytes,
-                                    static_cast<uint64_t>(r1 - r0) * kIBRowBytes, s);
-                            gin.signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), s);
+                            // v9: one NIC op: the put plus a weak signal on (our rank, expert g) at the source
+                            gin.put_signal_weak(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes + static_cast<int64_t>(r0) * kIBRowBytes,
+                                                ib_combine_staging + s * ib_combine_bytes + static_cast<int64_t>(r0) * kIBRowBytes,
+                                                static_cast<uint64_t>(r1 - r0) * kIBRowBytes, s,
+                                                workspace.get_ib_combine_ready_e_ptr(sym_buffer.rank_idx, g));
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                             atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
                             atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(r1 - r0) * kIBRowBytes);
@@ -1936,10 +1938,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             const uint32_t ib_peer_rank = is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0;
+            const uint32_t ib_peer_expert = is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) % kNumExpertsPerRank : 0;
             const bool ib_peer_remote = is_routed and is_remote(ib_peer_rank);
-            const auto ib_peer_ready_ptr = workspace.get_ib_combine_ready_ptr(ib_peer_rank);
+            // v9: per-token readiness: each routed slot waits only for its own (expert rank, local expert) put
+            const auto ib_peer_ready_ptr = workspace.get_ib_combine_ready_e_ptr(ib_peer_rank, ib_peer_expert);
+            const uint64_t ib_peer_expected = *workspace.get_ib_combine_expected_e_ptr(ib_peer_rank, ib_peer_expert);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
-                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) >= *workspace.get_ib_combine_expected_ptr(ib_peer_rank)
+                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) >= ib_peer_expected
                                 : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
 #else
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },

@@ -108,11 +108,13 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_landing_expected[kNumMaxRanks];  // local: cumulative signals expected from each source (v3a)
     alignas(128) uint32_t ib_pack_count[2][kNumMaxRanks];  // local: rows packed per peer this launch, by epoch parity (v4)
     static constexpr uint32_t kIBMaxExpertsPerRank = 128;
-    static constexpr uint32_t kIBNumCombineGroups = 8;
+    static constexpr uint32_t kIBNumCombineGroups = kIBMaxExpertsPerRank;  // v9: one combine group per local expert
     alignas(128) uint32_t ib_src_prefix[kNumMaxRanks][kIBMaxExpertsPerRank + 1];  // v5b: row offset of (source, local expert) in the combine staging / landing
     alignas(128) uint32_t ib_group_total[2][kIBNumCombineGroups];  // v5b: staged row-tiles expected per expert group, by epoch parity
     alignas(128) uint32_t ib_group_done[2][kIBNumCombineGroups];
     alignas(128) uint64_t ib_combine_expected[kNumMaxRanks];  // v5b: cumulative combine signals expected from each expert rank
+    alignas(128) uint64_t ib_combine_ready_e[kNumMaxRanks][kIBMaxExpertsPerRank];  // v9: NIC weak signal per (expert rank, local expert) put landed here
+    alignas(128) uint32_t ib_combine_expected_e[kNumMaxRanks][kIBMaxExpertsPerRank];  // v9: cumulative puts expected per (expert rank, local expert)
     alignas(128) uint32_t ib_pack_slot[2][kNumMaxRanks][kIBMaxExpertsPerRank];  // v7: pairs packed per (peer, expert) this launch, by parity
     alignas(128) uint32_t ib_pack_pairs[2][kNumMaxRanks];  // v7: pairs packed per peer this launch, by parity
     alignas(128) uint64_t ib_meta_ready[kNumMaxRanks];  // v7: +1 per launch per source once its counts/slot table landed
@@ -266,6 +268,14 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_ib_combine_expected_ptr(const uint32_t& rank_idx) const {
         return signals->ib_combine_expected + rank_idx;
+    }
+    CUTLASS_DEVICE
+    uint64_t* get_ib_combine_ready_e_ptr(const uint32_t& src_rank_idx, const uint32_t& local_expert_idx) const {
+        return signals->ib_combine_ready_e[src_rank_idx] + local_expert_idx;
+    }
+    CUTLASS_DEVICE
+    uint32_t* get_ib_combine_expected_e_ptr(const uint32_t& rank_idx, const uint32_t& local_expert_idx) const {
+        return signals->ib_combine_expected_e[rank_idx] + local_expert_idx;
     }
 
     CUTLASS_DEVICE

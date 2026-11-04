@@ -452,13 +452,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // (v2a': no per-SM signals; SM 0 signals once per Gin context after the grid sync + its count puts)
 #endif
 
+        IB_TRACE(1, sm_idx == 0 and thread_idx == 0);  // index work done (before the grid sync)
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
 
-        IB_TRACE(1, sm_idx == 0 and thread_idx == 0);
+        IB_TRACE(10, sm_idx == 0 and thread_idx == 0);  // after the dispatch grid sync
         // Write expert count
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
@@ -498,6 +499,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+        IB_TRACE(11, sm_idx == 0 and thread_idx == 0);  // counts written, about to enter the pre-pull barrier
         // Barrier before pulling
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -1772,9 +1774,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE(9, sm_idx == 0 and epilogue_thread_idx == 0);
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
-            printf("IB_TRACE rank=%u epoch=%llu us: idx=%.1f barrier=%.1f scan=%.1f pull_end=%.1f l2_done=%.1f l2_sync=%.1f combine_put=%.1f first_wait=%.1f end=%.1f\n",
+            printf("IB_TRACE rank=%u epoch=%llu us: idx=%.1f gsync=%.1f pre_barrier=%.1f barrier=%.1f scan=%.1f pull_end=%.1f l2_done=%.1f l2_sync=%.1f combine_put=%.1f first_wait=%.1f end=%.1f\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch,
-                   (t[1] - t[0]) / 1e3, (t[2] - t[0]) / 1e3, (t[3] - t[0]) / 1e3, (t[4] - t[0]) / 1e3,
+                   (t[1] - t[0]) / 1e3, (t[10] - t[0]) / 1e3, (t[11] - t[0]) / 1e3, (t[2] - t[0]) / 1e3, (t[3] - t[0]) / 1e3, (t[4] - t[0]) / 1e3,
                    (t[5] - t[0]) / 1e3, (t[6] - t[0]) / 1e3, (t[7] - t[0]) / 1e3, (t[8] - t[0]) / 1e3, (t[9] - t[0]) / 1e3);
         }
 #endif

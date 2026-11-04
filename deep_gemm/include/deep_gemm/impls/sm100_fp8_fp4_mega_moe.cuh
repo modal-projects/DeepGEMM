@@ -350,7 +350,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
-    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64 and not kIsIB;  // Gin state needs dispatch registers
+    #ifndef DG_MEGA_MOE_IB_KEEP_REGS
+#define DG_MEGA_MOE_IB_KEEP_REGS 0
+#endif
+    // Gin state needs dispatch registers; DG_MEGA_MOE_IB_KEEP_REGS=1 keeps the upstream split (perf experiment)
+    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64 and (not kIsIB or DG_MEGA_MOE_IB_KEEP_REGS);
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;

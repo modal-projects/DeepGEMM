@@ -147,7 +147,8 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = get_num_sms_for_mega_moe();
 
     // Compile
-    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::string(is_ib ? "#define DG_MEGA_MOE_IB 1\n" : "") + std::format(R"(
+    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::string(is_ib ? "#define DG_MEGA_MOE_IB 1\n" : "") +
+        std::string(std::getenv("DG_MEGA_MOE_IB_KEEP_REGS") != nullptr ? "#define DG_MEGA_MOE_IB_KEEP_REGS 1\n" : "") + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;

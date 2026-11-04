@@ -318,7 +318,8 @@ struct MegaMoEScheduler {
             for (uint32_t r = 0; r < kNumRanks; ++ r) {
                 if (not ib_is_remote(r))
                     continue;
-                while (ptx::ld_acq_sys(workspace.get_ib_arrival_ptr(r)) != ib_epoch);
+                // every SM of the source strong-signals once per launch after its index (and SM 0 count) puts
+                while (ptx::ld_acq_sys(workspace.get_ib_arrival_ptr(r)) != ib_epoch * kNumSMs);
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
                     const auto expert_idx = i * 32 + ptx::get_lane_idx();

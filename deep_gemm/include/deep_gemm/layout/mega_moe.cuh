@@ -96,6 +96,7 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_epoch;
     alignas(128) uint64_t ib_arrival[kNumMaxRanks];
     alignas(128) uint64_t ib_barrier_flag[2][kNumMaxRanks];
+    alignas(128) uint64_t ib_combine_ready[kNumMaxRanks];  // +1 per expert-side SM per launch
     alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
@@ -219,6 +220,11 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_ib_barrier_flag_ptr(const uint32_t& tag_idx, const uint32_t& src_rank_idx = 0) const {
         return signals->ib_barrier_flag[tag_idx % 2] + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_combine_ready_ptr(const uint32_t& src_rank_idx = 0) const {
+        return signals->ib_combine_ready + src_rank_idx;
     }
 
     CUTLASS_DEVICE

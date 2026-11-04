@@ -117,9 +117,8 @@ CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
             if (sym_buffer.is_lsa(thread_idx)) {
                 ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
             } else {
-                gin.flush();  // earlier puts from this thread land first
-                gin.put_value(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), epoch, thread_idx);
-                gin.flush();
+                // One strong signal per launch per tag: the counter equals `epoch` once this rank arrived
+                gin.signal_inc(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), thread_idx);
             }
         }
         sync_scope();

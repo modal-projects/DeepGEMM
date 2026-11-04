@@ -415,7 +415,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        make_gin().flush();  // index puts land before counts are announced
+        // Strong signal per SM after its index puts (SM 0 signals after its count puts below)
+        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        if (sm_idx != 0 and thread_idx < kNumRanks and is_remote(thread_idx))
+            make_gin().signal_inc(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), thread_idx);
 #endif
 
         // Grid sync
@@ -460,14 +463,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     expert_status);
             }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            // Announce arrival to remote ranks only after every count put has landed
-            make_gin().flush();
+            // SM 0's strong signal settles its index and count puts (same context) at each remote rank
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            if (thread_idx < kNumRanks and is_remote(thread_idx)) {
-                const auto gin = make_gin();
-                gin.put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), ib_epoch, thread_idx);
-                gin.flush();
-            }
+            if (thread_idx < kNumRanks and is_remote(thread_idx))
+                make_gin().signal_inc(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), thread_idx);
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -1553,7 +1552,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        make_gin().flush();  // remote combine rows land before the ready flags below
+        // Each SM strong-signals every remote rank once its combine puts are posted: the source waits for
+        // kNumSMs signals per launch, which settles all of this rank's combine rows (every context)
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+        if (epilogue_thread_idx < kNumRanks and is_remote(epilogue_thread_idx))
+            make_gin().signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), epilogue_thread_idx);
 #endif
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
@@ -1565,9 +1568,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             if (is_remote(epilogue_thread_idx)) {
-                const auto gin = make_gin();
-                gin.put_value(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), peer_grid_idx, epilogue_thread_idx);
-                gin.flush();
+                // readiness for remote ranks is the per-SM strong signal before the grid sync
             } else
 #endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
@@ -1592,7 +1593,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            const uint32_t ib_peer_rank = is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0;
+            const bool ib_peer_remote = is_routed and is_remote(ib_peer_rank);
+            const auto ib_peer_ready_ptr = workspace.get_ib_combine_ready_ptr(ib_peer_rank);
+            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
+                (ib_peer_remote ? ptx::ld_acq_sys(ib_peer_ready_ptr) == ib_epoch * kNumSMs : ptx::ld_acq_sys(peer_ready_ptr) == grid_idx)); },
+#else
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+#endif
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;

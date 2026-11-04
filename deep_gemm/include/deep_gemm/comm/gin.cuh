@@ -54,8 +54,15 @@ struct GinIB {
                 ncclCoopThread(), ncclGin_None(), ncclGinOptFlagsDefault, ncclGin_SegmentDevice());
     }
 
-    // Wait until every operation this thread posted on its context has completed (puts placed remotely,
-    // gets landed locally)
+    // Strong signal: +1 on the 64-bit counter at `sym_ptr` (local layout) on `dst_rank_idx`. Its visibility
+    // implies every preceding put on this context to that peer has settled. Only NIC signals may touch the
+    // counter (never GPU atomics).
+    __device__ __forceinline__ void signal_inc(const uint64_t* sym_ptr, const uint32_t& dst_rank_idx) const {
+        gin.signal(world, static_cast<int>(dst_rank_idx), ncclGin_StrongVASignalInc{window, static_cast<size_t>(offset(sym_ptr))});
+    }
+
+    // Wait until this context's outstanding gets have landed locally and put sources are reusable.
+    // NOTES: flush does NOT mean puts have settled remotely; use `signal_inc` for that.
     __device__ __forceinline__ void flush() const {
         gin.flush(ncclCoopThread());
     }

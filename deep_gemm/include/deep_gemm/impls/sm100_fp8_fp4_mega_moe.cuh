@@ -1361,9 +1361,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto stg = ib_mirror(ib_parity, ib_my_node);
             const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);
             const auto in_w = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffW);
-            for (uint32_t i = epilogue_thread_idx; i < kIBT * kNumTopk; i += kNumEpilogueThreads) {
-                reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = i < num_tokens * kNumTopk ? in_idx[i] : kIBIdxSentinel;
-                reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = i < num_tokens * kNumTopk ? in_w[i] : 0xffffffffu;
+            constexpr uint32_t kSB = 4;  // independent loads first, then the stores
+            for (uint32_t i0 = 0; i0 < kIBT * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
+                uint64_t vi[kSB];
+                uint32_t vw[kSB];
+                #pragma unroll
+                for (uint32_t u = 0; u < kSB; ++ u) {
+                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                    vi[u] = i < num_tokens * kNumTopk ? __ldcg(reinterpret_cast<const unsigned long long*>(in_idx) + i) : kIBIdxSentinel;
+                    vw[u] = i < num_tokens * kNumTopk ? __ldcg(in_w + i) : 0xffffffffu;
+                }
+                #pragma unroll
+                for (uint32_t u = 0; u < kSB; ++ u) {
+                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                    if (i < kIBT * kNumTopk) {
+                        reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = vi[u];
+                        reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = vw[u];
+                    }
+                }
             }
             if (epilogue_thread_idx == 0)
                 *reinterpret_cast<uint64_t*>(stg + kIBOffHdr) = (ib_epoch << 32) | num_tokens;

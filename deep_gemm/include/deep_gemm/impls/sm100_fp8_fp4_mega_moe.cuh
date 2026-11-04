@@ -1005,6 +1005,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // v8: the dispatch warps are idle from here until the cleanup; SM g (g < groups) waits for expert group g's
+        // staged row-tiles to reach the group total, then its warps send the group's rows to the remote sources
+        // (warp w: sources w, w + warps, ...; one put + one strong signal each), off the epilogue's critical path
+        if (sm_idx < kIBNumCombineGroups) {
+            const uint32_t g = sm_idx;
+            const uint32_t total = ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g));
+            if (total > 0) {
+                if (thread_idx == 0)
+                    while (ptx::ld_acq(workspace.get_ib_group_done_ptr(ib_parity, g)) < total)
+                        __nanosleep(256);
+                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                const uint32_t gb = ib_group_begin(g), ge = ib_group_begin(g + 1);
+                if (lane_idx == 0) {
+                    const auto gin = make_gin();
+                    for (uint32_t s = warp_idx; s < kNumRanks; s += kNumDispatchWarps) {
+                        if (not is_remote(s))
+                            continue;
+                        const uint32_t r0 = *workspace.get_ib_src_prefix_ptr(s, gb), r1 = *workspace.get_ib_src_prefix_ptr(s, ge);
+                        if (r1 > r0) {
+                            gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes + static_cast<int64_t>(r0) * kIBRowBytes,
+                                    ib_combine_staging + s * ib_combine_bytes + static_cast<int64_t>(r0) * kIBRowBytes,
+                                    static_cast<uint64_t>(r1 - r0) * kIBRowBytes, s);
+                            gin.signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), s);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
+                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(r1 - r0) * kIBRowBytes);
+#endif
+                        }
+                    }
+                }
+                __syncwarp();
+            }
+        }
+#endif
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1789,48 +1824,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ib_staged_rows = 0;
                     if (n_staged > 0 and not task_info.is_shared()) {
                         const uint32_t g = ib_group_of(task_info.local_expert_idx);
-                        uint32_t old = 0;
+                        // v8: release this warp's staged rows into the group counter; the idle dispatch warps of
+                        // SM `group` poll it and send the group's rows once it reaches the total
                         if (lane_idx == 0)
-                            old = ib_atom_add_acq_rel(workspace.get_ib_group_done_ptr(ib_parity, g), n_staged);
-                        old = __shfl_sync(0xffffffff, old, 0);
-                        if (lane_idx == 0 and old + n_staged == ptx::ld_acq(workspace.get_ib_group_total_ptr(ib_parity, g)))
-                            shared_storage.ib_post_group = g | (((shared_storage.ib_post_group >> 8) + 1u) << 8);
+                            ib_atom_add_acq_rel(workspace.get_ib_group_done_ptr(ib_parity, g), n_staged);
                     }
                 }
 #endif
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                {
-                    const uint32_t v = shared_storage.ib_post_group;
-                    if (v != ib_post_seen) {
-                        ib_post_seen = v;
-                        const uint32_t g = v & 0xffu;
-                        const uint32_t gb = ib_group_begin(g), ge = ib_group_begin(g + 1);
-                        if (lane_idx == 0) {
-                            const auto gin = make_gin();
-                            for (uint32_t s = epilogue_warp_idx; s < kNumRanks; s += kNumEpilogueWarps) {
-                                if (not is_remote(s))
-                                    continue;
-                                const uint32_t r0 = *workspace.get_ib_src_prefix_ptr(s, gb), r1 = *workspace.get_ib_src_prefix_ptr(s, ge);
-                                if (r1 > r0) {
-                                    gin.put(ib_combine_landing + sym_buffer.rank_idx * kIBCombineLandingBytes + static_cast<int64_t>(r0) * kIBRowBytes,
-                                            ib_combine_staging + s * ib_combine_bytes + static_cast<int64_t>(r0) * kIBRowBytes,
-                                            static_cast<uint64_t>(r1 - r0) * kIBRowBytes, s);
-                                    gin.signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), s);
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 12), 1ull);
-                                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 13), static_cast<unsigned long long>(r1 - r0) * kIBRowBytes);
-#endif
-                                }
-                            }
-                        }
-                        __syncwarp();
-                    }
-                    // every warp has read the published group before the next task's finisher can overwrite it
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                }
-#endif
             }
         }
 

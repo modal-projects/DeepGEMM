@@ -480,8 +480,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     kk = __shfl_sync(0xffffffff, kk, 0);
                     if (pair_remote and r == p)
                         my_kk = kk;
-                    // peer p's pack block = our combine staging slot for p (free until the L2 epilogue; the puts are
-                    // flushed before the pre-pull barrier), laid out like p's landing copy of our region
+                    // peer p's pack block (dedicated region since v5a), laid out like p's landing copy of our region
                     const auto stage_p = ib_pack + p * ib_landing_stride;
                     const auto src_x = ib_input_base + t * ib_token_bytes;
                     const auto dst_x = stage_p + static_cast<int64_t>(kk) * ib_token_bytes;
@@ -511,8 +510,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 gin.put_signal_weak(dst + ib_off_sf + r0 * ib_sf_bytes, stage_p + ib_off_sf + r0 * ib_sf_bytes,
                                                     static_cast<uint64_t>(kIBChunkRows) * ib_sf_bytes, p,
                                                     workspace.get_ib_chunk_ready_ptr(sym_buffer.rank_idx, c));
-                            // v10b: no flush here (it stalls the gather ~tens of us per chunk); SM 0 flushes every
-                            // context once after the dispatch grid sync, before the pre-pull barrier
+                            // v10b/c: no flush (it stalls the gather ~tens of us per chunk); sources are a dedicated
+                            // pack region rewritten only by the next launch (see the note after the grid sync)
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                             atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), ib_sf_bytes > 0 ? 2ull : 1ull);
                             atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(kIBChunkRows) * (ib_token_bytes + ib_sf_bytes));
@@ -646,13 +645,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
-        // v10b: the chunk puts issued during the gather read their sources (the pack blocks, reused as combine
-        // staging by the L2 epilogue) asynchronously; one flush per Gin context here makes every source reusable
-        if (sm_idx == 0 and lane_idx == 0 and warp_idx < DG_MEGA_MOE_IB_CONTEXTS) {
-            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, warp_idx);
-            gin.flush();
-        }
-        __syncwarp();
+        // v10c: no flush at all. The pack blocks are a dedicated region (v5a), rewritten only by the NEXT launch's
+        // gather, and the next launch cannot start before every put of this one has landed at its receiver (the
+        // receivers' combine rows, which this launch waits for, are posted after their L2, which needed our rows).
+        // (v10b's per-context flush here cost ~60-70 us: it waits for every in-flight put on the context.)
 #endif
 
         // Write expert count

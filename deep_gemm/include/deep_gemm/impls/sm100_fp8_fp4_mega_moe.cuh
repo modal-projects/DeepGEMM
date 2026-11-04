@@ -1560,6 +1560,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             if (epilogue_thread_idx < kNumRanks and is_remote(epilogue_thread_idx))
                 make_gin().signal_inc(workspace.get_ib_combine_ready_ptr(sym_buffer.rank_idx), epilogue_thread_idx);
+
+            // Every SM must finish reading the per-expert counts above before any SM's dispatch warps clear them
+            // (that cleanup only waits for its own SM's epilogue, at the dispatch/epilogue barrier below)
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
         }
 #endif
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
@@ -1601,6 +1608,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
 #endif
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            asm volatile("fence.proxy.async.global;" ::: "memory");  // NIC-written rows are read by TMA below
+#endif
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 

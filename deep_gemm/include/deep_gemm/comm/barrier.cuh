@@ -57,7 +57,8 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
                                    const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
+                                   const bool& sync_epilogue = true,
+                                   const bool& do_remote = true) {  // false: NVLink part only (remote readiness proven elsewhere)
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
 
     // Grid sync before NVLink signaling
@@ -103,7 +104,8 @@ CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
                                    const sync_scope_t& sync_scope,
                                    const make_gin_t& make_gin, const uint64_t& epoch,
                                    const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
+                                   const bool& sync_epilogue = true,
+                                   const bool& do_remote = true) {  // false: NVLink part only (remote readiness proven elsewhere)
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (sync_prologue)
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
@@ -120,7 +122,7 @@ CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
         // arrived. v2f: posted from one lane in a loop (contending lanes serialize on GDAKI queues)
         // v2h: one lane per remote rank (distinct QPs, no contention); Gin is built lazily so LSA-only runs
         // never construct it
-        if (thread_idx < kNumRanks and not sym_buffer.is_lsa(thread_idx))
+        if (do_remote and thread_idx < kNumRanks and not sym_buffer.is_lsa(thread_idx))
             make_gin().signal_inc(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), thread_idx);
         sync_scope();
 
@@ -132,7 +134,7 @@ CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
                        sym_buffer.rank_idx, ptx::ld_acq_sys(signal_ptr), target, kTag);
             });
         }
-        if (thread_idx < kNumRanks and not sym_buffer.is_lsa(thread_idx)) {
+        if (do_remote and thread_idx < kNumRanks and not sym_buffer.is_lsa(thread_idx)) {
             const auto flag_ptr = workspace.get_ib_barrier_flag_ptr(kTag, thread_idx);
             wait_until([&]() { return ptx::ld_acq_sys(flag_ptr) == epoch; }, [&]() {
                 printf("DeepGEMM hybrid barrier (IB part) timeout: rank=%d, peer=%u, flag=%lu, epoch=%lu, tag=%d\n",

@@ -173,6 +173,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kIBCombineLandingBytes = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * kIBRowBytes;
     DG_STATIC_ASSERT(kNumMaxTokensPerRank * kNumTopk <= 65536, "IB packs pair indices in 16 bits");
     const auto ib_combine_landing = ib_landing + kNumRanks * ib_landing_stride;
+    // v5a: per-peer pack blocks (gathered rows + map) with the landing layout; own region, so no reuse hazard
+    const auto ib_pack = ib_combine_landing + kNumRanks * kIBCombineLandingBytes;
 #else
     constexpr bool kIsIB = false;
     constexpr int64_t ib_token_bytes = 0, ib_off_sf = 0, ib_sf_bytes = 0;  // unused without IB
@@ -446,7 +448,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     kk = __shfl_sync(0xffffffff, kk, 0);
                     // peer p's pack block = our combine staging slot for p (free until the L2 epilogue; the puts are
                     // flushed before the pre-pull barrier), laid out like p's landing copy of our region
-                    const auto stage_p = ib_combine_staging + p * ib_combine_bytes;
+                    const auto stage_p = ib_pack + p * ib_landing_stride;
                     const auto src_x = ib_input_base + t * ib_token_bytes;
                     const auto dst_x = stage_p + static_cast<int64_t>(kk) * ib_token_bytes;
                     for (int64_t o = lane_idx * 16; o < ib_token_bytes; o += 32 * 16)
@@ -511,7 +513,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1) ^ 1u, thread_idx) = 0;
         if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
             const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
-            const auto stage_p = ib_combine_staging + peer * ib_combine_bytes;
+            const auto stage_p = ib_pack + peer * ib_landing_stride;
             const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
             const int64_t cnt = *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1), peer);
             const uint8_t* src = nullptr; const uint8_t* dst_sym = nullptr; int64_t size = 0;
@@ -523,6 +525,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 default: src = stage_p + ib_off_map; dst_sym = dst + ib_off_map; size = num_tokens * 2; break;
             }
             const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
+            // v5a: the token count rides on the map piece's context, before its strong signal (no IB barrier needed)
+            if (piece == kIBNumLandingPieces - 1)
+                gin.put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), peer);
             if (size > 0 and not (DG_MEGA_MOE_IB_DIAG & 1))
                 gin.put(dst_sym, src, static_cast<uint64_t>(size), peer);
             gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
@@ -568,8 +573,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // (also SM 0, context 0) settles both at each remote rank
             // v2h: one lane per peer (each peer is its own QP, so lanes do not contend; v2f's one-lane loop
             // serialized ~5 us per op)
-            if (thread_idx < kNumRanks and is_remote(thread_idx))
-                make_gin().put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), thread_idx);
+            // v5a: the count put moved into the map landing piece
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -577,16 +581,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE(11, sm_idx == 0 and thread_idx == 0);  // counts written, about to enter the pre-pull barrier
         // Barrier before pulling
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v4: our landing puts read the combine staging, which the L2 epilogue overwrites: settle them locally
-        // (flush per context) before arriving at the barrier, so no rank passes it while a put still reads
-        if (sm_idx == 0 and thread_idx < DG_MEGA_MOE_IB_CONTEXTS)
-            comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, thread_idx).flush();
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        // v5a: NVLink part only; remote readiness (counts + landing data) is proven by the landing signals
         comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            make_gin, ib_epoch, false, true);
+            make_gin, ib_epoch, false, true, false);
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
         // v3e: SM r (one per remote source) builds the counts/index table for source r: warp 0 scans r's landing
         // top-k (a), warp 1 (or warp 0 after it) scans our own top-k for pairs routed to r (b); each SM then adds 1

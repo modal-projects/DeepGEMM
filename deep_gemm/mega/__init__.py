@@ -56,7 +56,8 @@ class SymmBuffer:
             landing_bytes = num_max_tokens_per_rank * (hidden * 2 + hidden // 16 + num_topk * 16 + 64) + 4096
             # v2d combine landing: per expert rank, a contiguous chunk of up to max_tokens x top-k BF16 rows
             combine_landing_bytes = num_max_tokens_per_rank * num_topk * hidden * 2
-            num_bytes = ((num_bytes + 127) // 128) * 128 + group.size() * (combine_bytes + landing_bytes + combine_landing_bytes)
+            # v5a pack region: per peer, gathered rows + map with the landing layout
+            num_bytes = ((num_bytes + 127) // 128) * 128 + group.size() * (combine_bytes + landing_bytes + combine_landing_bytes + landing_bytes)
             self.buffer, self.handle = _ib.allocate(group, num_bytes)
             self.group.barrier()
             torch.cuda.synchronize()

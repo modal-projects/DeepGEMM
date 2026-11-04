@@ -1422,6 +1422,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // 400G; with 3+ counterparts it convoys the posters (EP32 measured ~7 ms), so never there
 #if defined(DG_MEGA_MOE_IB_NO_META_FIRST) and DG_MEGA_MOE_IB_NO_META_FIRST
                     constexpr bool kMetaFirst = false;
+#elif defined(DG_MEGA_MOE_IB_META_FIRST_ALL) and DG_MEGA_MOE_IB_META_FIRST_ALL
+                    constexpr bool kMetaFirst = true;
 #else
                     const bool kMetaFirst = ib_num_nodes == 2;
 #endif

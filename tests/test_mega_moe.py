@@ -365,6 +365,44 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         run_baseline, _n_warmup=5, _n_repeat=1,
         backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
 
+    # Component timings of the legacy arm on the same inputs: DeepEP dispatch alone, GEMMs + SwiGLU alone,
+    # DeepEP combine alone (each a CUDA-graph median); isolates what a bulk-posting unfused pipeline would need
+    if is_legacy_loaded and os.environ.get('LEGACY_COMPONENTS', '0') == '1':
+        _bench = lambda fn: tilelang_bench(fn, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3
+        _d = {}
+
+        def run_dispatch_only():
+            cumulative_local_expert_recv_stats_baseline.copy_(initial_cumulative_local_expert_recv_stats_baseline)
+            _d['r'] = ep_buffer.dispatch(
+                x, topk_idx=topk_idx, topk_weights=topk_weights,
+                cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_baseline,
+                num_experts=num_experts, expert_alignment=alignment, **dispatch_kwargs)
+        t_dispatch = _bench(run_dispatch_only)
+        recv_x_c, _, recv_topk_weights_c, handle_c, _ = _d['r']
+        num_recv_tokens_c = get_num_tokens(recv_x_c)
+
+        def run_gemms_only():
+            l1_y = torch.empty((num_recv_tokens_c, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
+            gemm_fn(recv_x_c, l1_weights, l1_y, handle_c.psum_num_recv_tokens_per_expert, **gemm_kwargs)
+            swiglu_result = tilelang_ops.swiglu_apply_weight_to_fp8(
+                x=l1_y, topk_weights=recv_topk_weights_c,
+                avail_tokens=handle_c.psum_num_recv_tokens_per_expert[-1],
+                num_per_channels=32, use_col_major_scales=True,
+                clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                **swiglu_kwargs)
+            l1_y = swiglu_result[-1] if is_bf16xbf16 else swiglu_result
+            l2_y = torch.empty((num_recv_tokens_c, hidden), dtype=torch.bfloat16, device='cuda')
+            gemm_fn(l1_y, l2_weights, l2_y, handle_c.psum_num_recv_tokens_per_expert, **gemm_kwargs)
+            return l2_y
+        t_gemms = _bench(run_gemms_only)
+        l2_y_c = run_gemms_only()
+
+        def run_combine_only():
+            return ep_buffer.combine(l2_y_c, handle=handle_c, bias=get_baseline_shared_bias())[0]
+        t_combine = _bench(run_combine_only)
+        dist_print(f'LEGACY_COMPONENTS us: dispatch={t_dispatch * 1e6:.0f} gemms_swiglu={t_gemms * 1e6:.0f} '
+                   f'combine={t_combine * 1e6:.0f} arm_total={t_baseline * 1e6:.0f} fused={t_fused * 1e6:.0f}', once_in_node=True)
+
     # TFLOPS: routed + shared L1/L2, each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
     num_routed_flops = 2 * num_recv_tokens * hidden * intermediate_hidden * 3

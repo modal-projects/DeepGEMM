@@ -1456,13 +1456,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t proxy = ib_cp(r, ib_my_node);
                 const auto mir = sym_buffer.map(ib_mirror(ib_parity, r / ib_lsa), proxy);
                 const auto hdr = reinterpret_cast<const uint64_t*>(mir + kIBOffHdr);
-                uint64_t h = 0;
-                comm::wait_until([&]() { h = ptx::ld_volatile(hdr); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
-                    if (epilogue_thread_idx == 0)
+                // One thread polls the (NVLink-remote) header with a pause between polls: hundreds of threads spinning
+                // on a proxy's HBM while its NIC writes there slows the NIC down drastically on GB200
+                auto nt_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d) + kNumExpertsPerRank;
+                if (epilogue_thread_idx == 0) {
+                    uint64_t h = 0;
+                    comm::wait_until([&]() { h = ptx::ld_volatile(hdr); if ((h >> 32) != (ib_epoch & 0xffffffffull)) __nanosleep(200); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
                         printf("DeepGEMM IB header timeout: rank=%u, source=%u, proxy=%u, header=%llx, epoch=%llu\n",
                                sym_buffer.rank_idx, r, proxy, (unsigned long long) h, (unsigned long long) ib_epoch);
-                });
-                const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
+                    });
+                    *nt_smem = static_cast<uint32_t>(h & 0xffffffffull);
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                const uint32_t nt = *nt_smem;
                 IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
                 const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
                 const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);

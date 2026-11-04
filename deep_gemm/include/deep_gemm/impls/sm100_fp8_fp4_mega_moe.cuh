@@ -573,7 +573,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
                 // v2h: per-expert slot counters live in lane registers (lane l counts local expert l) instead of
                 // a global atomic per pair (~1 us each, serialized): ballots + shuffles only
-                DG_STATIC_ASSERT(kNumExpertsPerRank <= 32, "IB scan keeps one expert counter per lane");
+                // (shapes with > 32 experts per rank, e.g. MegaSeek, fall back to a global atomic per pair)
+                constexpr bool kIBRegisterCounters = kNumExpertsPerRank <= 32;
                 uint32_t num_pairs = 0, cnt = 0;
                 const uint32_t lt_mask = (1u << lane_idx) - 1;
                 // v3b: the landing top-k lives in memory the NIC just wrote (uncached): batch the loads so one
@@ -598,16 +599,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t le = mine ? static_cast<uint32_t>(e) % kNumExpertsPerRank : 0xffffffffu;
                     const uint32_t idx = num_pairs + __popc(ballot & lt_mask);
                     uint32_t slot = 0;
-                    if (ballot != 0) {
-                        #pragma unroll 1
-                        for (uint32_t l = 0; l < kNumExpertsPerRank; ++l) {
-                            const uint32_t m = __ballot_sync(0xffffffff, le == l);
-                            const uint32_t base_l = __shfl_sync(0xffffffff, cnt, l);
-                            if (le == l)
-                                slot = base_l + __popc(m & lt_mask);
-                            if (lane_idx == l)
-                                cnt += __popc(m);
+                    if constexpr (kIBRegisterCounters) {
+                        if (ballot != 0) {
+                            #pragma unroll 1
+                            for (uint32_t l = 0; l < kNumExpertsPerRank; ++l) {
+                                const uint32_t m = __ballot_sync(0xffffffff, le == l);
+                                const uint32_t base_l = __shfl_sync(0xffffffff, cnt, l);
+                                if (le == l)
+                                    slot = base_l + __popc(m & lt_mask);
+                                if (lane_idx == l)
+                                    cnt += __popc(m);
+                            }
                         }
+                    } else if (mine) {
+                        slot = static_cast<uint32_t>(atomicAdd(
+                            reinterpret_cast<unsigned long long*>(workspace.get_expert_recv_count_ptr(r, le)), 1ull));
                     }
                     if (mine)
                         *workspace.get_src_token_topk_idx_ptr(le, r, slot) = j | (idx << 16);
@@ -615,7 +621,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                   }
                 }
                 // only this warp touches the (remote r, local expert) counters: plain stores replace the atomics
-                if (lane_idx < kNumExpertsPerRank)
+                if (kIBRegisterCounters and lane_idx < kNumExpertsPerRank)
                     *workspace.get_expert_recv_count_ptr(r, lane_idx) = cnt;
                 if (lane_idx == 0)
                     *workspace.get_ib_pairs_from_ptr(r) = num_pairs;

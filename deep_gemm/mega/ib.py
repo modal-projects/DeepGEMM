@@ -43,7 +43,7 @@ std::vector<int64_t> nccl_unique_id() {
 
 // Returns (state handle, buffer ptr, per-rank LSA ptrs (0 for other nodes), dev_comm device ptr, window, lsa nranks)
 std::tuple<int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t, int64_t>
-create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num_bytes, int64_t num_contexts) {
+create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num_bytes, int64_t num_contexts, int64_t gin_type) {
     auto* st = new IBState();
     ncclUniqueId id;
     for (size_t i = 0; i < sizeof(id); ++ i) id.internal[i] = static_cast<char>(uid[i]);
@@ -57,12 +57,13 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     CHECK_NCCL(ncclCommQueryProperties(st->comm, &props));
     ncclTeam_t lsa = ncclTeamLsa(st->comm);
     const bool need_gin = lsa.nRanks < world;  // all ranks in one NVLink domain: load/store only
-    TORCH_CHECK(not need_gin or props.ginSupport[NCCL_GIN_TYPE_GDAKI],
-                "NCCL Gin GDAKI is unavailable on this communicator (ginType=", props.ginType, ")");
+    TORCH_CHECK(not need_gin or props.ginType != NCCL_GIN_TYPE_NONE,
+                "NCCL Gin is unavailable on this communicator (ginType=", props.ginType, ")");
     if (need_gin) {
 
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    reqs.ginType = NCCL_GIN_TYPE_GDAKI;
+    // 0 = any backend NCCL can set up (GDAKI needs host driver PeerMappingOverride; PROXY=2 works without)
+    reqs.ginType = static_cast<ncclGinType_t>(gin_type);
     reqs.ginContextCount = static_cast<int>(num_contexts);
     reqs.ginExclusiveContexts = false;
     reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -147,7 +148,8 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
     rank, world = group.rank(), group.size()
     uid = [ext.nccl_unique_id()] if rank == 0 else [None]
     dist.broadcast_object_list(uid, src=dist.get_global_rank(group, 0), group=group)
-    state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS)
+    gin_type = int(os.environ.get('DG_MEGA_MOE_IB_GIN_TYPE', '0'))  # 0 any, 2 proxy, 3 GDAKI, 5 EFA GDA
+    state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS, gin_type)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
     buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa] if num_lsa < world else [])
     handle = types.SimpleNamespace(buffer_ptrs=buffer_ptrs, ib_state=state, num_lsa_ranks=num_lsa)

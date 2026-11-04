@@ -625,7 +625,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // Remote-node sources: read the landing copy pushed at kernel start (v2a); same-node: NVLink peer
             const auto src_ptr = [&](auto local_ptr) {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB

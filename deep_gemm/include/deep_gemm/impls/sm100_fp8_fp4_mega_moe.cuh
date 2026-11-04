@@ -156,6 +156,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_landing_bytes = math::align<int64_t>(
         reinterpret_cast<uint8_t*>(buffer.input_topk_weights_buffer.get_end_ptr()) - ib_input_base, 128);
     const auto ib_landing = ib_combine_staging + kNumRanks * ib_combine_bytes;
+    constexpr uint32_t kIBNumLandingPieces = 4;  // tokens, SF, top-k idx, top-k weights
     // v2d: per expert rank, a contiguous chunk of our combine rows, ordered by (token, top-k)
     constexpr uint32_t kIBRowBytes = kHidden * sizeof(nv_bfloat16);
     constexpr int64_t kIBCombineLandingBytes = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * kIBRowBytes;
@@ -411,16 +412,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // queues), each followed by a strong signal on its context; the receiver waits for all of them
         // v2f: one (peer, context) chunk per SM, posted by that SM's thread 0 (lanes of one warp contending on
         // GDAKI queues serialize; DeepEP posts one lane per warp too)
-        DG_STATIC_ASSERT(kNumRanks * DG_MEGA_MOE_IB_CONTEXTS <= kNumSMs, "Insufficient SMs for IB landing puts");
-        if (thread_idx == 0 and sm_idx < kNumRanks * DG_MEGA_MOE_IB_CONTEXTS and is_remote(sm_idx % kNumRanks)) {
-            const uint32_t peer = sm_idx % kNumRanks, ctx = sm_idx / kNumRanks;
-            const int64_t chunk = math::align<int64_t>(math::ceil_div<int64_t>(ib_landing_bytes, DG_MEGA_MOE_IB_CONTEXTS), 128);
-            const int64_t begin = ctx * chunk, size = cute::min(chunk, ib_landing_bytes - begin);
-            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx);
+        // v2g: the input region is sized for kNumMaxTokensPerRank (1920 at Flash shapes) but only `num_tokens`
+        // rows are live; pushing the whole region sent 15x the bytes. Each peer now gets 4 pieces (tokens, SF,
+        // top-k idx, top-k weights), each only its first `num_tokens` rows, piece i on context i % contexts,
+        // each followed by a strong signal; the receiver waits for kIBNumLandingPieces signals per source.
+        DG_STATIC_ASSERT(kNumRanks * kIBNumLandingPieces <= kNumSMs, "Insufficient SMs for IB landing puts");
+        if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
+            const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
+            const uint8_t* piece_base = nullptr;
+            int64_t size = 0;
+            switch (piece) {
+                case 0: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_token_buffer.get_base_ptr());
+                        size = buffer.input_token_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+                case 1: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_sf_buffer.get_base_ptr());
+                        size = buffer.input_sf_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+                case 2: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr());
+                        size = buffer.input_topk_idx_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+                default: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_topk_weights_buffer.get_base_ptr());
+                        size = buffer.input_topk_weights_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
+            }
+            const int64_t begin = piece_base - ib_input_base;
+            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
 #ifndef DG_MEGA_MOE_IB_DIAG
 #define DG_MEGA_MOE_IB_DIAG 0
 #endif
-            // DIAG bit 0: skip the landing payload (timing only; results wrong); bit 1: cap it at 4 KB per chunk
+            // DIAG bit 0: skip the landing payload (timing only; results wrong); bit 1: cap it at 4 KB per piece
             // bit 3: only the first half of the ranks (node 0) sends its payload (unidirectional in-kernel push)
             const bool skip = (DG_MEGA_MOE_IB_DIAG & 1) or ((DG_MEGA_MOE_IB_DIAG & 8) and sym_buffer.rank_idx >= kNumRanks / 2);
             const int64_t sent = skip ? 0 : ((DG_MEGA_MOE_IB_DIAG & 2) ? cute::min<int64_t>(size, 4096) : size);
@@ -539,7 +555,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (not is_remote(r))
                     continue;
                 // the landing chunks from all of r's contexts have settled
-                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * DG_MEGA_MOE_IB_CONTEXTS);
+                while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * kIBNumLandingPieces);
                 const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
                 const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
                 uint32_t num_pairs = 0;

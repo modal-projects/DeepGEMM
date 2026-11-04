@@ -1368,7 +1368,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
         IB_TRACE(23, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
-        if (sm_idx == kNumSMs - 1) {
+        if (sm_idx == kNumSMs - 1 and num_tokens == kIBT) {
+            // Full batch: every top-k / weight row is polled by the proxy, so the input slices go out as they are
+            // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
+            if (epilogue_warp_idx == 0 and lane_idx % 16 + 1 < ib_num_nodes) {
+                const uint32_t nr = lane_idx % 16, n = ib_node_of_slot(nr);
+                const auto gin = make_gin(nr + (lane_idx / 16) * 2);
+                const auto dst = ib_mirror(ib_parity, ib_my_node);
+                if (lane_idx < 16)
+                    gin.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(kIBT * kNumTopk * 12), ib_cp(sym_buffer.rank_idx, n));
+                else
+                    gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, ib_cp(sym_buffer.rank_idx, n));
+            }
+            __syncwarp();
+            IB_TRACE(24, epilogue_thread_idx == 0);
+            if (epilogue_thread_idx == 0)
+                ptx::st_rel_sys(&workspace.signals->ib_o_meta_posted, ib_epoch);
+        } else if (sm_idx == kNumSMs - 1) {
             const auto stg = ib_mirror(ib_parity, ib_my_node);
             const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);
             const auto in_w = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffW);

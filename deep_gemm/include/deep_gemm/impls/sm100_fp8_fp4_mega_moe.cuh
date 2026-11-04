@@ -156,14 +156,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_landing_bytes = math::align<int64_t>(
         reinterpret_cast<uint8_t*>(buffer.input_topk_weights_buffer.get_end_ptr()) - ib_input_base, 128);
     const auto ib_landing = ib_combine_staging + kNumRanks * ib_combine_bytes;
-    constexpr uint32_t kIBNumLandingPieces = 4;  // tokens, SF, top-k idx, top-k weights
+    // v4 packed landing layout per source (same offsets as the input region for SF/idx/weights, plus a token
+    // map): [x rows packed by k][SF rows packed by k][top-k idx, whole][top-k weights, whole][map: token -> k]
+    constexpr uint32_t kIBNumLandingPieces = 5;  // x packed, SF packed, top-k idx, top-k weights, map
+    const int64_t ib_token_bytes = buffer.input_token_buffer.data_layout.template get_num_bytes<int64_t>();
+    const int64_t ib_sf_bytes = buffer.input_sf_buffer.data_layout.template get_num_bytes<int64_t>();
+    const int64_t ib_off_sf = reinterpret_cast<const uint8_t*>(buffer.input_sf_buffer.get_base_ptr()) - ib_input_base;
+    const int64_t ib_off_idx = reinterpret_cast<const uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr()) - ib_input_base;
+    const int64_t ib_off_w = reinterpret_cast<const uint8_t*>(buffer.input_topk_weights_buffer.get_base_ptr()) - ib_input_base;
+    const int64_t ib_idx_bytes = buffer.input_topk_idx_buffer.data_layout.template get_num_bytes<int64_t>();
+    const int64_t ib_w_bytes = buffer.input_topk_weights_buffer.data_layout.template get_num_bytes<int64_t>();
+    const int64_t ib_off_map = ib_landing_bytes;  // right after the mirrored input region
+    const int64_t ib_landing_stride = math::align<int64_t>(ib_off_map + static_cast<int64_t>(kNumMaxTokensPerRank) * 2, 128);
     // v2d: per expert rank, a contiguous chunk of our combine rows, ordered by (token, top-k)
     constexpr uint32_t kIBRowBytes = kHidden * sizeof(nv_bfloat16);
     constexpr int64_t kIBCombineLandingBytes = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk * kIBRowBytes;
     DG_STATIC_ASSERT(kNumMaxTokensPerRank * kNumTopk <= 65536, "IB packs pair indices in 16 bits");
-    const auto ib_combine_landing = ib_landing + kNumRanks * ib_landing_bytes;
+    const auto ib_combine_landing = ib_landing + kNumRanks * ib_landing_stride;
 #else
     constexpr bool kIsIB = false;
+    constexpr int64_t ib_token_bytes = 0, ib_off_sf = 0, ib_sf_bytes = 0;  // unused without IB
 #endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
@@ -406,44 +418,49 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         };
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // v2g: the input region is sized for kNumMaxTokensPerRank (1920 at Flash shapes) but only `num_tokens`
-        // rows are live; pushing the whole region sent 15x the bytes. Each peer now gets 4 pieces (tokens, SF,
-        // top-k idx, top-k weights), each only its first `num_tokens` rows, piece i on context i % contexts,
-        // each followed by a strong signal; the receiver waits for kIBNumLandingPieces signals per source.
-        DG_STATIC_ASSERT(kNumRanks * kIBNumLandingPieces <= kNumSMs, "Insufficient SMs for IB landing puts");
-        if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
-            const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
-            const uint8_t* piece_base = nullptr;
-            int64_t size = 0;
-            switch (piece) {
-                case 0: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_token_buffer.get_base_ptr());
-                        size = buffer.input_token_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
-                case 1: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_sf_buffer.get_base_ptr());
-                        size = buffer.input_sf_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
-                case 2: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_topk_idx_buffer.get_base_ptr());
-                        size = buffer.input_topk_idx_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
-                default: piece_base = reinterpret_cast<const uint8_t*>(buffer.input_topk_weights_buffer.get_base_ptr());
-                        size = buffer.input_topk_weights_buffer.data_layout.template get_num_bytes<int64_t>() * num_tokens; break;
-            }
-            const int64_t begin = piece_base - ib_input_base;
-            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
+        // v4: packed push. Gather: every dispatch warp handles tokens t = sm * warps + warp + k * SMs * warps; for
+        // each remote rank p in the token's top-k it takes slot k = pack_count[p]++ and copies the token row and SF
+        // row into our own landing slot (ib_landing + rank * stride, unused locally) at packed index k, and records
+        // map[p][t] = k. After the dispatch grid sync, SM (p + kNumRanks * piece) puts piece `piece` to p with one
+        // strong signal each (5 pieces): packed x block, packed SF block, whole top-k idx, whole weights, map.
+        DG_STATIC_ASSERT(kNumRanks <= 32, "IB push keeps a peer bitmask in 32 bits");
+        DG_STATIC_ASSERT(kNumRanks * kIBNumLandingPieces <= kNumSMs, "Insufficient SMs for IB landing pieces");
+        DG_STATIC_ASSERT(kNumMaxTokensPerRank <= 65535, "IB landing map holds 16-bit packed indices");
 #ifndef DG_MEGA_MOE_IB_DIAG
 #define DG_MEGA_MOE_IB_DIAG 0
 #endif
-            // DIAG bit 0: skip the landing payload (timing only; results wrong); bit 1: cap it at 4 KB per piece
-            // bit 3: only the first half of the ranks (node 0) sends its payload (unidirectional in-kernel push)
-            const bool skip = (DG_MEGA_MOE_IB_DIAG & 1) or ((DG_MEGA_MOE_IB_DIAG & 8) and sym_buffer.rank_idx >= kNumRanks / 2);
-            const int64_t sent = skip ? 0 : ((DG_MEGA_MOE_IB_DIAG & 2) ? cute::min<int64_t>(size, 4096) : size);
-            if (sent > 0)
-                gin.put(ib_landing + sym_buffer.rank_idx * ib_landing_bytes + begin, ib_input_base + begin, sent, peer);
-            gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
-            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(sent));
-#endif
-            // DIAG bit 2: flush after posting (forces local completion processing on this context)
-            if (DG_MEGA_MOE_IB_DIAG & 4)
-                gin.flush();
+        {
+            const auto own_topk = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
+            const uint32_t parity = static_cast<uint32_t>(ib_epoch & 1);
+            for (uint32_t t = sm_idx * kNumDispatchWarps + warp_idx; t < num_tokens; t += kNumSMs * kNumDispatchWarps) {
+                const int e = lane_idx < kNumTopk ? static_cast<int>(own_topk[t * kNumTopk + lane_idx]) : -1;
+                const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0;
+                const uint32_t bit = (e >= 0 and is_remote(r)) ? (1u << r) : 0u;
+                uint32_t peers = __reduce_or_sync(0xffffffff, bit);
+                while (peers != 0) {
+                    const uint32_t p = __ffs(peers) - 1;
+                    peers &= peers - 1;
+                    uint32_t kk = 0;
+                    if (lane_idx == 0)
+                        kk = atomicAdd(workspace.get_ib_pack_count_ptr(parity, p), 1u);
+                    kk = __shfl_sync(0xffffffff, kk, 0);
+                    // peer p's pack block = our combine staging slot for p (free until the L2 epilogue; the puts are
+                    // flushed before the pre-pull barrier), laid out like p's landing copy of our region
+                    const auto stage_p = ib_combine_staging + p * ib_combine_bytes;
+                    const auto src_x = ib_input_base + t * ib_token_bytes;
+                    const auto dst_x = stage_p + static_cast<int64_t>(kk) * ib_token_bytes;
+                    for (int64_t o = lane_idx * 16; o < ib_token_bytes; o += 32 * 16)
+                        *reinterpret_cast<int4*>(dst_x + o) = *reinterpret_cast<const int4*>(src_x + o);
+                    if (ib_sf_bytes > 0) {
+                        const auto src_sf = ib_input_base + ib_off_sf + t * ib_sf_bytes;
+                        const auto dst_sf = stage_p + ib_off_sf + static_cast<int64_t>(kk) * ib_sf_bytes;
+                        for (int64_t o = lane_idx * 16; o < ib_sf_bytes; o += 32 * 16)
+                            *reinterpret_cast<int4*>(dst_sf + o) = *reinterpret_cast<const int4*>(src_sf + o);
+                    }
+                    if (lane_idx == 0)
+                        reinterpret_cast<uint16_t*>(stage_p + ib_off_map)[t] = static_cast<uint16_t>(kk);
+                }
+            }
         }
 #endif
         IB_TRACE(0, sm_idx == 0 and thread_idx == 0);
@@ -486,6 +503,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
         IB_TRACE(10, sm_idx == 0 and thread_idx == 0);  // after the dispatch grid sync
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // v4: the gather above is complete grid-wide. Reset the other parity's pack counters (used by the next
+        // launch), then SM (peer + kNumRanks * piece) puts piece `piece` of our packed region to `peer` + one
+        // strong signal on context `piece`
+        if (sm_idx == 0 and thread_idx < kNumRanks)
+            *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1) ^ 1u, thread_idx) = 0;
+        if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
+            const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
+            const auto stage_p = ib_combine_staging + peer * ib_combine_bytes;
+            const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
+            const int64_t cnt = *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1), peer);
+            const uint8_t* src = nullptr; const uint8_t* dst_sym = nullptr; int64_t size = 0;
+            switch (piece) {
+                case 0: src = stage_p; dst_sym = dst; size = cnt * ib_token_bytes; break;
+                case 1: src = stage_p + ib_off_sf; dst_sym = dst + ib_off_sf; size = cnt * ib_sf_bytes; break;
+                case 2: src = ib_input_base + ib_off_idx; dst_sym = dst + ib_off_idx; size = num_tokens * ib_idx_bytes; break;
+                case 3: src = ib_input_base + ib_off_w; dst_sym = dst + ib_off_w; size = num_tokens * ib_w_bytes; break;
+                default: src = stage_p + ib_off_map; dst_sym = dst + ib_off_map; size = num_tokens * 2; break;
+            }
+            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
+            if (size > 0 and not (DG_MEGA_MOE_IB_DIAG & 1))
+                gin.put(dst_sym, src, static_cast<uint64_t>(size), peer);
+            gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
+            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
+#endif
+        }
+#endif
 
         // Write expert count
         if (sm_idx == 0) {
@@ -531,6 +577,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE(11, sm_idx == 0 and thread_idx == 0);  // counts written, about to enter the pre-pull barrier
         // Barrier before pulling
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // v4: our landing puts read the combine staging, which the L2 epilogue overwrites: settle them locally
+        // (flush per context) before arriving at the barrier, so no rank passes it while a put still reads
+        if (sm_idx == 0 and thread_idx < DG_MEGA_MOE_IB_CONTEXTS)
+            comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, thread_idx).flush();
+        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
         comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -549,7 +600,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // v2g: one strong signal per landing piece per launch from r settles r's landing puts
                 while (ptx::ld_acq_sys(workspace.get_ib_landing_ready_ptr(r)) != ib_epoch * kIBNumLandingPieces);
                 const auto n = static_cast<uint32_t>(ptx::ld_volatile(workspace.get_ib_arrival_ptr(r)));
-                const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_bytes + ib_topk_offset);
+                const auto topk = reinterpret_cast<const int64_t*>(ib_landing + r * ib_landing_stride + ib_off_idx);
                 // v2h: per-expert slot counters live in lane registers (lane l counts local expert l) instead of
                 // a global atomic per pair (~1 us each, serialized): ballots + shuffles only
                 // (shapes with > 32 experts per rank, e.g. MegaSeek, fall back to a global atomic per pair)
@@ -782,18 +833,32 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             // Remote-node sources: read the landing copy pushed at kernel start (v2a); same-node: NVLink peer
-            const auto src_ptr = [&](auto local_ptr) {
+            const auto src_ptr = [&](auto local_ptr) {  // whole arrays (top-k weights): mirrored offset
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (is_remote(current_rank_in_expert_idx)) {
                     using ptr_t = decltype(local_ptr);
                     const auto offset = reinterpret_cast<const uint8_t*>(local_ptr) - ib_input_base;
-                    return reinterpret_cast<ptr_t>(ib_landing + current_rank_in_expert_idx * ib_landing_bytes + offset);
+                    return reinterpret_cast<ptr_t>(ib_landing + current_rank_in_expert_idx * ib_landing_stride + offset);
                 }
 #endif
                 return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
             };
-            const auto src_base_ptr = src_ptr(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr());
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // v4: token / SF rows of remote sources are packed; the map gives the packed index of this token
+            const uint32_t ib_packed = is_remote(current_rank_in_expert_idx) ? reinterpret_cast<const uint16_t*>(
+                ib_landing + current_rank_in_expert_idx * ib_landing_stride + ib_off_map)[src_token_idx] : 0u;
+#endif
+            const auto src_row_ptr = [&](auto local_ptr, const int64_t& off, const int64_t& row_bytes) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if (is_remote(current_rank_in_expert_idx)) {
+                    using ptr_t = decltype(local_ptr);
+                    return reinterpret_cast<ptr_t>(ib_landing + current_rank_in_expert_idx * ib_landing_stride + off + ib_packed * row_bytes);
+                }
+#endif
+                return sym_buffer.map(local_ptr, current_rank_in_expert_idx);
+            };
+            const auto src_base_ptr = src_row_ptr(
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), 0, ib_token_bytes);
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -824,8 +889,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = src_ptr(
-                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>());
+            const auto remote_sf_ptr = src_row_ptr(
+                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(), ib_off_sf, ib_sf_bytes);
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;

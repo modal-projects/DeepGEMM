@@ -1389,11 +1389,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
             const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
-            // The GEMM stages of this SM are unused until the first task, which needs these counts: stage the
-            // polled top-k (as u16 expert + 1, 0 = masked) in smem_b so the slot loop runs from shared memory
-            auto e_smem = reinterpret_cast<uint16_t*>(&shared_storage.smem_b);
-            DG_STATIC_ASSERT(kNumMaxTokensPerRank * kNumTopk * 2 <= sizeof(shared_storage.smem_b), "IB D1 smem");
-            DG_STATIC_ASSERT(kNumExperts < 65535, "IB D1 u16 experts");
+            // NOTES: smem_b can NOT be used as scratch here: shared-expert tasks do not wait for the routed counts
             for (uint32_t i0 = 0; i0 < nt * kNumTopk; i0 += kNumEpilogueThreads * 4) {
                 uint64_t v[4];
                 uint32_t wv[4];
@@ -1409,7 +1405,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (i < nt * kNumTopk) {
                         IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "d1_idx", s, i);
                         IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "d1_w", s, i);
-                        e_smem[i] = static_cast<int64_t>(v[u]) >= 0 ? static_cast<uint16_t>(v[u] + 1) : 0;
                     }
                 }
             }
@@ -1423,9 +1418,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             IB_TRACE(21, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
             if (epilogue_warp_idx == 0) {
+                // The top-k values were polled above; load 16 iterations' worth at once (independent loads)
+                constexpr uint32_t kBlk = 16;
+                int ev[kBlk];
                 for (uint32_t b = 0; b < nt * kNumTopk; b += 32) {
                     const uint32_t j = b + lane_idx;
-                    const int e = j < nt * kNumTopk ? static_cast<int>(e_smem[j]) - 1 : -1;
+                    if ((b / 32) % kBlk == 0) {
+                        #pragma unroll
+                        for (uint32_t u = 0; u < kBlk; ++ u) {
+                            const uint32_t jj = j + u * 32;
+                            ev[u] = jj < nt * kNumTopk ? static_cast<int>(static_cast<int64_t>(__ldcg(reinterpret_cast<const unsigned long long*>(idx) + jj))) : -1;
+                        }
+                    }
+                    int e = ev[0];
+                    #pragma unroll
+                    for (uint32_t u = 1; u < kBlk; ++ u)
+                        if ((b / 32) % kBlk == u) e = ev[u];
                     const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
                     const bool on = e >= 0 and r / ib_lsa == ib_my_node;
                     const uint32_t key = on ? static_cast<uint32_t>(e) : (0x80000000u | lane_idx);

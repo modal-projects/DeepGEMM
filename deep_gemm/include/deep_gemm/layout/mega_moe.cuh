@@ -87,6 +87,16 @@ struct alignas(128) MegaMoESignals {
 
     // Shared-expert signals
     uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
+
+    // Mega MoE over IB (unused when every rank shares one NVLink domain). Remote ranks never touch the
+    // GPU-atomic words above: they put per-source values here, tagged with a launch epoch.
+    static constexpr uint32_t kNumMaxIBScratchSlots = 1024;  // >= SMs x dispatch warps
+    static constexpr uint32_t kNumIBScratchBytes = 512;      // SF (<= 448 B) + top-k weight at 480
+    static constexpr uint32_t kIBScratchWeightOffset = 480;
+    alignas(128) uint64_t ib_epoch;
+    alignas(128) uint64_t ib_arrival[kNumMaxRanks];
+    alignas(128) uint64_t ib_barrier_flag[2][kNumMaxRanks];
+    alignas(128) uint8_t ib_scratch[kNumMaxIBScratchSlots][kNumIBScratchBytes];
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 
@@ -194,6 +204,26 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_shared_l2_task_count_ptr() const {
         return signals->shared_l2_task_count;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_epoch_ptr() const {
+        return &signals->ib_epoch;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_arrival_ptr(const uint32_t& src_rank_idx = 0) const {
+        return signals->ib_arrival + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_ib_barrier_flag_ptr(const uint32_t& tag_idx, const uint32_t& src_rank_idx = 0) const {
+        return signals->ib_barrier_flag[tag_idx % 2] + src_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint8_t* get_ib_scratch_ptr(const uint32_t& slot_idx) const {
+        return signals->ib_scratch[slot_idx];
     }
 
     CUTLASS_DEVICE

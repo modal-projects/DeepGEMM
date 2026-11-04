@@ -47,7 +47,16 @@ class SymmBuffer:
             mma_type, activation,
             num_shared_experts
         )
-        if base is None:
+        from . import ib as _ib
+        if base is None and _ib.enabled():
+            # Mega MoE over IB: one NCCL window; extra tail holds per-destination combine staging
+            # (num_ranks copies of the combine buffer, see kernel `ib_combine_staging`)
+            combine_bytes = (num_topk + 1) * num_max_tokens_per_rank * hidden * 2
+            num_bytes = ((num_bytes + 127) // 128) * 128 + group.size() * combine_bytes
+            self.buffer, self.handle = _ib.allocate(group, num_bytes)
+            self.group.barrier()
+            torch.cuda.synchronize()
+        elif base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
             self.handle = (

@@ -8,6 +8,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
+#include <deep_gemm/comm/gin.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/mma/sm100.cuh>
@@ -132,6 +133,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
+
+    // Mega MoE over IB: ranks outside this NVLink domain are reached with NCCL Gin (DESIGN-v1.md)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    constexpr bool kIsIB = true;
+    const auto& ib_dev_comm = *reinterpret_cast<const ncclDevComm_t*>(sym_buffer.gin_dev_comm);
+    const auto ib_window = reinterpret_cast<ncclWindow_t>(sym_buffer.gin_window);
+    const uint64_t ib_epoch = ptx::ld_volatile(workspace.get_ib_epoch_ptr()) + 1;
+    const auto make_gin = [&]() { return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, sm_idx); };
+    const auto is_remote = [&](const uint32_t& r) { return not sym_buffer.is_lsa(r); };
+    // Remote combine rows are staged here (one copy of the combine buffer per destination rank), then put
+    const auto ib_combine_staging = math::advance_ptr<uint8_t>(
+        sym_buffer.get_base_ptr(), math::align<int64_t>(buffer.get_num_bytes(), 128));
+    const auto ib_combine_bytes = static_cast<int64_t>(buffer.combine_token_buffer.get_num_bytes());
+#else
+    constexpr bool kIsIB = false;
+#endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
@@ -302,6 +319,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.task_info_empty_barriers,
             shared_storage.task_infos
     );
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    scheduler.set_ib(sym_buffer.num_lsa_ranks, sym_buffer.rank_idx, ib_epoch);
+#endif
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -325,7 +345,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
-    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
+    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64 and not kIsIB;  // Gin state needs dispatch registers
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;
@@ -386,8 +406,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if (is_remote(dst_rank_idx)) {
+                make_gin().put_value(dst_ptr, static_cast<uint32_t>(token_topk_idx), dst_rank_idx);
+                return;
+            }
+#endif
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        make_gin().flush();  // index puts land before counts are announced
+#endif
 
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
@@ -399,8 +428,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks)
+            if (thread_idx < kNumRanks) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if (is_remote(thread_idx))
+                    make_gin().put_value(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx),
+                                         static_cast<uint64_t>(ptx::get_grid_idx() + 1), thread_idx);
+                else
+#endif
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+            }
             __syncwarp();
 
             #pragma unroll
@@ -408,6 +444,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if (is_remote(dst_rank_idx)) {
+                    // Plain put into the per-source slot; never the GPU-atomic sum (DESIGN-v1 rule)
+                    make_gin().put_value(workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                                         static_cast<uint64_t>(expert_status & 0xffffffff), dst_rank_idx);
+                    continue;
+                }
+#endif
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
@@ -415,10 +459,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
             }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Announce arrival to remote ranks only after every count put has landed
+            make_gin().flush();
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx < kNumRanks and is_remote(thread_idx)) {
+                const auto gin = make_gin();
+                gin.put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), ib_epoch, thread_idx);
+                gin.flush();
+            }
+#endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+            workspace, sym_buffer, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+            make_gin(), ib_epoch, false, true);
+#else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -426,6 +487,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+#endif
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -549,9 +611,56 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
+            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if (is_remote(current_rank_in_expert_idx)) {
+                // RDMA-read token bytes straight into the pool slot; SF and top-k weight into this warp's scratch
+                constexpr uint32_t kNumSFBytes = (kHidden / 128) * sizeof(uint32_t);
+                DG_STATIC_ASSERT(kNumSFBytes <= layout::MegaMoESignals::kIBScratchWeightOffset, "IB scratch too small for SF");
+                const auto scratch = workspace.get_ib_scratch_ptr(sm_idx * kNumDispatchWarps + warp_idx);
+                const auto src_rank = current_rank_in_expert_idx;
+                if (cute::elect_one_sync()) {
+                    const auto gin = make_gin();
+                    gin.get(dst_base_ptr, buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), kHidden, src_rank);
+                    gin.get(scratch, buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr(), kNumSFBytes, src_rank);
+                    gin.get(scratch + layout::MegaMoESignals::kIBScratchWeightOffset,
+                            buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, sizeof(float), src_rank);
+                    gin.flush();
+                }
+                __syncwarp();
+
+                // SF scatter (same transposed layout as the NVLink path) and weight
+                const auto ib_local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
+                const uint32_t ib_ring_block_idx = pool_block_idx % kNumRingBlocks;
+                const auto ib_sf_ring_token_idx = ib_ring_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_idx_in_expert % BLOCK_M);
+                const auto scratch_sf = reinterpret_cast<const uint32_t*>(scratch);
+                #pragma unroll
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kHidden / 128, 32u); ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    if (j < kHidden / 128)
+                        ib_local_sf_ptr[j * kNumSFRingTokens + ib_sf_ring_token_idx] = ptx::ld_volatile(scratch_sf + j);
+                }
+                __syncwarp();
+
+                if (cute::elect_one_sync()) {
+                    *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() =
+                        *reinterpret_cast<const volatile float*>(scratch + layout::MegaMoESignals::kIBScratchWeightOffset);
+                    *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                        {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                    // NIC-written token bytes are read by the GEMM's TMA (async proxy)
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
+                    const bool is_last_token = (token_idx == expert_end_idx - 1);
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
+                        is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
+                    );
+                }
+                __syncwarp();
+                continue;
+            }
+#endif
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -643,8 +752,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Other SMs: clean blocks
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 // Read expert token count before clearing
-                const auto num_recv_tokens = static_cast<uint32_t>(
+                auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                for (uint32_t r = 0; r < kNumRanks; ++ r)
+                    num_recv_tokens += is_remote(r) ? static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(r, i)) : 0u;
+#endif
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 // Compute expert pool block offset
@@ -680,6 +793,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         // Wait for all ranks to finish cleaning
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+            workspace, sym_buffer, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+            make_gin(), ib_epoch, true, false);
+#else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -687,6 +807,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+#endif
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if (sm_idx == 0 and thread_idx == 0)
+            *workspace.get_ib_epoch_ptr() = ib_epoch;
+#endif
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1348,7 +1473,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        bool is_remote_row = false;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                        is_remote_row = is_remote(dst_rank_idx);
+                        if (is_remote_row) {
+                            const auto offset_in_combine = reinterpret_cast<int64_t>(dst_ptr) -
+                                reinterpret_cast<int64_t>(buffer.combine_token_buffer.get_base_ptr());
+                            const auto staging_ptr = reinterpret_cast<float4*>(
+                                ib_combine_staging + dst_rank_idx * ib_combine_bytes + offset_in_combine);
+                            *staging_ptr = packed;
+                            // 16 lanes wrote one contiguous 256 B row segment; its first lane puts it
+                            const uint32_t half_mask = 0xffffu << (lane_idx / 16 * 16);
+                            __syncwarp(half_mask);
+                            if (lane_idx % 16 == 0) {
+                                __threadfence();
+                                make_gin().put(dst_ptr, staging_ptr, 16 * sizeof(float4), dst_rank_idx);
+                            }
+                        }
+#endif
+                        if (not is_remote_row)
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
                 }
 
@@ -1408,6 +1552,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        make_gin().flush();  // remote combine rows land before the ready flags below
+#endif
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
@@ -1415,8 +1562,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if (is_remote(epilogue_thread_idx)) {
+                const auto gin = make_gin();
+                gin.put_value(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), peer_grid_idx, epilogue_thread_idx);
+                gin.flush();
+            } else
+#endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+        }
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);

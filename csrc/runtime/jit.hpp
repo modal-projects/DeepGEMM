@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -27,6 +28,9 @@ inline void init_jit(const std::string& library_root_path) {
             emplace_back("--diag-suppress=39,161,174,177,186,940");
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
+        // Mega MoE over IB: kernels include <nccl_device.h> (header-only Gin device API)
+        if (const char* nccl_include = std::getenv("DG_NCCL_INCLUDE_DIR"); nccl_include != nullptr)
+            runtime->default_compiler_options.nvcc_flags->emplace_back(std::string("-I") + nccl_include);
         return runtime;
     });
 }

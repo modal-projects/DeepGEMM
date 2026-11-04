@@ -235,7 +235,7 @@ static void fp8_fp4_mega_moe(
     }
 
     // Check buffer bytes
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_ranks = static_cast<int>(layout::SymBuffer<>::num_ranks_of(sym_buffer_ptrs));
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
@@ -347,7 +347,7 @@ static void bf16_mega_moe(
     }
 
     // Check buffer bytes
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_ranks = static_cast<int>(layout::SymBuffer<>::num_ranks_of(sym_buffer_ptrs));
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,

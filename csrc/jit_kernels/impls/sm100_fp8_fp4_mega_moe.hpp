@@ -34,7 +34,8 @@ static void sm100_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math
 ) {
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_ranks = static_cast<int>(layout::SymBuffer<>::num_ranks_of(sym_buffer_ptrs));
+    const bool is_ib = num_ranks != static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
@@ -146,7 +147,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = get_num_sms_for_mega_moe();
 
     // Compile
-    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::format(R"(
+    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::string(is_ib ? "#define DG_MEGA_MOE_IB 1\n" : "") + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;

@@ -43,7 +43,8 @@ std::vector<int64_t> nccl_unique_id() {
 
 // Returns (state handle, buffer ptr, per-rank LSA ptrs (0 for other nodes), dev_comm device ptr, window, lsa nranks)
 std::tuple<int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t, int64_t>
-create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num_bytes, int64_t num_contexts, int64_t gin_type) {
+create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num_bytes, int64_t num_contexts, int64_t gin_type,
+       int64_t virtual_lsa) {
     auto* st = new IBState();
     ncclUniqueId id;
     for (size_t i = 0; i < sizeof(id); ++ i) id.internal[i] = static_cast<char>(uid[i]);
@@ -56,7 +57,10 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
     CHECK_NCCL(ncclCommQueryProperties(st->comm, &props));
     ncclTeam_t lsa = ncclTeamLsa(st->comm);
-    const bool need_gin = lsa.nRanks < world;  // all ranks in one NVLink domain: load/store only
+    // virtual_lsa > 0: treat groups of `virtual_lsa` consecutive ranks as separate NVLink domains, so ranks in
+    // other groups (even on this node) are reached with Gin; single-node bitwise checks of every IB path
+    const int64_t num_lsa = virtual_lsa > 0 ? virtual_lsa : lsa.nRanks;
+    const bool need_gin = num_lsa < world;
     TORCH_CHECK(not need_gin or props.ginType != NCCL_GIN_TYPE_NONE,
                 "NCCL Gin is unavailable on this communicator (ginType=", props.ginType, ")");
     if (need_gin) {
@@ -80,15 +84,19 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     CHECK_CUDA(cudaMemcpy(st->dev_comm_dev, st->dev_comm_host, dev_comm_size, cudaMemcpyHostToDevice));
     }
     const int64_t node_first = rank - lsa.rank;
+    const int64_t group_first = rank - rank % num_lsa;
     std::vector<int64_t> ptrs(static_cast<size_t>(world), 0);
     for (int i = 0; i < lsa.nRanks; ++ i) {
+        const int64_t r = node_first + i;
+        if (r < group_first or r >= group_first + num_lsa)
+            continue;  // outside this (virtual) NVLink domain: Gin only
         void* p = nullptr;
         CHECK_NCCL(ncclGetLsaDevicePointer(st->window, 0, i, &p));
-        ptrs[static_cast<size_t>(node_first + i)] = reinterpret_cast<int64_t>(p);
+        ptrs[static_cast<size_t>(r)] = reinterpret_cast<int64_t>(p);
     }
     TORCH_CHECK(ptrs[static_cast<size_t>(rank)] == reinterpret_cast<int64_t>(st->ptr) or ptrs[static_cast<size_t>(rank)] != 0);
     return {reinterpret_cast<int64_t>(st), reinterpret_cast<int64_t>(st->ptr), ptrs,
-            reinterpret_cast<int64_t>(st->dev_comm_dev), reinterpret_cast<int64_t>(st->window), static_cast<int64_t>(lsa.nRanks)};
+            reinterpret_cast<int64_t>(st->dev_comm_dev), reinterpret_cast<int64_t>(st->window), num_lsa};
 }
 
 torch::Tensor as_tensor(int64_t ptr, int64_t num_bytes, int64_t device) {
@@ -149,7 +157,9 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
     uid = [ext.nccl_unique_id()] if rank == 0 else [None]
     dist.broadcast_object_list(uid, src=dist.get_global_rank(group, 0), group=group)
     gin_type = int(os.environ.get('DG_MEGA_MOE_IB_GIN_TYPE', '0'))  # 0 any, 2 proxy, 3 GDAKI, 5 EFA GDA
-    state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS, gin_type)
+    virtual_lsa = int(os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0'))
+    state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS, gin_type,
+                                                                 virtual_lsa)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
     # DG_MEGA_MOE_IB_FORCE=1: compile the IB kernel even when all ranks share one NVLink domain (compile and
     # local-path checks on single-node clusters; Gin paths are never taken since every rank is load/store-reachable)

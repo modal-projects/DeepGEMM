@@ -95,12 +95,13 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
 // NVLink barrier among same-node ranks + epoch-tagged Gin flags across nodes (SM 0 only).
 // Remote ranks never touch the GPU-atomic NVLink signal words.
-template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag,
+          typename sync_scope_t, typename make_gin_t>
 CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
-                                   const GinIB& gin, const uint64_t& epoch,
+                                   const make_gin_t& make_gin, const uint64_t& epoch,
                                    const bool& sync_prologue = true,
                                    const bool& sync_epilogue = true) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
@@ -118,7 +119,7 @@ CUTLASS_DEVICE void hybrid_barrier(const layout::Workspace& workspace,
                 ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
             } else {
                 // One strong signal per launch per tag: the counter equals `epoch` once this rank arrived
-                gin.signal_inc(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), thread_idx);
+                make_gin().signal_inc(workspace.get_ib_barrier_flag_ptr(kTag, sym_buffer.rank_idx), thread_idx);
             }
         }
         sync_scope();

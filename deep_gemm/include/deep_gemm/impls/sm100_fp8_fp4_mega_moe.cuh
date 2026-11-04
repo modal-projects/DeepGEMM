@@ -488,7 +488,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            make_gin(), ib_epoch, false, true);
+            make_gin, ib_epoch, false, true);
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
@@ -774,7 +774,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            make_gin(), ib_epoch, true, false);
+            make_gin, ib_epoch, true, false);
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(

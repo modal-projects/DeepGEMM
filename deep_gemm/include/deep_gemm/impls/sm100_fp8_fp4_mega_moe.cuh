@@ -447,7 +447,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // map[p][t] = k. After the dispatch grid sync, SM (p + kNumRanks * piece) puts piece `piece` to p with one
         // strong signal each (5 pieces): packed x block, packed SF block, whole top-k idx, whole weights, map.
         DG_STATIC_ASSERT(kNumRanks <= 32, "IB push keeps a peer bitmask in 32 bits");
-        DG_STATIC_ASSERT(kNumRanks * kIBNumLandingPieces <= kNumSMs, "Insufficient SMs for IB landing pieces");
         DG_STATIC_ASSERT(kNumMaxTokensPerRank <= 65535, "IB landing map holds 16-bit packed indices");
 #ifndef DG_MEGA_MOE_IB_DIAG
 #define DG_MEGA_MOE_IB_DIAG 0
@@ -555,13 +554,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (thread_idx < kNumRanks)
                 *workspace.get_ib_pack_pairs_ptr(ib_parity ^ 1u, thread_idx) = 0;
         }
-        DG_STATIC_ASSERT(kIBMetaPieceSM + kNumRanks <= kNumSMs, "Insufficient SMs for the IB meta piece");
-        if (sm_idx >= kIBMetaPieceSM and sm_idx < kIBMetaPieceSM + kNumRanks and is_remote(sm_idx - kIBMetaPieceSM)) {
-            // v7: the meta piece (counts + slot table) goes first, on its own signal; the receiver can build its
-            // index table and start local work while the token rows are still landing
-            const uint32_t peer = sm_idx - kIBMetaPieceSM;
+        DG_STATIC_ASSERT(kNumRanks <= kNumSMs, "Insufficient SMs for IB landing pieces");
+        if (sm_idx < kNumRanks and is_remote(sm_idx)) {
+            // EP32-capable layout: SM `peer` posts every piece of our packed region to `peer`, one piece per
+            // dispatch warp (lane 0): 0 x packed, 1 SF packed, 2 top-k idx, 3 weights, 4 map (+count), 5 meta
+            const uint32_t peer = sm_idx;
             const auto stage_p = ib_pack + peer * ib_landing_stride;
             const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
+            const int64_t cnt = *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1), peer);
             auto counts = reinterpret_cast<uint32_t*>(stage_p + ib_off_meta);
             if (thread_idx < kNumExpertsPerRank)
                 counts[thread_idx] = *workspace.get_ib_pack_slot_ptr(ib_parity, peer, thread_idx);
@@ -570,41 +570,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *reinterpret_cast<uint32_t*>(stage_p + ib_off_meta_pairs) = npairs;
             __threadfence();
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            if (thread_idx == 0) {
-                const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, peer);
-                const int64_t size = (ib_off_meta_entries - ib_off_meta) + static_cast<int64_t>(npairs) * 8;
-                gin.put(dst + ib_off_meta, stage_p + ib_off_meta, static_cast<uint64_t>(size), peer);
-                gin.signal_inc(workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx), peer);
+            if (lane_idx == 0) {
+                for (uint32_t piece = warp_idx; piece <= kIBNumLandingPieces; piece += kNumDispatchWarps) {
+                    const uint8_t* src = nullptr; const uint8_t* dst_sym = nullptr; int64_t size = 0;
+                    switch (piece) {
+                        case 0: src = stage_p; dst_sym = dst; size = cnt * ib_token_bytes; break;
+                        case 1: src = stage_p + ib_off_sf; dst_sym = dst + ib_off_sf; size = cnt * ib_sf_bytes; break;
+                        case 2: src = ib_input_base + ib_off_idx; dst_sym = dst + ib_off_idx; size = num_tokens * ib_idx_bytes; break;
+                        case 3: src = ib_input_base + ib_off_w; dst_sym = dst + ib_off_w; size = num_tokens * ib_w_bytes; break;
+                        case 4: src = stage_p + ib_off_map; dst_sym = dst + ib_off_map; size = num_tokens * 2; break;
+                        default: src = stage_p + ib_off_meta; dst_sym = dst + ib_off_meta;
+                                 size = (ib_off_meta_entries - ib_off_meta) + static_cast<int64_t>(npairs) * 8; break;
+                    }
+                    const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
+                    if (piece == kIBNumLandingPieces - 1)  // the token count rides on the map piece's context
+                        gin.put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), peer);
+                    if (size > 0 and not (DG_MEGA_MOE_IB_DIAG & 1))
+                        gin.put(dst_sym, src, static_cast<uint64_t>(size), peer);
+                    if (piece < kIBNumLandingPieces)
+                        gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
+                    else
+                        gin.signal_inc(workspace.get_ib_meta_ready_ptr(sym_buffer.rank_idx), peer);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
-                atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
+                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
+                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
 #endif
+                }
             }
-        }
-        if (thread_idx == 0 and sm_idx < kNumRanks * kIBNumLandingPieces and is_remote(sm_idx % kNumRanks)) {
-            const uint32_t peer = sm_idx % kNumRanks, piece = sm_idx / kNumRanks;
-            const auto stage_p = ib_pack + peer * ib_landing_stride;
-            const auto dst = ib_landing + sym_buffer.rank_idx * ib_landing_stride;
-            const int64_t cnt = *workspace.get_ib_pack_count_ptr(static_cast<uint32_t>(ib_epoch & 1), peer);
-            const uint8_t* src = nullptr; const uint8_t* dst_sym = nullptr; int64_t size = 0;
-            switch (piece) {
-                case 0: src = stage_p; dst_sym = dst; size = cnt * ib_token_bytes; break;
-                case 1: src = stage_p + ib_off_sf; dst_sym = dst + ib_off_sf; size = cnt * ib_sf_bytes; break;
-                case 2: src = ib_input_base + ib_off_idx; dst_sym = dst + ib_off_idx; size = num_tokens * ib_idx_bytes; break;
-                case 3: src = ib_input_base + ib_off_w; dst_sym = dst + ib_off_w; size = num_tokens * ib_w_bytes; break;
-                default: src = stage_p + ib_off_map; dst_sym = dst + ib_off_map; size = num_tokens * 2; break;
-            }
-            const auto gin = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, piece);
-            // v5a: the token count rides on the map piece's context, before its strong signal (no IB barrier needed)
-            if (piece == kIBNumLandingPieces - 1)
-                gin.put_value(workspace.get_ib_arrival_ptr(sym_buffer.rank_idx), static_cast<uint64_t>(num_tokens), peer);
-            if (size > 0 and not (DG_MEGA_MOE_IB_DIAG & 1))
-                gin.put(dst_sym, src, static_cast<uint64_t>(size), peer);
-            gin.signal_inc(workspace.get_ib_landing_ready_ptr(sym_buffer.rank_idx), peer);
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 14), 1ull);
-            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 15), static_cast<unsigned long long>(size));
-#endif
+            __syncwarp();
         }
 #endif
 

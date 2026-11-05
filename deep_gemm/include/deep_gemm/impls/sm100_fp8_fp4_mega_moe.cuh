@@ -2203,7 +2203,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         keys1[t] = kNumExpertsPerRank, keys2[t] = 0;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // DG_MEGA_MOE_IB_SCAN_BATCH=N: loads in flight per thread in the D1 scan (default 4). The scan reads each
+                // remote source's T x K top-k entries over NVLink; MegaSeek @1024 (19456 entries / 256 threads) took ~68 us
+#if defined(DG_MEGA_MOE_IB_SCAN_BATCH)
+                constexpr uint32_t kB = DG_MEGA_MOE_IB_SCAN_BATCH;
+#else
                 constexpr uint32_t kB = 4;
+#endif
                 if constexpr (kIBSplitScan) {
                     // Pass 1: counts only (idx), then publish them (same protocol as below)
                     for (uint32_t i0 = 0; i0 < nt * kNumTopk; i0 += kNumEpilogueThreads * kB) {

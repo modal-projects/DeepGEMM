@@ -871,10 +871,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto src_base_ptr = ib_rem ?
                 sym_buffer.map(ib_mir + static_cast<int64_t>(src_token_idx) * kIBTokBytes, ib_proxy) :
                 sym_buffer.map(reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()), current_rank_in_expert_idx);
+            // DG_MEGA_MOE_IB_PULL_WHOLE=1 (bench agent: pulled 41.0 -> 36.1 us @128, 145 -> 123 @1024 on B300): issue every
+            // 16-byte x load of the row plus its SF loads before polling any of them (one round of NVLink latency per row)
+#if defined(DG_MEGA_MOE_IB_PULL_WHOLE) and DG_MEGA_MOE_IB_PULL_WHOLE
+            constexpr bool kIBPullWhole = true;
+#else
+            constexpr bool kIBPullWhole = false;
+#endif
+            constexpr uint32_t kIBSFIters = (kHidden / 128 + 31) / 32;
+            uint32_t ib_sf_pre[kIBSFIters];
+            if (kIBPullWhole and ib_rem) {
+                const auto sf_src = sym_buffer.map(reinterpret_cast<uint32_t*>(ib_mir + kIBOffSF + static_cast<int64_t>(src_token_idx) * kIBSFBytes), ib_proxy);
+                #pragma unroll
+                for (uint32_t i = 0; i < kIBSFIters; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    ib_sf_pre[i] = j < kHidden / 128 ? ptx::ld_volatile(sf_src + j) : 0u;
+                }
+            }
             if (ib_rem) {
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
-                constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = 5;
+                constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = kIBPullWhole ? kUnits : 5;
                 #pragma unroll
                 for (uint32_t u0 = 0; u0 < kUnits; u0 += kBatch) {
                     uint4 v[kBatch];
@@ -954,7 +971,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t j = i * 32 + lane_idx;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (j < kNumSFUint32) {
-                    uint32_t sf = ib_rem ? ptx::ld_volatile(remote_sf_ptr + j) : remote_sf_ptr[j];
+                    uint32_t sf = ib_rem ? (kIBPullWhole ? ib_sf_pre[i] : ptx::ld_volatile(remote_sf_ptr + j)) : remote_sf_ptr[j];
                     IB_POLL(ib_rem and sf == 0xffffffffu, sf = ptx::ld_volatile(remote_sf_ptr + j), "pull_sf", current_rank_in_expert_idx, src_token_idx);
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf;
                 }

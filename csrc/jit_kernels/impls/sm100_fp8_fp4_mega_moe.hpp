@@ -159,7 +159,8 @@ static void sm100_fp8_fp4_mega_moe(
         (std::getenv("DG_MEGA_MOE_IB_SHARING") != nullptr ? std::format("#define DG_MEGA_MOE_IB_SHARING {}\n", std::getenv("DG_MEGA_MOE_IB_SHARING")) : std::string()) +
         std::string(std::getenv("DG_MEGA_MOE_IB_META_FIRST_ALL") != nullptr ? "#define DG_MEGA_MOE_IB_META_FIRST_ALL 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_WAVE_SORT") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_WAVE_SORT")) != "0" ? "#define DG_MEGA_MOE_IB_WAVE_SORT 1\n" : "") +
-        std::string(std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE")) != "0" ? "#define DG_MEGA_MOE_IB_STREAM_COMBINE 1\n" : "") +
+        (std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE")) != "0" ?
+            std::format("#define DG_MEGA_MOE_IB_STREAM_COMBINE {}\n", std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_IB_DIAG") != nullptr ? std::format("#define DG_MEGA_MOE_IB_DIAG {}\n", std::getenv("DG_MEGA_MOE_IB_DIAG")) : std::string()) + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 

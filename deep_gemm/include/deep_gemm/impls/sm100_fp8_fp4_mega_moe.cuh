@@ -481,8 +481,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 #if defined(DG_MEGA_MOE_IB_STREAM_COMBINE) and DG_MEGA_MOE_IB_STREAM_COMBINE
     constexpr bool kIBStreamCombine = true;
+    // STREAM_COMBINE=2: the last dispatch warp of every SM does not pull; it runs the forward-combine from the start
+    // (during the GEMMs), claiming items dynamically in wave order; the pull warps join once their pulls are done
+    constexpr bool kIBCombineWarp = DG_MEGA_MOE_IB_STREAM_COMBINE >= 2 and kIBReduceOnArrival;
 #else
     constexpr bool kIBStreamCombine = false;
+    constexpr bool kIBCombineWarp = false;
 #endif
     // Tables in the (otherwise unused) ib_pool_combine_idx array, local to each GPU:
     //   slot [remote source k][T]: token -> mirror x row (receiver), perm2 [remote node][T]: return position -> token
@@ -587,7 +591,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kXUnitsPerItem = kIBTokBytes / 16 / kSplit;
             DG_STATIC_ASSERT(kXUnitsPerItem * 16 * kSplit == kIBTokBytes, "IB forward x split");
             const uint32_t k_s = ib_k_of_rank(s);
-            for (uint32_t item = global_warp; item < nt * kSplit; item += num_global_warps) {
+            const auto claim = [&](const uint32_t& prev) {
+                if constexpr (not kIBCombineWarp) {
+                    return prev + num_global_warps;
+                } else {
+                    uint32_t v = 0;
+                    if (lane_idx == 0) v = atomicAdd(&workspace.signals->ib_o_fitem[ib_parity][n], 1u);
+                    return __shfl_sync(0xffffffffu, v, 0);
+                }
+            };
+            for (uint32_t item = kIBCombineWarp ? claim(0) : global_warp; item < nt * kSplit; item = claim(item)) {
                 // p = record position (= token index unless STREAM_COMBINE), t = token
                 const uint32_t p_rec = item / kSplit, qtr = item % kSplit;
                 const uint32_t t = kIBStreamCombine ? ptx::ld_volatile(ib_tab + kIBTabPerm2 + nr * kIBTabT + p_rec) : p_rec;
@@ -748,6 +761,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     workspace.signals->ib_o_fchunk[ib_parity ^ 1][i / layout::MegaMoESignals::kIBOMaxChunks][i % layout::MegaMoESignals::kIBOMaxChunks] = 0;
                 if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
                     workspace.signals->ib_o_fdone[ib_parity ^ 1][thread_idx] = 0;
+                if (kIBCombineWarp and thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
+                    workspace.signals->ib_o_fitem[ib_parity ^ 1][thread_idx] = 0;
             }
         }
 #endif
@@ -857,8 +872,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
 #endif
 
-        constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        constexpr bool kSkipLastPullWarp = kIBCombineWarp;
+#else
+        constexpr bool kSkipLastPullWarp = false;
+#endif
+        constexpr uint32_t kNumPullWarps = kSkipLastPullWarp ? kNumDispatchWarps - 1 : kNumDispatchWarps;
+        constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps;
+        for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx; not (kSkipLastPullWarp and warp_idx >= kNumPullWarps); token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {

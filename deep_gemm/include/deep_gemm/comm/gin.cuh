@@ -29,9 +29,10 @@ struct GinIB {
     int64_t base;
 
     __device__ __forceinline__
-    GinIB(const ncclDevComm_t& dev_comm, const ncclWindow_t& window, const int64_t& base, const uint32_t& context_idx):
-        gin(dev_comm, static_cast<int>(DG_MEGA_MOE_IB_SHARING >= 1 ? context_idx : context_idx % DG_MEGA_MOE_IB_CONTEXTS),
-            static_cast<ncclGinResourceSharingMode>(DG_MEGA_MOE_IB_SHARING)),
+    GinIB(const ncclDevComm_t& dev_comm, const ncclWindow_t& window, const int64_t& base, const uint32_t& context_idx,
+          const int& sharing = DG_MEGA_MOE_IB_SHARING):
+        gin(dev_comm, static_cast<int>(sharing >= 1 ? context_idx : context_idx % DG_MEGA_MOE_IB_CONTEXTS),
+            static_cast<ncclGinResourceSharingMode>(sharing)),
         world(ncclTeamWorld(dev_comm)), window(window), base(base) {}
 
     template <typename ptr_t>

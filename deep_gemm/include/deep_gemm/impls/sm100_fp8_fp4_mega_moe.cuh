@@ -156,6 +156,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_cp = [&](const uint32_t& r, const uint32_t& n) { return n * ib_lsa + r % ib_lsa; };  // counterpart of r on node n
     const auto ib_node_of_slot = [&](const uint32_t& nr) { return nr < ib_my_node ? nr : nr + 1; };     // nr-th remote node
     const auto make_gin = [&](const uint32_t& ctx) { return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx); };
+    // Bisect knob for exclusive contexts: DG_MEGA_MOE_IB_XSITES = bitmask of posting sites that use their exclusive
+    // index + DG_MEGA_MOE_IB_SHARING (1 meta, 2 meta header, 4 x/SF pieces, 8 combine chunks, 16 return header when a
+    // node sent nothing, 32 return header after the last chunk); the other sites use GPU sharing on a separate pool of
+    // contexts above the exclusive range (so they never touch an exclusive context).
+#ifndef DG_MEGA_MOE_IB_XSITES
+#define DG_MEGA_MOE_IB_XSITES 63
+#endif
+    const auto make_gin_site = [&](const uint32_t& site, const uint32_t& xctx, const uint32_t& orig, const uint32_t& xbase) {
+        if (DG_MEGA_MOE_IB_SHARING >= 1 and (DG_MEGA_MOE_IB_XSITES & site))
+            return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, xctx);
+        if (DG_MEGA_MOE_IB_SHARING >= 1)  // shared pool above the exclusive range
+            return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base,
+                               xbase + orig % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - xbase), 0);
+        return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, orig);
+    };
     // Mirror layout = the upstream input region layout: x [T][H] fp8, SF [T][H/32], top-k idx [T][K] i64, weights [T][K] f32
     constexpr int64_t kIBT = kNumMaxTokensPerRank;
     constexpr int64_t kIBTokBytes = kHidden, kIBSFBytes = kHidden / 32;
@@ -199,6 +214,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + nr * kIBM + c : orig; };
     const auto ctx_rhdr = [&](const uint32_t& nr, const uint32_t& orig) {
         return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + ib_R * kIBM + nr : orig; };
+    const uint32_t ib_xbase = ib_R * (4 + 2 * kIBM);
     if (kIBThreadCtx and ib_R * (4 + 2 * kIBM) > DG_MEGA_MOE_IB_CONTEXTS) {
         if (blockIdx.x == 0 and threadIdx.x == 0)
             printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING>=1 needs %u Gin contexts (R=%u, M=%u), have %d\n",
@@ -469,7 +485,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto ret_dst = ib_ret(ib_parity, ib_my_node);
             if (nt == 0) {
                 if (is_leader)
-                    make_gin(ctx_rhdr(nr, nr)).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                    make_gin_site(16, ctx_rhdr(nr, nr), nr, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
                 continue;
             }
             const auto mir = ib_mirror(ib_parity, n);
@@ -588,10 +604,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 state = __shfl_sync(0xffffffffu, state, 0);
                 if (state > 0 and lane_idx == 0) {
                     const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
-                    make_gin(ctx_chunk(nr, c, c + nr)).put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                    make_gin_site(8, ctx_chunk(nr, c, c + nr), c + nr, ib_xbase).put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
                 }
                 if (state == 2 and lane_idx == 1)
-                    make_gin(ctx_rhdr(nr, c + nr + 1)).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                    make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
                 __syncwarp();
             }
         }
@@ -1388,7 +1404,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
             if (epilogue_warp_idx == 0 and lane_idx % 16 + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx % 16, n = ib_node_of_slot(nr);
-                const auto gin = make_gin(lane_idx < 16 ? ctx_meta(nr, nr) : ctx_mhdr(nr, nr + 2));
+                const auto gin = lane_idx < 16 ? make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase) : make_gin_site(2, ctx_mhdr(nr, nr + 2), nr + 2, ib_xbase);
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
                 if (lane_idx < 16)
                     gin.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(kIBT * kNumTopk * 12), ib_cp(sym_buffer.rank_idx, n));
@@ -1429,7 +1445,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);
-                make_gin(ctx_meta(lane_idx, lane_idx)).put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
+                make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
                                        static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
             }
             __syncwarp();
@@ -1462,7 +1478,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t t0 = (piece - 1) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
-                    make_gin(ctx_piece(q, q + 1)).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
+                    make_gin_site(4, ctx_piece(q, q + 1), q + 1, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
                 }
                 __syncwarp();

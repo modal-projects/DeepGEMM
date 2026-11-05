@@ -161,6 +161,8 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(std::getenv("DG_MEGA_MOE_IB_RET_DB") != nullptr ? "#define DG_MEGA_MOE_IB_RET_DB 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_FRONT") != nullptr ? "#define DG_MEGA_MOE_IB_FRONT 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_GPU_ACQ") != nullptr ? "#define DG_MEGA_MOE_IB_GPU_ACQ 1\n" : "") +
+        (std::getenv("DG_MEGA_MOE_IB_RETGROUPS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_RETGROUPS {}\n", std::getenv("DG_MEGA_MOE_IB_RETGROUPS")) : std::string()) +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_L2_COLMAJOR") != nullptr ? "#define DG_MEGA_MOE_L2_COLMAJOR 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_DEBUG_D0") != nullptr ? "#define DG_MEGA_MOE_IB_DEBUG_D0 1\n" : "") +
         (std::getenv("DG_MEGA_MOE_IB_CONTEXTS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_CONTEXTS {}\n", std::getenv("DG_MEGA_MOE_IB_CONTEXTS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_IB_SHARING") != nullptr ? std::format("#define DG_MEGA_MOE_IB_SHARING {}\n", std::getenv("DG_MEGA_MOE_IB_SHARING")) : std::string()) +

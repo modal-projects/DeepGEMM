@@ -304,6 +304,9 @@ struct MegaMoEScheduler {
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters);
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+#if defined(DG_MEGA_MOE_L2_COLMAJOR) and DG_MEGA_MOE_L2_COLMAJOR
+        num_sched_l1_waves = num_total_l1_waves;  // column-major L2 touches every M block at once: all L1 first
+#endif
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -387,6 +390,17 @@ struct MegaMoEScheduler {
             } else {
                 if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx))
                     break;
+#if defined(DG_MEGA_MOE_L2_COLMAJOR) and DG_MEGA_MOE_L2_COLMAJOR
+                {
+                    // DG_MEGA_MOE_L2_COLMAJOR=1: the same task set, column-major within each locality domain (all M blocks
+                    // of a column cluster before the next column), so whole column groups of every token finish early
+                    constexpr uint32_t kLocal = kNumL2Clusters / kNumLocalityDomains;
+                    const uint32_t domain = n_cluster_idx / kLocal;
+                    const uint32_t idx = m_block_idx * kLocal + n_cluster_idx % kLocal;  // the row-major local index
+                    m_block_idx = idx % num_total_m_blocks;
+                    n_cluster_idx = domain * kLocal + idx / num_total_m_blocks;
+                }
+#endif
 
                 // The next task should be L1
                 if (num_sched_l1_waves != kNumSchedL1WavesDone)

@@ -227,6 +227,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kIBPCombStride = static_cast<int64_t>(kNumTopk) * kIBT * kHidden * 2;
     constexpr int64_t kIBFStageStride = kIBT * kIBRecAlloc;
     DG_STATIC_ASSERT(kIBRecBytes % 16 == 0, "IB record alignment");
+    // DG_MEGA_MOE_IB_RETGROUPS=G (4 or 10; fp8 combine only): the return records are laid out group-major
+    // ([group][token][kHidden / G fp8 | kHidden / G / 128 scales]) and the proxy puts each (32-token chunk, column group)
+    // slice as soon as its columns are reduced, so with a column-major L2 (DG_MEGA_MOE_L2_COLMAJOR=1) most of the return
+    // overlaps the L2 tail instead of following it (a token's whole record used to wait for every one of its experts' L2)
+#if defined(DG_MEGA_MOE_IB_RETGROUPS) and DG_MEGA_MOE_IB_RETGROUPS
+    constexpr uint32_t kIBRetGroups = DG_MEGA_MOE_IB_RETGROUPS;
+#else
+    constexpr uint32_t kIBRetGroups = 0;
+#endif
+    DG_STATIC_ASSERT(kIBRetGroups == 0 or (kIBFp8Combine and kHidden % (kIBRetGroups * 128) == 0), "IB return groups");
+    constexpr uint32_t kIBGCols = kIBRetGroups > 0 ? kHidden / kIBRetGroups : kHidden;
+    constexpr int64_t kIBGBytes = kIBGCols + kIBGCols / 128 * 4;  // one token's slice of one group
+    DG_STATIC_ASSERT(kIBGBytes % 8 == 0, "IB return group alignment");
+    // fp8 value / scale address of column `col` of token `t`'s record in a record buffer (stage or return)
+    const auto ib_rec_q = [&](uint8_t* base, const uint32_t& t, const uint32_t& col) -> uint8_t* {
+        if constexpr (kIBRetGroups > 0) {
+            const uint32_t g = col / kIBGCols;
+            return base + (static_cast<int64_t>(g) * kIBT + t) * kIBGBytes + col % kIBGCols;
+        } else {
+            return base + static_cast<int64_t>(t) * kIBRecBytes + col;
+        }
+    };
+    const auto ib_rec_s = [&](uint8_t* base, const uint32_t& t, const uint32_t& col) -> uint8_t* {
+        if constexpr (kIBRetGroups > 0) {
+            const uint32_t g = col / kIBGCols;
+            return base + (static_cast<int64_t>(g) * kIBT + t) * kIBGBytes + kIBGCols + (col % kIBGCols) / 128 * 4;
+        } else {
+            return base + static_cast<int64_t>(t) * kIBRecBytes + kHidden + col / 128 * 4;
+        }
+    };
     // Proxy-local slot table: entry (node-local rank, local expert, slot) -> pair index; the expert hosts read it over
     // NVLink in their pull (one load per row) instead of the proxy writing ~K x T scattered entries over NVLink
     constexpr int64_t kIBPTabStride = static_cast<int64_t>(kNumRanks) * kNumExpertsPerRank * kIBT * 4;
@@ -541,7 +571,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto pc = ib_pcomb(n);
             const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
             // Work item = (token, quarter of the hidden dim): 4 warps per token, every load of an item issued back to back
-            constexpr uint32_t kSplit = 4;
+            constexpr uint32_t kSplit = kIBRetGroups > 0 ? kIBRetGroups : 4;
             constexpr uint32_t kPieces = kHidden * 2 / (32 * 16);  // 16-byte bf16 units per lane over the row
             constexpr uint32_t kPPI = kPieces / kSplit;
             DG_STATIC_ASSERT(kPieces * 32 * 16 == kHidden * 2 and kPPI * kSplit == kPieces, "IB forward piece");
@@ -606,7 +636,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             ptx::accumulate(acc[i][l], b[l]);
                     }
                 }
-                const auto rec = fst + static_cast<int64_t>(t) * kIBRecBytes;
+                const auto rec = fst + static_cast<int64_t>(t) * kIBRecBytes;  // bf16 path only (fp8 uses ib_rec_q/s)
                 #pragma unroll
                 for (uint32_t i = 0; i < kPPI; ++ i) {
                     const uint32_t p = qtr * kPPI + i;
@@ -627,9 +657,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t l = 0; l < 4; ++ l)
                             qs[l] = __nv_cvt_float2_to_fp8x2(make_float2(acc[i][l].x * inv, acc[i][l].y * inv), __NV_SATFINITE, __NV_E4M3);
                         const uint32_t col = (p * 32 + lane_idx) * 8;
-                        *reinterpret_cast<uint2*>(rec + col) = q;
+                        *reinterpret_cast<uint2*>(ib_rec_q(fst, t, col)) = q;
                         if (lane_idx % 16 == 0)
-                            *reinterpret_cast<float*>(rec + kHidden + col / 128 * 4) = scale;
+                            *reinterpret_cast<float*>(ib_rec_s(fst, t, col)) = scale;
                     } else {
                         uint4 o;
                         auto ob = reinterpret_cast<nv_bfloat162*>(&o);
@@ -644,16 +674,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // at the same time on another context (Gin ops cost ~10 us of issue each: never serialize two)
                 const uint32_t c = t / kIBChunk, size = cute::min(kIBChunk, nt - c * kIBChunk);
                 uint32_t state = 0;
+                // Grouped returns: the unit is (chunk, column group) = `size` items, each group slice is put on its own
+                constexpr uint32_t kUnitsPerChunk = kIBRetGroups > 0 ? kIBRetGroups : 1;
+                const uint32_t unit = kIBRetGroups > 0 ? c * kIBRetGroups + qtr : c;
                 if (lane_idx == 0) {
                     __threadfence();
-                    if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][c], 1u) + 1 == size * kSplit)
-                        state = ib_atom_add_acq_rel(&workspace.signals->ib_o_fdone[ib_parity][n], 1u) + 1 == nchunks ? 2u : 1u;
+                    if (ib_atom_add_acq_rel(&workspace.signals->ib_o_fchunk[ib_parity][n][unit], 1u) + 1 == size * (kSplit / kUnitsPerChunk))
+                        state = ib_atom_add_acq_rel(&workspace.signals->ib_o_fdone[ib_parity][n], 1u) + 1 == nchunks * kUnitsPerChunk ? 2u : 1u;
                 }
                 state = __shfl_sync(0xffffffffu, state, 0);
                 if (state > 0 and lane_idx == 0) {
-                    const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
-                    const auto g = make_gin_site(8, ctx_chunk(nr, c, c + nr), c + nr, ib_xbase);
-                    g.put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                    const int64_t off = kIBRetGroups > 0 ? (static_cast<int64_t>(qtr) * kIBT + c * kIBChunk) * kIBGBytes
+                                                         : static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
+                    const uint64_t bytes = static_cast<uint64_t>(size) * (kIBRetGroups > 0 ? kIBGBytes : kIBRecBytes);
+                    const auto g = make_gin_site(8, ctx_chunk(nr, unit, unit + nr), unit + nr, ib_xbase);
+                    g.put(ret_dst + off, fst + off, bytes, s);
                     IB_TRACE_MAX(14, true);  // proxy: return record chunk put issued, last one
 #if defined(DG_MEGA_MOE_IB_RET_DB) and DG_MEGA_MOE_IB_RET_DB
                     // Late-tail doorbell: the last op on a context can sit unprocessed until the next op on it, so each
@@ -1190,7 +1225,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             if (thread_idx == 0)
-                IB_POLL(ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks, (void) 0, "e_fdone", n, nchunks);
+                IB_POLL(ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks * (kIBRetGroups > 0 ? kIBRetGroups : 1u), (void) 0, "e_fdone", n, nchunks);
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
             const auto mir = ib_mirror(ib_parity, n);
             const uint32_t gtid = sm_idx * kNumDispatchThreads + thread_idx;
@@ -2256,21 +2291,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t n = ib_node_of_slot(nr);
                 const bool hit = (ib_nodes_hit >> n) & 1u;
                 if constexpr (kIBFp8Combine) {
-                    const auto rec = ib_ret(ib_parity, n) + static_cast<int64_t>(token_idx) * kIBRecBytes;
+                    const auto rbase = ib_ret(ib_parity, n);
                     // All loads of the record part first (independent), then the sentinel checks
                     uint64_t qv[kNumUint4PerLane];
                     uint32_t sv[kNumUint4PerLane];
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
-                        qv[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(rec + col));
-                        sv[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4));
+                        qv[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase, token_idx, col)));
+                        sv[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase, token_idx, col)));
                     }
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
-                        const auto qptr = reinterpret_cast<uint64_t*>(rec + col);
-                        const auto sptr = reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4);
+                        const auto qptr = reinterpret_cast<uint64_t*>(ib_rec_q(rbase, token_idx, col));
+                        const auto sptr = reinterpret_cast<uint32_t*>(ib_rec_s(rbase, token_idx, col));
                         uint64_t q = qv[j];
                         IB_POLL(q == ~0ull, q = ptx::ld_volatile(qptr), "c3_q", n, token_idx);
                         IB_TRACE_MAX(21, lane_idx == 0 and j == 0);  // source: a return record seen, last one
@@ -2293,7 +2328,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
                         if (col % 128 == 0 and not kIBOracle)
-                            *reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4) = 0xffffffffu;
+                            *reinterpret_cast<uint32_t*>(ib_rec_s(rbase, token_idx, col)) = 0xffffffffu;
                     }
                     continue;
                 }

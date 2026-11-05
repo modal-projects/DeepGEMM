@@ -1609,6 +1609,32 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
+#if defined(DG_MEGA_MOE_L2_PREFETCH) and DG_MEGA_MOE_L2_PREFETCH
+        // DG_MEGA_MOE_L2_PREFETCH=E: before the first task (the routed L1 cannot start until every source's counts are in),
+        // prefetch the L1 weight tiles of local experts [0, E) into L2 (the routed GEMMs are weight-stream bound at small
+        // batch, experts run in index order). Tiles are split across SMs by (expert, n block); TMA L2 prefetch, no smem.
+        {
+            constexpr uint32_t kPrefetchExperts = cute::min(static_cast<uint32_t>(DG_MEGA_MOE_L2_PREFETCH), kNumExpertsPerRank);
+            constexpr uint32_t kNBlocks = L1_SHAPE_N / BLOCK_N, kKBlocks = L1_SHAPE_K / BLOCK_K;
+            constexpr uint32_t kPack = get_smem_pack_factor<weight_dtype_t>();
+            constexpr uint32_t kAtomLogical = tma::get_inner_block_atom_size<BLOCK_K, kSwizzleBMode, kPack, weight_dtype_t>() * kPack;
+            DG_STATIC_ASSERT(BLOCK_K % kAtomLogical == 0, "L2 prefetch atom");
+            if (cute::elect_one_sync()) {
+                const uint32_t half_n = L1_SHAPE_N / 2;
+                for (uint32_t p = sm_idx; p < kPrefetchExperts * kNBlocks; p += kNumSMs) {
+                    const uint32_t e = p / kNBlocks, n_idx = (p % kNBlocks) * BLOCK_N;
+                    const uint32_t half_idx = n_idx >= half_n, half_n_idx = n_idx - half_idx * half_n;
+                    for (uint32_t kb = 0; kb < kKBlocks; ++ kb)
+                        #pragma unroll
+                        for (uint32_t a = 0; a < BLOCK_K / kAtomLogical; ++ a)
+                            asm volatile("cp.async.bulk.prefetch.tensor.4d.L2.global.tile [%0, {%1, %2, %3, %4}];"
+                                         :: "l"(reinterpret_cast<uint64_t>(&tensor_map_l1_weights)),
+                                            "r"(kb * BLOCK_K + a * kAtomLogical), "r"(half_n_idx), "r"(half_idx), "r"(e) : "memory");
+                }
+            }
+            __syncwarp();
+        }
+#endif
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :

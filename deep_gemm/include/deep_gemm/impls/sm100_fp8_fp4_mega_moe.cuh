@@ -152,6 +152,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_window = reinterpret_cast<ncclWindow_t>(sym_buffer.gin_window);
     const uint64_t ib_epoch = ptx::ld_volatile(workspace.get_ib_epoch_ptr()) + 1;
     const uint32_t ib_parity = static_cast<uint32_t>(ib_epoch & 1);
+    // DG_MEGA_MOE_IB_ORACLE=1 (ceiling measurement, results only valid for identical inputs every launch): nothing the
+    // NIC writes is ever re-armed and, from epoch 3 on, the epoch tags are not checked, so every wait on remote data
+    // passes at once with the identical previous launch's bytes (both parities filled by epochs 1-2); all puts still
+    // run. Kernel time then = this design with zero network wait. NVLink-written partials keep their re-arm.
+#if defined(DG_MEGA_MOE_IB_ORACLE) and DG_MEGA_MOE_IB_ORACLE
+    constexpr bool kIBOracle = true;
+#else
+    constexpr bool kIBOracle = false;
+#endif
+    const bool ib_oracle_now = kIBOracle and ib_epoch > 2;
     const uint32_t ib_lsa = sym_buffer.num_lsa_ranks;
     const uint32_t ib_my_node = sym_buffer.rank_idx / ib_lsa;
     const uint32_t ib_num_nodes = kNumRanks / ib_lsa;
@@ -1141,6 +1151,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kGThreads = kNumSMs * kNumDispatchThreads;
             const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
             const uint4 idx_sentinel = {0u, 0x80000000u, 0u, 0x80000000u};
+            if (kIBOracle) continue;
             for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBTokBytes / 16; u += kGThreads)
                 reinterpret_cast<uint4*>(mir)[u] = ones;
             for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBSFBytes / 16; u += kGThreads)
@@ -1581,7 +1592,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto nt_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d) + kNumExpertsPerRank;
                 if (epilogue_thread_idx == 0) {
                     uint64_t h = 0;
-                    comm::wait_until([&]() { h = ptx::ld_volatile(hdr); if ((h >> 32) != (ib_epoch & 0xffffffffull)) __nanosleep(200); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
+                    comm::wait_until([&]() { h = ptx::ld_volatile(hdr); if (ib_oracle_now and h != ~0ull) return true; if ((h >> 32) != (ib_epoch & 0xffffffffull)) __nanosleep(200); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
                         printf("DeepGEMM IB header timeout: rank=%u, source=%u, proxy=%u, header=%llx, epoch=%llu\n",
                                sym_buffer.rank_idx, r, proxy, (unsigned long long) h, (unsigned long long) ib_epoch);
                     });
@@ -2225,13 +2236,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 reduced[j * kNumElemsPerUint4 + l].y += f.y * scale;
                             }
                         }
-                        *qptr = ~0ull;
+                        if constexpr (not kIBOracle) *qptr = ~0ull;
                     }
                     __syncwarp();
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
-                        if (col % 128 == 0)
+                        if (col % 128 == 0 and not kIBOracle)
                             *reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4) = 0xffffffffu;
                     }
                     continue;
@@ -2252,7 +2263,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
                             ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], b[l]);
                     }
-                    *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                    if constexpr (not kIBOracle) *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
                 }
             }
 #endif
@@ -2291,11 +2302,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx + 1 < ib_num_nodes) {
             const uint32_t n = ib_node_of_slot(epilogue_thread_idx);
             const auto hdr = reinterpret_cast<uint64_t*>(ib_ret(ib_parity, n) + kIBRetHdr);
-            comm::wait_until([&]() { return ptx::ld_volatile(hdr) == ib_epoch; }, [&]() {
+            comm::wait_until([&]() { return (ib_oracle_now and ptx::ld_volatile(hdr) != ~0ull) or ptx::ld_volatile(hdr) == ib_epoch; }, [&]() {
                 printf("DeepGEMM IB return header timeout: rank=%u, node=%u, header=%llx, epoch=%llu\n",
                        sym_buffer.rank_idx, n, (unsigned long long) ptx::ld_volatile(hdr), (unsigned long long) ib_epoch);
             });
-            *hdr = ~0ull;
+            if (not kIBOracle) *hdr = ~0ull;
         }
 #endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE

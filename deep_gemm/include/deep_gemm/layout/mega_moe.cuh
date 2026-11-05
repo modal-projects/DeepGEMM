@@ -142,6 +142,7 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint64_t ib_o_meta_posted_t;  // %globaltimer when the meta was posted (DG_MEGA_MOE_IB_XDELAY_NS)
     alignas(128) uint64_t ib_o_scratch;  // Gin warm-up target (never read)
     alignas(128) uint32_t ib_o_fitem[2][kIBOMaxNodes];  // overlap: forward-combine work items claimed, by parity
+    alignas(128) uint64_t ib_o_tab_ready[64];  // SENDER_TABLES: epoch once our D1 copied remote source k's slot table
     alignas(128) uint64_t ib_o_order_ready[64];  // overlap: epoch once our D1 wrote the slot / perm2 tables of remote source k
     alignas(128) uint64_t ib_o_landed[kIBOMaxNodes][kIBOMaxChunks];  // PULL_FLAG_GATE: epoch once (source node, x chunk) landed in our mirror
 };

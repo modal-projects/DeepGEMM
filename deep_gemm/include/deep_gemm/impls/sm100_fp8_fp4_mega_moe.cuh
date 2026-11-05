@@ -877,7 +877,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 sym_buffer.map(reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()), current_rank_in_expert_idx);
             // DG_MEGA_MOE_IB_PULL_WHOLE=1 (bench agent: pulled 41.0 -> 36.1 us @128, 145 -> 123 @1024 on B300): issue every
             // 16-byte x load of the row plus its SF loads before polling any of them (one round of NVLink latency per row)
-#if defined(DG_MEGA_MOE_IB_PULL_WHOLE) and DG_MEGA_MOE_IB_PULL_WHOLE
+#if not defined(DG_MEGA_MOE_IB_PULL_WHOLE) or DG_MEGA_MOE_IB_PULL_WHOLE  // default ON (B300: -3 us @128, -7 @1024, DeepEP-checked)
             constexpr bool kIBPullWhole = true;
 #else
             constexpr bool kIBPullWhole = false;

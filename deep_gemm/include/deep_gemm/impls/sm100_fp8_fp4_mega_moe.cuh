@@ -1904,6 +1904,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_thread_idx == 0)
+                { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_o_meta_posted_t = t_; }
                 ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
         } else if (sm_idx == kIBMetaSM) {
             const auto stg = ib_mirror(ib_parity, ib_my_node);
@@ -1945,6 +1946,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
             // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire
             if (epilogue_thread_idx == 0 and (kIBMetaFirstAll or not kIBFront))
+                { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_o_meta_posted_t = t_; }
                 ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
         }
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
@@ -2006,6 +2008,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     constexpr bool kMetaFirst = false;  // measured harmful with the host scan (GB200: ms-scale stalls)
 #endif
                     while (kMetaFirst and ptx::ld_acq_gpu(&workspace.signals->ib_o_meta_posted) < ib_epoch);
+#if defined(DG_MEGA_MOE_IB_XDELAY_NS) and DG_MEGA_MOE_IB_XDELAY_NS
+                    // DG_MEGA_MOE_IB_XDELAY_NS=N (with META_FIRST_ALL): x / SF pieces wait N ns after the meta was posted, so the
+                    // meta is not interleaved with megabytes of x on the NIC (hypothesis test: counts @1024 land ~50 us late)
+                    if constexpr (kMetaFirst) {
+                        const uint64_t t_meta = ptx::ld_volatile(&workspace.signals->ib_o_meta_posted_t);
+                        uint64_t t_; do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); } while (t_ < t_meta + DG_MEGA_MOE_IB_XDELAY_NS);
+                    }
+#endif
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
                     int64_t off = 0, bytes = 0;
                     if (piece == 0) {

@@ -925,6 +925,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     workspace.signals->ib_o_fchunk[ib_parity ^ 1][i / layout::MegaMoESignals::kIBOMaxChunks][i % layout::MegaMoESignals::kIBOMaxChunks] = 0;
                 if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes) {
                     workspace.signals->ib_o_fdone[ib_parity ^ 1][thread_idx] = 0;
+                }
                 if (kIBCombineWarp and thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
                     workspace.signals->ib_o_fitem[ib_parity ^ 1][thread_idx] = 0;
             }

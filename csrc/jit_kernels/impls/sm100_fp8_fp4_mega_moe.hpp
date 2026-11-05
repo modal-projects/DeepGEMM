@@ -161,6 +161,7 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(std::getenv("DG_MEGA_MOE_IB_RET_DB") != nullptr ? "#define DG_MEGA_MOE_IB_RET_DB 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_FRONT") != nullptr ? "#define DG_MEGA_MOE_IB_FRONT 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_GPU_ACQ") != nullptr ? "#define DG_MEGA_MOE_IB_GPU_ACQ 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_PULL_META_EARLY") != nullptr ? "#define DG_MEGA_MOE_PULL_META_EARLY 1\n" : "") +
         (std::getenv("DG_MEGA_MOE_L2_PREFETCH") != nullptr ? std::format("#define DG_MEGA_MOE_L2_PREFETCH {}\n", std::getenv("DG_MEGA_MOE_L2_PREFETCH")) : std::string()) +
         std::string(std::getenv("DG_MEGA_MOE_IB_FWD_DYN") != nullptr ? "#define DG_MEGA_MOE_IB_FWD_DYN 1\n" : "") +
         (std::getenv("DG_MEGA_MOE_IB_RETGROUPS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_RETGROUPS {}\n", std::getenv("DG_MEGA_MOE_IB_RETGROUPS")) : std::string()) +

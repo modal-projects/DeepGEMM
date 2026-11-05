@@ -1216,6 +1216,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ib_sf_pre[i] = j < kHidden / 128 ? ptx::ld_volatile(sf_src + j) : 0u;
                 }
             }
+            // DG_MEGA_MOE_PULL_META_EARLY=1: the row's top-k weight and (for NVLink-local rows) its SF are loaded here, before
+            // the row data, so their NVLink round trips overlap the data copy (pull phase trace on B300: weight + SF ~4.2 us
+            // of ~9.5 us per row, issued serially after the data). Remote weights were polled by the proxy before the counts.
+#if defined(DG_MEGA_MOE_PULL_META_EARLY) and DG_MEGA_MOE_PULL_META_EARLY
+            constexpr bool kMetaEarly = true;
+#else
+            constexpr bool kMetaEarly = false;
+#endif
+            float ib_w_pre = 0.f;
+            if constexpr (kMetaEarly) {
+                ib_w_pre = ib_rem ?
+                    *sym_buffer.map(reinterpret_cast<const float*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy) :
+                    *sym_buffer.map(buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
+                if (not ib_rem) {
+                    const auto sf_src = sym_buffer.map(buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(), current_rank_in_expert_idx);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kIBSFIters; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        ib_sf_pre[i] = j < kHidden / 128 ? sf_src[j] : 0u;
+                    }
+                }
+            }
             if (ib_rem) {
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
@@ -1315,7 +1337,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Load the weight first, so that its remote latency overlaps with the SF copy below
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // (proxied weights were polled by the proxy before it published the counts)
-            const auto weight = ib_rem ?
+            const auto weight = kMetaEarly ? ib_w_pre : ib_rem ?
                 *sym_buffer.map(reinterpret_cast<const float*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy) :
                 *sym_buffer.map(buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
 #else
@@ -1346,7 +1368,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t j = i * 32 + lane_idx;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (j < kNumSFUint32) {
-                    uint32_t sf = ib_rem ? (kIBPullWhole ? ib_sf_pre[i] : ptx::ld_volatile(remote_sf_ptr + j)) : remote_sf_ptr[j];
+                    uint32_t sf = ib_rem ? (kIBPullWhole ? ib_sf_pre[i] : ptx::ld_volatile(remote_sf_ptr + j)) : (kMetaEarly ? ib_sf_pre[i] : remote_sf_ptr[j]);
                     IB_POLL(ib_rem and sf == 0xffffffffu, sf = ptx::ld_volatile(remote_sf_ptr + j), "pull_sf", current_rank_in_expert_idx, src_token_idx);
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf;
                 }

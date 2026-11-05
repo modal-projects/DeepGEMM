@@ -2444,7 +2444,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             *hdr = ~0ull;
         }
 #endif
-#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         IB_TRACE(9, sm_idx == 0 and epilogue_thread_idx == 0);
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;

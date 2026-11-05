@@ -135,6 +135,7 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint32_t ib_o_nt[kIBOMaxNodes];
     alignas(128) uint32_t ib_o_fchunk[2][kIBOMaxNodes][kIBOMaxChunks];
     alignas(128) uint32_t ib_o_fdone[2][kIBOMaxNodes];
+    alignas(128) uint32_t ib_o_fitem[2][kIBOMaxNodes];  // DG_MEGA_MOE_IB_FWD_DYN: next forward-combine item to claim
     alignas(128) uint64_t ib_o_meta_posted;
     alignas(128) uint64_t ib_o_scratch;  // Gin warm-up target (never read)
 };

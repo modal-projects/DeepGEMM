@@ -488,7 +488,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     IB_TRACE(16, sm_idx == 0 and thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-    if (sm_idx == 0 and thread_idx == 0) { workspace.signals->ib_trace[10] = 0; workspace.signals->ib_trace[11] = 0; }
+    if (sm_idx == 0 and thread_idx == 0) { workspace.signals->ib_trace[10] = 0; workspace.signals->ib_trace[11] = 0; workspace.signals->ib_trace[37] = 0; }
 #endif
 
     // Task scheduler
@@ -559,7 +559,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBReduceOnArrival = true;
 #endif
-    const auto ib_forward_combine = [&](const uint32_t& global_warp, const uint32_t& num_global_warps, const bool& is_leader) {
+    // DG_MEGA_MOE_IB_FWD_DYN=1: forward-combine items are claimed from a per-(parity, node) counter instead of a static
+    // stride, and the epilogue warps join after their last L2 task (they otherwise idle at the dispatch/epilogue barrier
+    // while the dispatch warps finish the reduce; ceiling trace: the reduce ends ~35 us after the slowest rank's L2 @1024)
+#if defined(DG_MEGA_MOE_IB_FWD_DYN) and DG_MEGA_MOE_IB_FWD_DYN
+    constexpr bool kIBFwdDyn = true;
+#else
+    constexpr bool kIBFwdDyn = false;
+#endif
+    const auto ib_forward_combine = [&](const uint32_t& global_warp, const uint32_t& num_global_warps, const bool& is_leader,
+                                        const bool& is_epilogue = false) {
         const auto fwd_grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
             const uint32_t n = ib_node_of_slot(nr);
@@ -583,7 +592,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             DG_STATIC_ASSERT(kPieces * 32 * 16 == kHidden * 2 and kPPI * kSplit == kPieces, "IB forward piece");
             constexpr uint32_t kXUnitsPerItem = kIBTokBytes / 16 / kSplit;
             DG_STATIC_ASSERT(kXUnitsPerItem * 16 * kSplit == kIBTokBytes, "IB forward x split");
-            for (uint32_t item = global_warp; item < nt * kSplit; item += num_global_warps) {
+            const auto claim = [&]() {
+                uint32_t v = 0;
+                if (lane_idx == 0)
+                    v = atomicAdd(&workspace.signals->ib_o_fitem[ib_parity][n], 1u);
+                return __shfl_sync(0xffffffffu, v, 0);
+            };
+            for (uint32_t item = kIBFwdDyn ? claim() : global_warp; item < nt * kSplit;
+                 item = kIBFwdDyn ? claim() : item + num_global_warps) {
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                if (is_epilogue and lane_idx == 0)
+                    atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 37), 1ull);  // items done by epilogue warps
+#endif
                 const uint32_t t = item / kSplit, qtr = item % kSplit;
                 const int e = lane_idx < kNumTopk ? static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + t * kNumTopk + lane_idx))) : -1;
                 const uint32_t r = e >= 0 ? static_cast<uint32_t>(e) / kNumExpertsPerRank : 0u;
@@ -747,8 +767,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sm_idx == 1) {
                 for (uint32_t i = thread_idx; i < layout::MegaMoESignals::kIBOMaxNodes * layout::MegaMoESignals::kIBOMaxChunks; i += kNumDispatchThreads)
                     workspace.signals->ib_o_fchunk[ib_parity ^ 1][i / layout::MegaMoESignals::kIBOMaxChunks][i % layout::MegaMoESignals::kIBOMaxChunks] = 0;
-                if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
+                if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes) {
                     workspace.signals->ib_o_fdone[ib_parity ^ 1][thread_idx] = 0;
+                    workspace.signals->ib_o_fitem[ib_parity ^ 1][thread_idx] = 0;
+                }
             }
         }
 #endif
@@ -2201,6 +2223,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
         IB_TRACE(5, sm_idx == 0 and epilogue_thread_idx == 0);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBReduceOnArrival and kIBFwdDyn)  // help the dispatch warps finish the forward-combine
+            ib_forward_combine(epilogue_warp_idx * kNumSMs + sm_idx, kNumSMs * kNumEpilogueWarps, false, true);
+#endif
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -2406,10 +2432,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu | pre_fetch=%.1f fetched=%.1f | rec_put_last=%.1f comb_start=%.1f rec_seen_last=%.1f | prev_launch_end: dispatch=%.1f epilogue=%.1f\n",
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu | pre_fetch=%.1f fetched=%.1f | rec_put_last=%.1f comb_start=%.1f rec_seen_last=%.1f | prev_launch_end: dispatch=%.1f epilogue=%.1f | fwd_items_by_epilogue=%llu\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
                    us(25), us(26), us(28), us(27), us(31),
-                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11], us(12), us(13), us(14), us(15), us(21), t[35] / 1e3, t[36] / 1e3);
+                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11], us(12), us(13), us(14), us(15), us(21), t[35] / 1e3, t[36] / 1e3, (unsigned long long) t[37]);
         }
 #endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)

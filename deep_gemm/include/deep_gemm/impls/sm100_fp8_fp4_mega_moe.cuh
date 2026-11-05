@@ -421,6 +421,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
     IB_TRACE(16, sm_idx == 0 and thread_idx == 0);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+    if (sm_idx == 0 and thread_idx == 0) { workspace.signals->ib_trace[10] = 0; workspace.signals->ib_trace[11] = 0; }
+#endif
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -926,6 +929,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t b = 0; b < kBatch; ++ b)
                         if (u0 + b < kUnits) v[b] = ib_ldv4(src_base_ptr + ((u0 + b) * 32 + lane_idx) * 16);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                    // slot 10: remote rows whose FIRST load batch still saw a sentinel (row not fully landed when pulled);
+                    // slot 11: remote rows pulled (both reset by SM 0 at kernel start; the pull follows a grid barrier)
+                    if (u0 == 0) {
+                        bool miss = false;
+                        #pragma unroll
+                        for (uint32_t b = 0; b < kBatch; ++ b)
+                            if (u0 + b < kUnits) miss |= ib_is_sentinel4(v[b]);
+                        const bool any_miss = __any_sync(0xffffffffu, miss);
+                        if (lane_idx == 0) {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 11), 1ull);
+                            if (any_miss) atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 10), 1ull);
+                        }
+                    }
+#endif
                     #pragma unroll
                     for (uint32_t b = 0; b < kBatch; ++ b) {
                         if (u0 + b < kUnits) {
@@ -2274,10 +2292,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f\n",
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
                    us(25), us(26), us(28), us(27), us(31),
-                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8));
+                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11]);
         }
 #endif
     }

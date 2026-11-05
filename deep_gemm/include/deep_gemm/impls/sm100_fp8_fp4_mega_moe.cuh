@@ -156,10 +156,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // counterpart (the proxy), which publishes counts / slot entries to its NVLink peers exactly like an NVLink
     // source would; peers pull rows from the proxy's mirror over NVLink; L2 rows for remote sources go to the
     // proxy's combine buffer; the proxy reduces them and returns one record per token. Readiness = data != sentinel.
+#define IB_STAGE(st, cond) do {} while (0)  // NVLink build; the IB build redefines it below
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
     const auto& ib_dev_comm = *reinterpret_cast<const ncclDevComm_t*>(sym_buffer.gin_dev_comm);
     const auto ib_window = reinterpret_cast<ncclWindow_t>(sym_buffer.gin_window);
+#undef IB_STAGE
+#define IB_STAGE(st, cond) do { if (cond) atomicMax(reinterpret_cast<unsigned long long*>(workspace.signals->ib_sm_stage + sm_idx), \
+    static_cast<unsigned long long>((ib_epoch << 8) | (st))); } while (0)
     const uint64_t ib_epoch = ptx::ld_volatile(workspace.get_ib_epoch_ptr()) + 1;
+    IB_STAGE(1, thread_idx == 0);  // entered
     const uint32_t ib_parity = static_cast<uint32_t>(ib_epoch & 1);
     // DG_MEGA_MOE_IB_ORACLE=1 (ceiling measurement, results only valid for identical inputs every launch): nothing the
     // NIC writes is ever re-armed and, from epoch 3 on, the epoch tags are not checked, so every wait on remote data
@@ -536,12 +541,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
         // Allocate tensor memory
+        IB_STAGE(2, lane_idx == 0);  // before the TMEM allocation
         Allocator().allocate(kNumTmemCols, &shared_storage.tmem_ptr_in_smem);
+        IB_STAGE(3, lane_idx == 0);  // TMEM allocated
     }
     cute::cluster_sync();
+    IB_STAGE(4, thread_idx == 0);  // prologue + cluster sync done
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
+    IB_STAGE(5, thread_idx == 0);  // PDL dependency done
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
     if (sm_idx == 0 and thread_idx == 0) {  // previous launch's ends relative to its start (slot 16 not yet overwritten)
         workspace.signals->ib_trace[35] = workspace.signals->ib_trace[33] - workspace.signals->ib_trace[16];
@@ -996,6 +1005,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 #endif
+        IB_STAGE(6, thread_idx == 0);  // dispatch warps started
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -1025,6 +1035,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         });
 
         // Grid sync
+        IB_STAGE(7, thread_idx == 0);  // at dispatch grid sync 0
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }

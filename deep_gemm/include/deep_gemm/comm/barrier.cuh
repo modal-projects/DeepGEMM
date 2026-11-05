@@ -46,6 +46,18 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
         wait_until([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
             printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
                    sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Hang forensics: one SM per GPU dumps every CTA that is not at the grid sync yet for this launch
+            if (atomicExch(&workspace.signals->ib_stage_dumped, 1u) == 0u) {
+                const uint64_t ep = ptx::ld_volatile(workspace.get_ib_epoch_ptr()) + 1;
+                for (uint32_t s = 0; s < kNumSMs; ++ s) {
+                    const uint64_t v = ptx::ld_volatile(workspace.signals->ib_sm_stage + s);
+                    if ((v >> 8) != ep or (v & 0xffu) < 7u)
+                        printf("DeepGEMM STAGE sm=%u epoch=%llu (now %llu) stage=%llu\n", s, (unsigned long long) (v >> 8),
+                               (unsigned long long) ep, (unsigned long long) (v & 0xffu));
+                }
+            }
+#endif
         });
     }
     sync_scope();

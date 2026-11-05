@@ -107,6 +107,9 @@ struct alignas(128) MegaMoESignals {
     // DG_MEGA_MOE_IB_TRACE: 8-us histograms of the printed launch (epoch % 16 == 0) from kernel start: [0] L1 block
     // starts (tokens ready), [1] L2 block starts (first K block ready), [2] remote rows pulled, [3] local rows pulled
     alignas(128) uint32_t ib_hist[4][64];
+    // Hang forensics (IB build, always on): per CTA, atomicMax of (epoch << 8) | stage; dumped by the grid-sync timeout
+    alignas(128) uint64_t ib_sm_stage[256];
+    uint32_t ib_stage_dumped;
     alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
     alignas(128) uint64_t ib_landing_expected[kNumMaxRanks];  // local: cumulative signals expected from each source (v3a)
     alignas(128) uint32_t ib_pack_count[2][kNumMaxRanks];  // local: rows packed per peer this launch, by epoch parity (v4)

@@ -476,8 +476,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // computes the same order and reads each token's record at its position.
 #if defined(DG_MEGA_MOE_IB_WAVE_SORT) and DG_MEGA_MOE_IB_WAVE_SORT
     constexpr bool kIBWaveSort = true;
+    // Debug modes: 2 = sort + staging copy in token order (identity slots), 3 = sort only, posts from the input
+    constexpr uint32_t kIBWSMode = DG_MEGA_MOE_IB_WAVE_SORT;
 #else
     constexpr bool kIBWaveSort = false;
+    constexpr uint32_t kIBWSMode = 0;
 #endif
 #if defined(DG_MEGA_MOE_IB_STREAM_COMBINE) and DG_MEGA_MOE_IB_STREAM_COMBINE
     constexpr bool kIBStreamCombine = true;
@@ -1616,7 +1619,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         *reinterpret_cast<volatile uint32_t*>(keys + t) = k1;
                     }
                     ib_stable_sort(keys, num_tokens, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
-                        if (pos >= c0 and pos < c1) ib_inv[pos - c0] = t;
+                        if (pos >= c0 and pos < c1) ib_inv[pos - c0] = kIBWSMode >= 2 ? pos : t;
                     });
                     constexpr uint32_t kRowUnits = kIBTokBytes / 16;
                     for (uint32_t u = epilogue_thread_idx; u < (c1 - c0) * kRowUnits; u += kNumEpilogueThreads) {
@@ -1657,7 +1660,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t t0 = (piece - 1) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
-                    const auto src = kIBWaveSort and piece > 0 ? x_stage + off : ib_input_base + off;
+                    const auto src = kIBWaveSort and kIBWSMode != 3 and piece > 0 ? x_stage + off : ib_input_base + off;
                     make_gin(ctx_piece(q, q + 1)).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
                 }
@@ -1744,7 +1747,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Slot table (token -> mirror x row) and the proxy's return order; published by the count add below
                 if constexpr (kIBWaveSort) {
                     ib_stable_sort(keys1, nt, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
-                        ib_tab[kIBTabSlot + k * kIBTabT + t] = pos;
+                        ib_tab[kIBTabSlot + k * kIBTabT + t] = kIBWSMode >= 2 ? t : pos;
                     });
                 }
                 if (d1_key2) {

@@ -497,6 +497,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS
 #define DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS 0
 #endif
+    // PULL_FLAG_GATE: one warp per GPU (the last SM's last dispatch warp, which does not pull) polls the tails of the x
+    // chunks landing in its OWN mirrors (local HBM) and publishes a per-(source node, chunk) epoch word; pull warps
+    // busy-poll that word over NVLink before reading a row (then still check every sentinel). Removes the GB200 NIC
+    // slowdown caused by hundreds of warps spinning on a proxy's mirror while its NIC writes there.
+#if defined(DG_MEGA_MOE_IB_PULL_FLAG_GATE) and DG_MEGA_MOE_IB_PULL_FLAG_GATE
+    constexpr bool kIBFlagGate = true;
+#else
+    constexpr bool kIBFlagGate = false;
+#endif
     const auto ib_ws_on = [&](const uint32_t& n_tok) { return kIBWaveSort and n_tok >= DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS; };
     const auto ib_sc_on = [&](const uint32_t& n_tok) { return kIBStreamCombine and n_tok >= DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS; };
     // Tables in the (otherwise unused) ib_pool_combine_idx array, local to each GPU:
@@ -921,12 +930,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         constexpr bool kSkipLastPullWarp = kIBCombineWarp;
+        constexpr bool kFlagWarp = kIBFlagGate;
 #else
         constexpr bool kSkipLastPullWarp = false;
+        constexpr bool kFlagWarp = false;
 #endif
         constexpr uint32_t kNumPullWarps = kSkipLastPullWarp ? kNumDispatchWarps - 1 : kNumDispatchWarps;
-        constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps;
-        for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx; not (kSkipLastPullWarp and warp_idx >= kNumPullWarps); token_idx += kNumGlobalWarps) {
+        // The flag warp (last SM, last dispatch warp) has the highest global pull index, so excluding it keeps the others
+        const bool is_flag_warp = kFlagWarp and sm_idx == kNumSMs - 1 and warp_idx == kNumDispatchWarps - 1;
+        constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps - (kFlagWarp and not kSkipLastPullWarp ? 1u : 0u);
+        for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx;
+             not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -1045,6 +1059,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
                 constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = 5;
+                if constexpr (kIBFlagGate) {
+                    if (lane_idx == 0) {
+                        const auto flag = sym_buffer.map(&workspace.signals->ib_o_landed[current_rank_in_expert_idx / ib_lsa][ib_xslot / kIBChunk], ib_proxy);
+                        IB_POLL(ptx::ld_acq_sys(flag) != ib_epoch, (void) 0, "pull_flag", current_rank_in_expert_idx, ib_xslot);
+                    }
+                    __syncwarp();
+                }
 #if defined(DG_MEGA_MOE_IB_PULL_GATE) and DG_MEGA_MOE_IB_PULL_GATE
                 // Gate: one lane polls the row's last 16 bytes with a pause before the warp reads the row (hundreds of
                 // warps spinning on the proxy's HBM while its NIC writes there slows the NIC down, ms-scale on GB200)
@@ -1175,6 +1196,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if (is_flag_warp) {
+            // Lane l owns chunks l and l + 32 of every remote node; a chunk is published when its last row's last 16
+            // bytes landed (the last row is known once the mirror header landed; before that only full chunks qualify)
+            DG_STATIC_ASSERT(layout::MegaMoESignals::kIBOMaxChunks == 64, "IB flag gate chunks");
+            uint32_t done = 0;  // bit nr * 2 + j
+            const uint32_t num_remote_nodes = ib_num_nodes - 1;
+            const uint32_t all_bits = num_remote_nodes >= 16 ? 0xffffffffu : (1u << (2 * num_remote_nodes)) - 1u;
+            IB_POLL(__any_sync(0xffffffffu, done != all_bits), ([&]() {
+                for (uint32_t nr = 0; nr < num_remote_nodes; ++ nr) {
+                    const uint32_t n = ib_node_of_slot(nr);
+                    const auto mir = ib_mirror(ib_parity, n);
+                    const uint64_t h = ptx::ld_volatile(reinterpret_cast<const uint64_t*>(mir + kIBOffHdr));
+                    const bool known = (h >> 32) == (ib_epoch & 0xffffffffull);
+                    const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 2; ++ j) {
+                        const uint32_t bit = 1u << (nr * 2 + j), c = lane_idx + 32 * j;
+                        if (done & bit) continue;
+                        if (known and c * kIBChunk >= nt) { done |= bit; continue; }
+                        const uint32_t last_row = known ? cute::min(c * kIBChunk + kIBChunk, nt) - 1 : c * kIBChunk + kIBChunk - 1;
+                        if (last_row >= kIBT) { if (known) done |= bit; continue; }
+                        if (not ib_is_sentinel4(ib_ldv4(mir + static_cast<int64_t>(last_row) * kIBTokBytes + kIBTokBytes - 16))) {
+                            ptx::st_rel_sys(&workspace.signals->ib_o_landed[n][c], ib_epoch);
+                            done |= bit;
+                        }
+                    }
+                }
+            })(), "flag_pub", done, all_bits);
+        }
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
         if constexpr (kIBReduceOnArrival) {
             // The dispatch warps are idle until the cleanup: reduce forwarded tokens as their partials land

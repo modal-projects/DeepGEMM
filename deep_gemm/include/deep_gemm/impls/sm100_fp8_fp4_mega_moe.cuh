@@ -647,6 +647,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kXUnitsPerItem = kIBTokBytes / 16 / kSplit;
             DG_STATIC_ASSERT(kXUnitsPerItem * 16 * kSplit == kIBTokBytes, "IB forward x split");
             const uint32_t k_s = ib_k_of_rank(s);
+            if (kIBWaveSort or kIBStreamCombine)
+                IB_POLL(ptx::ld_acq_sys(&workspace.signals->ib_o_order_ready[k_s]) != ib_epoch, (void) 0, "fwd_order_ready", k_s, 0);
             const auto claim = [&](const uint32_t& prev) {
                 if constexpr (not kIBCombineWarp) {
                     return prev + num_global_warps;
@@ -939,6 +941,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // The flag warp (last SM, last dispatch warp) has the highest global pull index, so excluding it keeps the others
         const bool is_flag_warp = kFlagWarp and sm_idx == kNumSMs - 1 and warp_idx == kNumDispatchWarps - 1;
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps - (kFlagWarp and not kSkipLastPullWarp ? 1u : 0u);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        uint64_t ib_order_seen = 0;  // remote sources whose order tables our D1 has published (bit k)
+#endif
         for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx;
              not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
@@ -1050,6 +1055,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t ib_proxy = ib_rem ? ib_cp(current_rank_in_expert_idx, ib_my_node) : current_rank_in_expert_idx;
             const auto ib_mir = ib_mirror(ib_parity, current_rank_in_expert_idx / ib_lsa);
             // WAVE_SORT: the source's x rows sit in the mirror in wave order (slot table built by our D1 scan)
+            if (kIBWaveSort and ib_rem) {
+                const uint32_t k_r = ib_k_of_rank(current_rank_in_expert_idx);
+                if (not ((ib_order_seen >> k_r) & 1ull)) {
+                    IB_POLL(ptx::ld_acq_sys(&workspace.signals->ib_o_order_ready[k_r]) != ib_epoch, (void) 0, "order_ready", k_r, 0);
+                    ib_order_seen |= 1ull << k_r;
+                }
+            }
             const uint32_t ib_xslot = kIBWaveSort and ib_rem ?
                 ib_tab[kIBTabSlot + ib_k_of_rank(current_rank_in_expert_idx) * kIBTabT + src_token_idx] : src_token_idx;
             const auto src_base_ptr = ib_rem ?
@@ -1858,20 +1870,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-                // Slot table (token -> mirror x row) and the proxy's return order; published by the count add below
-                if (d1_key1) {
-                    ib_stable_sort(keys1, nt, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
-                        ib_tab[kIBTabSlot + k * kIBTabT + t] = kIBWSMode >= 2 ? t : pos;
-                    });
-                } else if (kIBWaveSort) {
-                    for (uint32_t t = epilogue_thread_idx; t < nt; t += kNumEpilogueThreads)
-                        ib_tab[kIBTabSlot + k * kIBTabT + t] = t;  // below the size gate: identity (the pull reads the table)
-                }
-                if (d1_key2) {
-                    ib_stable_sort(keys2, nt, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
-                        ib_tab[kIBTabPerm2 + ib_nr_of_node(r / ib_lsa) * kIBTabT + pos] = t;
-                    });
-                }
                 for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
                     *workspace.get_expert_recv_count_ptr(r, i) = cnt[i];
                     __threadfence();
@@ -1880,6 +1878,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 IB_TRACE(19, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
+                // Overlap orders, after the count publish (off the count critical path): slot table (token -> mirror
+                // x row) and the proxy's return order, then an epoch flag the pulls / forward-combine acquire
+                if constexpr (kIBWaveSort or kIBStreamCombine) {
+                    if (d1_key1) {
+                        ib_stable_sort(keys1, nt, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
+                            ib_tab[kIBTabSlot + k * kIBTabT + t] = kIBWSMode >= 2 ? t : pos;
+                        });
+                    } else if (kIBWaveSort) {
+                        for (uint32_t t = epilogue_thread_idx; t < nt; t += kNumEpilogueThreads)
+                            ib_tab[kIBTabSlot + k * kIBTabT + t] = t;  // below the size gate: identity (the pull reads the table)
+                    }
+                    if (d1_key2) {
+                        ib_stable_sort(keys2, nt, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
+                            ib_tab[kIBTabPerm2 + ib_nr_of_node(r / ib_lsa) * kIBTabT + pos] = t;
+                        });
+                    }
+                    __threadfence();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_thread_idx == 0)
+                        ptx::st_rel_sys(&workspace.signals->ib_o_order_ready[k], ib_epoch);
+                }
             }
         }
 #endif

@@ -87,6 +87,19 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
 #endif
     st->dev_comm_host = malloc(dev_comm_size);
     CHECK_NCCL(ncclDevCommCreate(st->comm, &reqs, static_cast<ncclDevComm_t*>(st->dev_comm_host)));
+    {
+        // ginContextCount is a hint: report what the devcomm actually holds. Device-side, context index i maps to
+        // connection i % ginConnectionCount and context i / ginConnectionCount with no bound check, so an index beyond
+        // ginContextCount * ginConnectionCount reads past the context arrays.
+        const auto* dc = static_cast<const ncclDevComm_t*>(st->dev_comm_host);
+        const int64_t have = static_cast<int64_t>(dc->ginContextCount) * static_cast<int64_t>(dc->ginConnectionCount);
+        if (rank == 0)
+            printf("DG_IB_GIN requested_contexts=%lld exclusive=%d devcomm.ginContextCount=%u ginConnectionCount=%u usable_indices=%lld\n",
+                   (long long) num_contexts, (int) exclusive, dc->ginContextCount, (unsigned) dc->ginConnectionCount, (long long) have);
+        TORCH_CHECK(exclusive == 0 or have >= num_contexts, "NCCL Gin granted ", have, " context indices (ginContextCount ",
+                    dc->ginContextCount, " x connections ", (int) dc->ginConnectionCount, "), fewer than the ", num_contexts,
+                    " requested with exclusive contexts");
+    }
     CHECK_CUDA(cudaMalloc(&st->dev_comm_dev, dev_comm_size));
     CHECK_CUDA(cudaMemcpy(st->dev_comm_dev, st->dev_comm_host, dev_comm_size, cudaMemcpyHostToDevice));
     }

@@ -14,6 +14,13 @@ namespace deep_gemm::comm {
 #ifndef DG_MEGA_MOE_IB_CONTEXTS
 #define DG_MEGA_MOE_IB_CONTEXTS 4
 #endif
+// 0: NCCL_GIN_RESOURCE_SHARING_GPU (contexts shared by any thread: global atomic slot reservation, CAS publish, lock +
+// atomic max per put, ~3-4 us of issue per put on CPU-proxy hosts). 2: NCCL_GIN_RESOURCE_SHARING_THREAD with exclusive
+// contexts (one issuing thread per context at a time; ~0.9 us per put; the caller guarantees exclusivity and that the
+// index is < DG_MEGA_MOE_IB_CONTEXTS, so no modulo).
+#ifndef DG_MEGA_MOE_IB_SHARING
+#define DG_MEGA_MOE_IB_SHARING 0
+#endif
 
 struct GinIB {
     ncclGin gin;
@@ -23,7 +30,8 @@ struct GinIB {
 
     __device__ __forceinline__
     GinIB(const ncclDevComm_t& dev_comm, const ncclWindow_t& window, const int64_t& base, const uint32_t& context_idx):
-        gin(dev_comm, static_cast<int>(context_idx % DG_MEGA_MOE_IB_CONTEXTS), NCCL_GIN_RESOURCE_SHARING_GPU),
+        gin(dev_comm, static_cast<int>(DG_MEGA_MOE_IB_SHARING == 2 ? context_idx : context_idx % DG_MEGA_MOE_IB_CONTEXTS),
+            static_cast<ncclGinResourceSharingMode>(DG_MEGA_MOE_IB_SHARING)),
         world(ncclTeamWorld(dev_comm)), window(window), base(base) {}
 
     template <typename ptr_t>

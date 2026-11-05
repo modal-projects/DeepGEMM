@@ -13,6 +13,13 @@ import torch.distributed as dist
 
 _ext = None
 IB_MAGIC = 0x1B1B1B1B1B1B1B1B
+# DG_MEGA_MOE_IB_SHARING=2: exclusive THREAD-mode Gin contexts (one issuer per context; see comm/gin.cuh). The kernel
+# needs R * (4 + 2 * ceil(max_tokens / 32)) contexts (R = remote nodes): 72 covers EP16 <= 1024 tok and EP32 <= 256 tok.
+# A deep send queue keeps a put from ever polling the CQ for a free slot. Both are read by NCCL / the JIT later.
+SHARING = int(os.environ.get('DG_MEGA_MOE_IB_SHARING', '0'))
+if SHARING == 2:
+    os.environ.setdefault('DG_MEGA_MOE_IB_CONTEXTS', '72')
+    os.environ.setdefault('NCCL_GIN_GDAKI_QP_DEPTH', '1024')
 NUM_GIN_CONTEXTS = int(os.environ.get('DG_MEGA_MOE_IB_CONTEXTS', '4'))
 
 _CPP = r'''
@@ -44,7 +51,7 @@ std::vector<int64_t> nccl_unique_id() {
 // Returns (state handle, buffer ptr, per-rank LSA ptrs (0 for other nodes), dev_comm device ptr, window, lsa nranks)
 std::tuple<int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t, int64_t>
 create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num_bytes, int64_t num_contexts, int64_t gin_type,
-       int64_t virtual_lsa) {
+       int64_t virtual_lsa, int64_t exclusive) {
     auto* st = new IBState();
     ncclUniqueId id;
     for (size_t i = 0; i < sizeof(id); ++ i) id.internal[i] = static_cast<char>(uid[i]);
@@ -69,7 +76,7 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     // 0 = any backend NCCL can set up (GDAKI needs host driver PeerMappingOverride; PROXY=2 works without)
     reqs.ginType = static_cast<ncclGinType_t>(gin_type);
     reqs.ginContextCount = static_cast<int>(num_contexts);
-    reqs.ginExclusiveContexts = false;
+    reqs.ginExclusiveContexts = exclusive != 0;
     reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     reqs.ginSignalCount = 4;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
@@ -159,7 +166,7 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
     gin_type = int(os.environ.get('DG_MEGA_MOE_IB_GIN_TYPE', '0'))  # 0 any, 2 proxy, 3 GDAKI, 5 EFA GDA
     virtual_lsa = int(os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0'))
     state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS, gin_type,
-                                                                 virtual_lsa)
+                                                                 virtual_lsa, 1 if SHARING == 2 else 0)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
     # DG_MEGA_MOE_IB_FORCE=1: compile the IB kernel even when all ranks share one NVLink domain (compile and
     # local-path checks on single-node clusters; Gin paths are never taken since every rank is load/store-reachable)

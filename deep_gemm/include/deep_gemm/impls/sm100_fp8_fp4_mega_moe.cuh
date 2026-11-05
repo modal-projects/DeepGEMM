@@ -185,6 +185,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kIBNodeStride = 2 * kIBMirrorStride + 2 * kIBRetStride + kIBPCombStride + kIBFStageStride + kIBPTabStride;
     constexpr uint32_t kIBChunk = 32;  // tokens per dispatch x put and per return put
     DG_STATIC_ASSERT(kIBT <= kIBChunk * layout::MegaMoESignals::kIBOMaxChunks, "IB chunk table");
+    // Gin context assignment. DG_MEGA_MOE_IB_SHARING == 2 (exclusive THREAD contexts): every concurrent issuer gets its
+    // own context, which works because each piece / chunk is posted exactly once per launch by exactly one thread.
+    // Layout over R = remote nodes, M = chunks per node: [meta R][meta header R][x/SF pieces R*(1+M)][combine chunks R*M]
+    // [return header R] = R * (4 + 2M) contexts. Otherwise the original (shared, modulo) indices.
+    constexpr bool kIBThreadCtx = DG_MEGA_MOE_IB_SHARING == 2;
+    constexpr uint32_t kIBM = (kIBT + kIBChunk - 1) / kIBChunk;
+    const uint32_t ib_R = ib_num_nodes - 1;
+    const auto ctx_meta = [&](const uint32_t& nr, const uint32_t& orig) { return kIBThreadCtx ? nr : orig; };
+    const auto ctx_mhdr = [&](const uint32_t& nr, const uint32_t& orig) { return kIBThreadCtx ? ib_R + nr : orig; };
+    const auto ctx_piece = [&](const uint32_t& q, const uint32_t& orig) { return kIBThreadCtx ? 2 * ib_R + q : orig; };
+    const auto ctx_chunk = [&](const uint32_t& nr, const uint32_t& c, const uint32_t& orig) {
+        return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + nr * kIBM + c : orig; };
+    const auto ctx_rhdr = [&](const uint32_t& nr, const uint32_t& orig) {
+        return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + ib_R * kIBM + nr : orig; };
+    if (kIBThreadCtx and ib_R * (4 + 2 * kIBM) > DG_MEGA_MOE_IB_CONTEXTS) {
+        if (blockIdx.x == 0 and threadIdx.x == 0)
+            printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING=2 needs %u Gin contexts (R=%u, M=%u), have %d\n",
+                   ib_R * (4 + 2 * kIBM), ib_R, kIBM, DG_MEGA_MOE_IB_CONTEXTS);
+        __trap();
+    }
     const auto ib_tail = math::advance_ptr<uint8_t>(sym_buffer.get_base_ptr(), math::align<int64_t>(buffer.get_num_bytes(), 128));
     const auto ib_mirror = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + p * kIBMirrorStride; };
     const auto ib_ret = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + p * kIBRetStride; };
@@ -449,7 +469,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto ret_dst = ib_ret(ib_parity, ib_my_node);
             if (nt == 0) {
                 if (is_leader)
-                    make_gin(nr).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                    make_gin(ctx_rhdr(nr, nr)).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
                 continue;
             }
             const auto mir = ib_mirror(ib_parity, n);
@@ -568,10 +588,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 state = __shfl_sync(0xffffffffu, state, 0);
                 if (state > 0 and lane_idx == 0) {
                     const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
-                    make_gin(c + nr).put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                    make_gin(ctx_chunk(nr, c, c + nr)).put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
                 }
                 if (state == 2 and lane_idx == 1)
-                    make_gin(c + nr + 1).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                    make_gin(ctx_rhdr(nr, c + nr + 1)).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
                 __syncwarp();
             }
         }
@@ -1368,7 +1388,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
             if (epilogue_warp_idx == 0 and lane_idx % 16 + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx % 16, n = ib_node_of_slot(nr);
-                const auto gin = make_gin(nr + (lane_idx / 16) * 2);
+                const auto gin = make_gin(lane_idx < 16 ? ctx_meta(nr, nr) : ctx_mhdr(nr, nr + 2));
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
                 if (lane_idx < 16)
                     gin.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(kIBT * kNumTopk * 12), ib_cp(sym_buffer.rank_idx, n));
@@ -1409,7 +1429,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);
-                make_gin(lane_idx).put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
+                make_gin(ctx_meta(lane_idx, lane_idx)).put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
                                        static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
             }
             __syncwarp();
@@ -1442,7 +1462,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t t0 = (piece - 1) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
-                    make_gin(q + 1).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
+                    make_gin(ctx_piece(q, q + 1)).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
                 }
                 __syncwarp();

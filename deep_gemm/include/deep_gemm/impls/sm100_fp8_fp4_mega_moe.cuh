@@ -810,8 +810,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         // Wait token data arrival
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        IB_TRACE_MAX(12, thread_idx == 0);  // dispatch warps reach the count wait, slowest SM
+#endif
         scheduler.fetch_expert_recv_count();
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        IB_TRACE_MAX(13, thread_idx == 0);  // all counts seen (before the system fence), slowest SM
         __threadfence_system();  // acquire: pairs with the proxy's fence before its count add (entries, per-source counts)
         IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(28, thread_idx == 0);  // counts, slowest SM
@@ -2346,10 +2350,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu\n",
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu | pre_fetch=%.1f fetched=%.1f\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
                    us(25), us(26), us(28), us(27), us(31),
-                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11]);
+                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11], us(12), us(13));
         }
 #endif
     }

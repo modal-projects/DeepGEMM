@@ -1153,16 +1153,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // rotation every block waited for the slowest scan (GB200 MegaSeek trace: pulls saw counts ~35 us after publish)
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_PULL_SKIP_SCAN) and DG_MEGA_MOE_IB_PULL_SKIP_SCAN
         DG_STATIC_ASSERT(not kFlagWarp, "PULL_SKIP_SCAN excludes the flag gate (its warp is on a scan SM)");
+        // The FRONT meta SM (SM 0) is excluded too: its epilogue stages the meta and, with SENDER_TABLES, builds the tables
+        // before reaching the same barrier (B300 int15: +16 us at 128 with SENDER_TABLES when SM 0 still pulled)
+        const uint32_t ib_pull_sm0 = kIBFront ? 1u : 0u;
         const uint32_t ib_pull_sms = kNumSMs - (kNumRanks - sym_buffer.num_lsa_ranks);
 #else
+        const uint32_t ib_pull_sm0 = 0;
         const uint32_t ib_pull_sms = kNumSMs;
 #endif
-        const uint32_t kNumGlobalWarps = ib_pull_sms == kNumSMs ? kNumGlobalWarpsAll : ib_pull_sms * kNumPullWarps;
+        const uint32_t kNumGlobalWarps = ib_pull_sms == kNumSMs and ib_pull_sm0 == 0 ? kNumGlobalWarpsAll : (ib_pull_sms - ib_pull_sm0) * kNumPullWarps;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         uint64_t ib_order_seen = 0;  // remote sources whose order tables our D1 has published (bit k)
 #endif
-        for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx;
-             sm_idx < ib_pull_sms and not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
+        for (uint32_t token_idx = (sm_idx - ib_pull_sm0) * kNumPullWarps + warp_idx;
+             sm_idx >= ib_pull_sm0 and sm_idx < ib_pull_sms and not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {

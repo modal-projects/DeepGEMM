@@ -1479,7 +1479,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_thread_idx == 0)
-                ptx::st_rel_sys(&workspace.signals->ib_o_meta_posted, ib_epoch);
+                ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
         } else if (sm_idx == kNumSMs - 1) {
             const auto stg = ib_mirror(ib_parity, ib_my_node);
             const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);
@@ -1516,7 +1516,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
             // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire
             if (epilogue_thread_idx == 0)
-                ptx::st_rel_sys(&workspace.signals->ib_o_meta_posted, ib_epoch);
+                ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
         }
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
         if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
@@ -1534,7 +1534,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
                     constexpr bool kMetaFirst = false;  // measured harmful with the host scan (GB200: ms-scale stalls)
 #endif
-                    while (kMetaFirst and ptx::ld_acq_sys(&workspace.signals->ib_o_meta_posted) < ib_epoch);
+                    while (kMetaFirst and ptx::ld_acq_gpu(&workspace.signals->ib_o_meta_posted) < ib_epoch);
                     const uint32_t n = ib_node_of_slot(q / num_pieces), piece = q % num_pieces;
                     int64_t off = 0, bytes = 0;
                     if (piece == 0) {

@@ -632,10 +632,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 state = __shfl_sync(0xffffffffu, state, 0);
                 if (state > 0 and lane_idx == 0) {
                     const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
-                    make_gin_site(8, ctx_chunk(nr, c, c + nr), c + nr, ib_xbase).put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                    const auto g = make_gin_site(8, ctx_chunk(nr, c, c + nr), c + nr, ib_xbase);
+                    g.put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+#if defined(DG_MEGA_MOE_IB_RET_DB) and DG_MEGA_MOE_IB_RET_DB
+                    // Late-tail doorbell: the last op on a context can sit unprocessed until the next op on it, so each
+                    // record chunk is followed by an 8 B put of the (idempotent) return header on the same context
+                    g.put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+#endif
                 }
                 if (state == 2 and lane_idx == 1)
                     make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+#if defined(DG_MEGA_MOE_IB_RET_DB) and DG_MEGA_MOE_IB_RET_DB
+                if (state == 2 and lane_idx == 1)  // doorbell for the header itself
+                    make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+#endif
                 __syncwarp();
             }
         }

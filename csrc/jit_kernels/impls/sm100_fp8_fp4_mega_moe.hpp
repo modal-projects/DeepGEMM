@@ -167,6 +167,7 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_SPLIT_SCAN") != nullptr ? "#define DG_MEGA_MOE_IB_SPLIT_SCAN 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_COUNTS_IN_META") != nullptr ? "#define DG_MEGA_MOE_IB_COUNTS_IN_META 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_SENDER_TABLES") != nullptr ? "#define DG_MEGA_MOE_IB_SENDER_TABLES 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_PULL_SKIP_SCAN") != nullptr ? "#define DG_MEGA_MOE_IB_PULL_SKIP_SCAN 1\n" : "") +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_SCAN_BATCH") != nullptr ? std::format("#define DG_MEGA_MOE_IB_SCAN_BATCH {}\n", std::getenv("DG_MEGA_MOE_IB_SCAN_BATCH")) : std::string()) +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_XDELAY_NS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_XDELAY_NS {}\n", std::getenv("DG_MEGA_MOE_IB_XDELAY_NS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_L2_PREFETCH") != nullptr ? std::format("#define DG_MEGA_MOE_L2_PREFETCH {}\n", std::getenv("DG_MEGA_MOE_L2_PREFETCH")) : std::string()) +

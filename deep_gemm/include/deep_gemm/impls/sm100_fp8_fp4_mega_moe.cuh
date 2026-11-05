@@ -1147,12 +1147,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kNumPullWarps = kSkipLastPullWarp ? kNumDispatchWarps - 1 : kNumDispatchWarps;
         // The flag warp (last SM, last dispatch warp) has the highest global pull index, so excluding it keeps the others
         const bool is_flag_warp = kFlagWarp and sm_idx == kNumSMs - 1 and warp_idx == kNumDispatchWarps - 1;
-        constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps - (kFlagWarp and not kSkipLastPullWarp ? 1u : 0u);
+        constexpr uint32_t kNumGlobalWarpsAll = kNumSMs * kNumPullWarps - (kFlagWarp and not kSkipLastPullWarp ? 1u : 0u);
+        // DG_MEGA_MOE_IB_PULL_SKIP_SCAN=1: the SMs running the D1 scan (the last kNumRanks - lsa) take no pull work. Their
+        // dispatch warps only start pulling after their epilogue finishes D1 (the barrier above), so with them in the
+        // rotation every block waited for the slowest scan (GB200 MegaSeek trace: pulls saw counts ~35 us after publish)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_PULL_SKIP_SCAN) and DG_MEGA_MOE_IB_PULL_SKIP_SCAN
+        DG_STATIC_ASSERT(not kFlagWarp, "PULL_SKIP_SCAN excludes the flag gate (its warp is on a scan SM)");
+        const uint32_t ib_pull_sms = kNumSMs - (kNumRanks - sym_buffer.num_lsa_ranks);
+#else
+        const uint32_t ib_pull_sms = kNumSMs;
+#endif
+        const uint32_t kNumGlobalWarps = ib_pull_sms == kNumSMs ? kNumGlobalWarpsAll : ib_pull_sms * kNumPullWarps;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         uint64_t ib_order_seen = 0;  // remote sources whose order tables our D1 has published (bit k)
 #endif
         for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx;
-             not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
+             sm_idx < ib_pull_sms and not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -2094,7 +2104,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (g / cim_node_experts != ib_my_node)
                         reinterpret_cast<uint32_t*>(stg + kIBOffCnt)[g] = cim_cnt[g];
             }
+            if (epilogue_thread_idx == 0)
+                *reinterpret_cast<uint64_t*>(stg + kIBOffHdr) = (ib_epoch << 32) | num_tokens;
+            __threadfence();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            IB_TRACE(24, epilogue_thread_idx == 0);
+            if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+                const uint32_t n = ib_node_of_slot(lane_idx);
+                const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
+                gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
+                          static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
+                if constexpr (kIBCountsInMeta) {
+                    const uint64_t cb = static_cast<uint64_t>(cim_node_experts) * 4;
+                    gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffCnt, stg + kIBOffCnt + static_cast<int64_t>(n) * static_cast<int64_t>(cb),
+                              cb, ib_cp(sym_buffer.rank_idx, n));
+                }
+                if (kIBHdrCtx)  // doorbell (see the full-batch branch): identical header value, pushes the meta put through
+                    gin_m.put_value(reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens,
+                                    ib_cp(sym_buffer.rank_idx, n));
+            }
+            __syncwarp();
             if constexpr (kIBSenderTables) {
+                // Built AFTER the meta + counts are posted (the build cost ~30 us of meta latency when it came first)
                 // Exclusive prefix over remote experts in global order (our node's experts count 0): each thread owns a
                 // contiguous run of experts, warp inclusive sums, then warp bases
                 auto st_cur = cim_cnt;  // in place: each thread reads its counts before overwriting them with cursors
@@ -2142,33 +2173,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         st_tab[atomicAdd_block(st_cur + e, 1u)] = i;
                 }
             }
-            if (epilogue_thread_idx == 0)
-                *reinterpret_cast<uint64_t*>(stg + kIBOffHdr) = (ib_epoch << 32) | num_tokens;
-            __threadfence();
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-            IB_TRACE(24, epilogue_thread_idx == 0);
-            if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
-                const uint32_t n = ib_node_of_slot(lane_idx);
-                const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
-                gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
-                          static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
-                if constexpr (kIBCountsInMeta) {
-                    const uint64_t cb = static_cast<uint64_t>(cim_node_experts) * 4;
-                    gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffCnt, stg + kIBOffCnt + static_cast<int64_t>(n) * static_cast<int64_t>(cb),
-                              cb, ib_cp(sym_buffer.rank_idx, n));
-                }
-                if constexpr (kIBSenderTables) {
+            if constexpr (kIBSenderTables) {
+                __threadfence();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+                    const uint32_t n = ib_node_of_slot(lane_idx);
+                    const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
                     const auto st_nstart = reinterpret_cast<const uint32_t*>(stg + kIBOffHdr + 16) + kNumEpilogueWarps;
                     const uint32_t a = st_nstart[n], b = st_nstart[n + 1];
                     if (b > a)
                         gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab, stg + kIBOffSTab + static_cast<int64_t>(a) * 4,
                                   static_cast<uint64_t>(b - a) * 4, ib_cp(sym_buffer.rank_idx, n));
-                }
-                if (kIBHdrCtx)  // doorbell (see the full-batch branch): identical header value, pushes the meta put through
                     gin_m.put_value(reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens,
-                                    ib_cp(sym_buffer.rank_idx, n));
+                                    ib_cp(sym_buffer.rank_idx, n));  // doorbell for the table put (identical header value)
+                }
+                __syncwarp();
             }
-            __syncwarp();
             // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire
             if (epilogue_thread_idx == 0 and (kIBMetaFirstAll or not kIBFront))
                 { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_o_meta_posted_t = t_; }

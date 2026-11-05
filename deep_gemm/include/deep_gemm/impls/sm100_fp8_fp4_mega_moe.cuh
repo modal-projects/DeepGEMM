@@ -135,8 +135,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto workspace = buffer.workspace;
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
 #define IB_TRACE(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_trace[i] = t_; } } while (0)
+// max over every SM that reaches the point (absolute %globaltimer, so no per-launch reset is needed)
+#define IB_TRACE_MAX(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); atomicMax(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + (i)), static_cast<unsigned long long>(t_)); } } while (0)
 #else
 #define IB_TRACE(i, cond) do {} while (0)
+#define IB_TRACE_MAX(i, cond) do {} while (0)
 #endif
 
     // Mega MoE over IB, opus design (REDESIGN_OPUS.md): counterpart forwarding. Every cross-node byte moves between
@@ -756,6 +759,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         __threadfence_system();  // acquire: pairs with the proxy's fence before its count add (entries, per-source counts)
         IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
+        IB_TRACE_MAX(28, thread_idx == 0);  // counts, slowest SM
 #endif
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
@@ -1004,6 +1008,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
+        IB_TRACE_MAX(27, thread_idx == 0);  // pull end, slowest SM
         if constexpr (kIBReduceOnArrival) {
             // The dispatch warps are idle until the cleanup: reduce forwarded tokens as their partials land
             ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0);
@@ -1529,6 +1534,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 const uint32_t nt = *nt_smem;
                 IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
+                IB_TRACE_MAX(25, epilogue_thread_idx == 0);  // remote header seen, slowest scanning SM
                 const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
                 const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
                 auto cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
@@ -1574,6 +1580,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 IB_TRACE(19, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
+                IB_TRACE_MAX(26, epilogue_thread_idx == 0);  // scan done, slowest scanning SM
             }
         }
 #endif
@@ -2240,8 +2247,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3);
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
+                   us(25), us(26), us(28), us(27));
         }
 #endif
     }

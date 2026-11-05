@@ -149,7 +149,7 @@ static void sm100_fp8_fp4_mega_moe(
     // Compile
     const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::string(is_ib ? "#define DG_MEGA_MOE_IB 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_KEEP_REGS") != nullptr ? "#define DG_MEGA_MOE_IB_KEEP_REGS 1\n" : "") +
-        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_TRACE") != nullptr ? "#define DG_MEGA_MOE_IB_TRACE 1\n" : "") +
+        std::string(((is_ib and std::getenv("DG_MEGA_MOE_IB_TRACE") != nullptr) or (not is_ib and std::getenv("DG_MEGA_MOE_NVL_TRACE") != nullptr)) ? "#define DG_MEGA_MOE_IB_TRACE 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_BF16_COMBINE") != nullptr ? "#define DG_MEGA_MOE_IB_BF16_COMBINE 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_FLAG_REDUCE") != nullptr ? "#define DG_MEGA_MOE_IB_FLAG_REDUCE 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_NO_META_FIRST") != nullptr ? "#define DG_MEGA_MOE_IB_NO_META_FIRST 1\n" : "") +

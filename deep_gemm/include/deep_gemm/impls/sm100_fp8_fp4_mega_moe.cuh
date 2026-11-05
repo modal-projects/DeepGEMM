@@ -793,6 +793,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+        IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
 #endif
 
         // Ensure the epilogue barrier cannot run with the pull barrier
@@ -811,12 +812,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         // Wait token data arrival
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         IB_TRACE_MAX(12, thread_idx == 0);  // dispatch warps reach the count wait, slowest SM
-#endif
         scheduler.fetch_expert_recv_count();
+        IB_TRACE_MAX(13, thread_idx == 0);  // all counts seen (before the IB system fence), slowest SM
+#if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
+        IB_TRACE_MAX(28, thread_idx == 0);  // NVLink build (DG_MEGA_MOE_NVL_TRACE): counts, slowest SM
+#endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        IB_TRACE_MAX(13, thread_idx == 0);  // all counts seen (before the system fence), slowest SM
         __threadfence_system();  // acquire: pairs with the proxy's fence before its count add (entries, per-source counts)
         IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(28, thread_idx == 0);  // counts, slowest SM
@@ -1094,6 +1096,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
+#if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
+        IB_TRACE_MAX(27, thread_idx == 0);  // NVLink build: pull end, slowest SM
+#endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(27, thread_idx == 0);  // pull end, slowest SM
@@ -2160,9 +2165,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         IB_TRACE_MAX(15, epilogue_thread_idx == 0);  // source: final combine loop starts, slowest SM
-#endif
         const auto grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
@@ -2359,6 +2362,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
                    us(25), us(26), us(28), us(27), us(31),
                    ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11], us(12), us(13), us(14), us(15), us(21));
+        }
+#endif
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
+        // NVLink-only build (DG_MEGA_MOE_NVL_TRACE=1): the same phase points as OPUS_TRACE, for like-for-like attribution
+        if (sm_idx == 0 and epilogue_thread_idx == 0) {
+            uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
+            auto* t = workspace.signals->ib_trace;
+            const uint64_t launch = ++ t[1];
+            const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
+            if (launch % 16 == 0)
+                printf("NVL_TRACE rank=%u launch=%llu us from kernel start: barrier=%.1f l2_done=%.1f end=%.1f | max over SMs: pre_fetch=%.1f counts=%.1f pull_end=%.1f comb_start=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) launch, us(2), us(5), ((int64_t) t_ - (int64_t) t[16]) / 1e3, us(12), us(28), us(27), us(15));
         }
 #endif
     }

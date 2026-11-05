@@ -235,7 +235,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 os.environ['DG_MEGA_MOE_IB_VIRTUAL_LSA'] = _saved
         assert nvl_ref_buffer.handle.num_lsa_ranks == num_ranks, \
             f'NVL reference needs one NVLink domain over all {num_ranks} ranks, got {nvl_ref_buffer.handle.num_lsa_ranks}'
-        nvl_ref_stats = torch.empty_like(cumulative_local_expert_recv_stats_fused)
         dist_print(f' > NVL reference buffer: one NVLink domain of {num_ranks} ranks', once_in_node=True)
 
     dist_print('Config:', once_in_node=True)
@@ -365,6 +364,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if is_legacy_loaded:
                 baseline_y, baseline_stats = run_baseline()
             else:
+                if nvl_ref_stats is None:
+                    nvl_ref_stats = torch.empty_like(cumulative_local_expert_recv_stats_fused)
                 baseline_y, baseline_stats = run_fused(nvl_ref_buffer, nvl_ref_stats)
             assert torch.equal(fused_stats, baseline_stats)
             # DG_MEGA_MOE_IB_TOLERANCE=<calc_diff bound>: the opus IB design reduces node-local partials before the

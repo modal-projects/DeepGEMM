@@ -211,7 +211,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kIBOffIdx = kIBOffSF + kIBT * kIBSFBytes;
     constexpr int64_t kIBOffW = kIBOffIdx + kIBT * kNumTopk * 8;
     constexpr int64_t kIBOffHdr = math::constexpr_align<int64_t>(kIBOffW + kIBT * kNumTopk * 4, 128);
-    constexpr int64_t kIBMirrorStride = kIBOffHdr + 128;
+    // Early counts (DG_MEGA_MOE_IB_COUNTS_EARLY), after the header: [destination node-local rank][local expert] u32,
+    // sentinel 0xffffffff. Always allocated (the host sizes the mirror the same way whatever the knobs)
+    constexpr int64_t kIBOffCnt = kIBOffHdr + 128;
+    constexpr int64_t kIBCntBytes = math::constexpr_align<int64_t>(static_cast<int64_t>(kNumExperts) * 4, 128);
+    constexpr int64_t kIBMirrorStride = kIBOffCnt + kIBCntBytes;
     // Return records (one per source token and remote node), forward staging, proxy combine buffer
     // P2: fp8 e4m3 (satfinite) + one f32 scale per 128 columns (5280 B at H = 5120); DG_MEGA_MOE_IB_BF16_COMBINE=1
     // keeps bf16 records. Allocation is sized for bf16 either way, so the layout does not depend on the mode.
@@ -287,6 +291,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kIBHdrCtx = false;
 #endif
     DG_STATIC_ASSERT(not kIBHdrCtx or DG_MEGA_MOE_IB_CONTEXTS >= 3, "DG_MEGA_MOE_IB_HDR_CTX needs >= 3 Gin contexts");
+    // DG_MEGA_MOE_IB_COUNTS_EARLY=1 (probe): SM 0's dispatch warps put this rank's per-expert send counts for each remote
+    // node (lsa x experts-per-rank u32, ~768 B) to the counterpart right after the dispatch grid sync, on the meta-header
+    // context (posted ~10 us before the meta), plus an identical second put as a doorbell. The D1 scan polls them, records
+    // when they land (trace slot 38) and checks them against its own counts (slot 39, sticky mismatch total). Nothing
+    // uses them yet: the question is only when they arrive and whether sending them delays anything else.
+#if defined(DG_MEGA_MOE_IB_COUNTS_EARLY) and DG_MEGA_MOE_IB_COUNTS_EARLY
+    constexpr bool kIBCountsEarly = true;
+#else
+    constexpr bool kIBCountsEarly = false;
+#endif
+    DG_STATIC_ASSERT(not kIBCountsEarly or (kIBHdrCtx and not kIBThreadCtx), "DG_MEGA_MOE_IB_COUNTS_EARLY needs HDR_CTX and shared contexts");
     const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
     const auto piece_orig = [&](const uint32_t& q) {
         return kIBHdrCtx ? 2 * ib_R + q % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R) : q + 1; };
@@ -993,6 +1008,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
             }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if constexpr (kIBCountsEarly) {
+                // Stage the remote-destination counts ([destination rank][local expert] u32) in our own node's mirror slot
+                // (unused locally) and put each remote node's slice to our counterpart there (same offset)
+                const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;
+                for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                    if (is_remote(i / kNumExpertsPerRank))
+                        reinterpret_cast<uint32_t*>(stg)[i] = static_cast<uint32_t>(*workspace.get_expert_send_count_ptr(i));
+                }
+                __threadfence();
+                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                if (thread_idx + 1 < ib_num_nodes) {
+                    const uint32_t nr = thread_idx, n = ib_node_of_slot(nr);
+                    const auto gin = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
+                    const uint64_t bytes = static_cast<uint64_t>(ib_lsa) * kNumExpertsPerRank * 4;
+                    const auto src = stg + static_cast<int64_t>(n) * static_cast<int64_t>(bytes);
+                    gin.put(stg, src, bytes, ib_cp(sym_buffer.rank_idx, n));
+                    gin.put(stg, src, bytes, ib_cp(sym_buffer.rank_idx, n));  // doorbell: identical bytes push the first through
+                }
+                IB_TRACE(32, thread_idx == 0);
+            }
+#endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -1534,6 +1571,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 reinterpret_cast<uint32_t*>(mir + kIBOffW)[u] = 0xffffffffu;
             if (gtid == 0)
                 *reinterpret_cast<uint64_t*>(mir + kIBOffHdr) = ~0ull;
+            if (kIBCountsEarly) {
+                for (int64_t u = gtid; u < kIBCntBytes / 4; u += kGThreads)
+                    reinterpret_cast<uint32_t*>(mir + kIBOffCnt)[u] = 0xffffffffu;
+            }
         }
         IB_TRACE(17, sm_idx == 0 and thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -2055,6 +2096,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t proxy = ib_cp(r, ib_my_node);
                 const auto mir = sym_buffer.map(ib_mirror(ib_parity, r / ib_lsa), proxy);
                 const auto hdr = reinterpret_cast<const uint64_t*>(mir + kIBOffHdr);
+                // COUNTS_EARLY probe: r's counts for our experts, in r's counterpart's mirror (our node-local rank's slice)
+                const auto cnt_early = reinterpret_cast<const uint32_t*>(mir + kIBOffCnt) + (sym_buffer.rank_idx % ib_lsa) * kNumExpertsPerRank;
+                if constexpr (kIBCountsEarly) {
+                    if (epilogue_thread_idx == 0) {
+                        comm::wait_until([&]() {
+                            for (uint32_t e = 0; e < kNumExpertsPerRank; ++ e)
+                                if (ptx::ld_volatile(cnt_early + e) == 0xffffffffu) { __nanosleep(100); return false; }
+                            return true;
+                        }, [&]() { printf("DeepGEMM IB early-count timeout: rank=%u, source=%u, proxy=%u, epoch=%llu\n",
+                                          sym_buffer.rank_idx, r, proxy, (unsigned long long) ib_epoch); });
+                        IB_TRACE_MAX(38, true);
+                    }
+                }
                 // One thread polls the (NVLink-remote) header with a pause between polls: hundreds of threads spinning
                 // on a proxy's HBM while its NIC writes there slows the NIC down drastically on GB200
                 auto nt_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d) + kNumExpertsPerRank;
@@ -2122,6 +2176,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
                 for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
                     *workspace.get_expert_recv_count_ptr(r, i) = cnt[i];
+                    if constexpr (kIBCountsEarly) {
+                        if (ptx::ld_volatile(cnt_early + i) != cnt[i])
+                            atomicAdd(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 39), 1ull);
+                    }
                     __threadfence();
                     ptx::atomic_add(workspace.get_expert_recv_count_sum_ptr(i),
                                     (static_cast<uint64_t>(kNumSMs) << 32) | static_cast<uint64_t>(cnt[i]));
@@ -2830,6 +2888,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    static_cast<double>(static_cast<int64_t>(t[35])) / 1e3, static_cast<double>(static_cast<int64_t>(t[36])) / 1e3, (unsigned long long) t[37]);
             printf("OPUS_TRACE3 rank=%u epoch=%llu | overlap: xpost_first=%.1f xpost_last=%.1f l1_first=%.1f rem_row_first=%.1f rem_row_last=%.1f rem_row_last_e0=%.1f ret_chunk_first=%.1f ret_chunk_last=%.1f ws=%d sc=%d\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(46), us(47), us(40), us(41), us(42), us(43), us(44), us(45), (int) kIBWaveSort, (int) kIBStreamCombine);
+            printf("OPUS_TRACE4 rank=%u epoch=%llu | counts_early: posted=%.1f landed_max=%.1f mismatches=%llu ce=%d\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(32), us(38), (unsigned long long) t[39], (int) kIBCountsEarly);
         }
 #endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)

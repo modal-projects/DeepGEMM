@@ -30,6 +30,7 @@ _CPP = r'''
 #include <nccl.h>
 #include <nccl_device.h>
 #include <vector>
+#include <cstdlib>
 
 #define CHECK_NCCL(x) do { ncclResult_t r = (x); TORCH_CHECK(r == ncclSuccess, "NCCL: ", ncclGetErrorString(r), " at ", #x); } while (0)
 #define CHECK_CUDA(x) do { cudaError_t e = (x); TORCH_CHECK(e == cudaSuccess, "CUDA: ", cudaGetErrorString(e), " at ", #x); } while (0)
@@ -75,11 +76,14 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     if (need_gin) {
 
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    const bool rail = std::getenv("DG_MEGA_MOE_IB_RAIL") != nullptr;
     // 0 = any backend NCCL can set up (GDAKI needs host driver PeerMappingOverride; PROXY=2 works without)
     reqs.ginType = static_cast<ncclGinType_t>(gin_type);
     reqs.ginContextCount = static_cast<int>(num_contexts);
     reqs.ginExclusiveContexts = exclusive != 0;
-    reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+    // DG_MEGA_MOE_IB_RAIL=1: rail-only Gin connections (DeepEP hybrid mode does this): the kernel only puts to its
+    // counterparts (same local index), and the CPU proxy scans every QP (bench: one-way 5.23 / 7.07 us at 1 / 72 contexts)
+    reqs.ginConnectionType = rail ? NCCL_GIN_CONNECTION_RAIL : NCCL_GIN_CONNECTION_FULL;
     reqs.ginSignalCount = 4;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
     reqs.useRuntimeVersion = true;
@@ -96,8 +100,8 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
         const auto* dc = static_cast<const ncclDevComm_t*>(st->dev_comm_host);
         const int64_t have = static_cast<int64_t>(dc->ginContextCount) * static_cast<int64_t>(dc->ginConnectionCount);
         if (rank == 0)
-            printf("DG_IB_GIN requested_contexts=%lld exclusive=%d devcomm.ginContextCount=%u ginConnectionCount=%u usable_indices=%lld\n",
-                   (long long) num_contexts, (int) exclusive, dc->ginContextCount, (unsigned) dc->ginConnectionCount, (long long) have);
+            printf("DG_IB_GIN rail=%d requested_contexts=%lld exclusive=%d devcomm.ginContextCount=%u ginConnectionCount=%u usable_indices=%lld\n",
+                   (int) rail, (long long) num_contexts, (int) exclusive, dc->ginContextCount, (unsigned) dc->ginConnectionCount, (long long) have);
         TORCH_CHECK(exclusive == 0 or have >= num_contexts, "NCCL Gin granted ", have, " context indices (ginContextCount ",
                     dc->ginContextCount, " x connections ", (int) dc->ginConnectionCount, "), fewer than the ", num_contexts,
                     " requested with exclusive contexts");

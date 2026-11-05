@@ -875,7 +875,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                uint64_t rw0_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(rw0_));
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                uint64_t rw1_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(rw1_));
+                // slot 29: max ring-slot wait in this launch (epoch-tagged so older launches lose the max); slot 30: last end
+                if (lane_idx == 0) {
+                    atomicMax(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 29),
+                              static_cast<unsigned long long>((ib_epoch << 40) | ((rw1_ - rw0_) & ((1ull << 40) - 1))));
+                    atomicMax(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 30), static_cast<unsigned long long>(rw1_));
+                }
+#else
+                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+#endif
             }
 
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
@@ -924,6 +936,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");  // generic stores, read by the GEMM's TMA
+                IB_TRACE_MAX(31, lane_idx == 0);  // last remote row fully landed + copied, slowest warp
             }
 #else
             constexpr bool ib_rem = false;
@@ -2259,9 +2272,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f\n",
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
-                   us(25), us(26), us(28), us(27));
+                   us(25), us(26), us(28), us(27), us(31),
+                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30));
         }
 #endif
     }

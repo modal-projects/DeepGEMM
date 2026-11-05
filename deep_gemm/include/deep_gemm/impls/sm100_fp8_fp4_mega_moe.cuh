@@ -348,7 +348,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSenderTables = false;
 #endif
-    DG_STATIC_ASSERT(not kIBSenderTables or (kIBCountsInMeta and not kIBWaveSort), "SENDER_TABLES needs COUNTS_IN_META, no WAVE_SORT");
     DG_STATIC_ASSERT(2 * kNumExpertsPerRank + 2 <= 256, "D1 counters live in the first 1 KB of smem_d");
     const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
     const auto piece_orig = [&](const uint32_t& q) {
@@ -688,7 +687,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kIBSortSmemFixed = kIBSortSmemOff + (kIBSortWarps + 1) * kIBNumKeys * 4 + kIBChunk * 4;
     constexpr bool kIBKeysInSmem = kIBSortSmemFixed + 2 * kIBTabT * 4 <= sizeof(SharedStorage::smem_d);
     DG_STATIC_ASSERT(kIBSortSmemFixed <= sizeof(SharedStorage::smem_d), "IB sort shared memory");
-    DG_STATIC_ASSERT(not kIBCountsInMeta or (2 * kNumExperts + kNumEpilogueWarps + 16) * 4 <= sizeof(SharedStorage::smem_d), "COUNTS_IN_META / SENDER_TABLES counters in smem_d");
+    DG_STATIC_ASSERT(not kIBCountsInMeta or kNumExperts * 4 <= sizeof(SharedStorage::smem_d), "COUNTS_IN_META counters in smem_d");
+    DG_STATIC_ASSERT(not kIBSenderTables or (kIBCountsInMeta and not kIBWaveSort), "SENDER_TABLES needs COUNTS_IN_META, no WAVE_SORT");
+    DG_STATIC_ASSERT(kNumEpilogueWarps + 9 <= 28, "SENDER_TABLES scratch in the staging header slot");
     const auto ib_sort_smem = reinterpret_cast<uint8_t*>(&shared_storage.smem_d);
     const auto ib_whist = reinterpret_cast<uint32_t*>(ib_sort_smem + kIBSortSmemOff);
     const auto ib_bstart = ib_whist + kIBSortWarps * kIBNumKeys;
@@ -2096,8 +2097,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if constexpr (kIBSenderTables) {
                 // Exclusive prefix over remote experts in global order (our node's experts count 0): each thread owns a
                 // contiguous run of experts, warp inclusive sums, then warp bases
-                auto st_cur = cim_cnt + kNumExperts;
-                auto st_wsum = st_cur + kNumExperts;
+                auto st_cur = cim_cnt;  // in place: each thread reads its counts before overwriting them with cursors
+                auto st_wsum = reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 16);  // header slot bytes 16..127 are never put
                 auto st_nstart = st_wsum + kNumEpilogueWarps;  // [nodes + 1] slice starts
                 constexpr uint32_t kPer = math::constexpr_ceil_div(kNumExperts, kNumEpilogueThreads);
                 const uint32_t g0 = epilogue_thread_idx * kPer;
@@ -2119,9 +2120,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t u = 0; u < kPer; ++ u) {
                     const uint32_t g = g0 + u;
                     if (g < kNumExperts) {
+                        const uint32_t c = g / cim_node_experts != ib_my_node ? cim_cnt[g] : 0u;
                         st_cur[g] = run;
-                        if (g / cim_node_experts != ib_my_node)
-                            run += cim_cnt[g];
+                        run += c;
                     }
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -2157,7 +2158,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                               cb, ib_cp(sym_buffer.rank_idx, n));
                 }
                 if constexpr (kIBSenderTables) {
-                    const auto st_nstart = cim_cnt + 2 * kNumExperts + kNumEpilogueWarps;
+                    const auto st_nstart = reinterpret_cast<const uint32_t*>(stg + kIBOffHdr + 16) + kNumEpilogueWarps;
                     const uint32_t a = st_nstart[n], b = st_nstart[n + 1];
                     if (b > a)
                         gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab, stg + kIBOffSTab + static_cast<int64_t>(a) * 4,

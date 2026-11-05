@@ -21,6 +21,14 @@ namespace deep_gemm::comm {
 #ifndef DG_MEGA_MOE_IB_SHARING
 #define DG_MEGA_MOE_IB_SHARING 0
 #endif
+// DG_MEGA_MOE_IB_SKIP_CREDIT=1: every put/putValue passes ncclGinOptFlagsMaySkipCreditCheck (DOCA skips the send-queue
+// availability check, which polls a CQ in host memory: -1..-2.5 us per post in the protocol bench). Safe only while the
+// ops in flight per QP stay below the QP depth: ib.py raises NCCL_GIN_GDAKI_QP_DEPTH to 1024 with it, and each launch
+// issues far fewer ops per context than that and flushes before the next launch.
+#ifndef DG_MEGA_MOE_IB_SKIP_CREDIT
+#define DG_MEGA_MOE_IB_SKIP_CREDIT 0
+#endif
+#define DG_IB_OPT_FLAGS (DG_MEGA_MOE_IB_SKIP_CREDIT ? ncclGinOptFlagsMaySkipCreditCheck : ncclGinOptFlagsDefault)
 
 struct GinIB {
     ncclGin gin;
@@ -45,7 +53,7 @@ struct GinIB {
     __device__ __forceinline__ void put_value(dtype_t* sym_ptr, const dtype_t& value, const uint32_t& dst_rank_idx) const {
         gin.putValue(world, static_cast<int>(dst_rank_idx), window, offset(sym_ptr), value,
                      ncclGin_None(), ncclCoopThread(), ncclGin_None(),
-                     cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+                     cuda::thread_scope_thread, cuda::thread_scope_device, DG_IB_OPT_FLAGS);
     }
 
     // Copy `num_bytes` from local `src_ptr` (inside the window) to `dst_sym_ptr` (local layout) on `dst_rank_idx`
@@ -53,14 +61,14 @@ struct GinIB {
                                         const uint32_t& dst_rank_idx) const {
         gin.put(world, static_cast<int>(dst_rank_idx), window, offset(dst_sym_ptr), window, offset(src_ptr), num_bytes,
                 ncclGin_None(), ncclGin_None(), ncclCoopThread(), ncclGin_None(),
-                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+                cuda::thread_scope_thread, cuda::thread_scope_device, DG_IB_OPT_FLAGS);
     }
 
     // Copy `num_bytes` from `src_sym_ptr` (local layout) on `src_rank_idx` into local `dst_ptr` (inside the window)
     __device__ __forceinline__ void get(void* dst_ptr, const void* src_sym_ptr, const uint64_t& num_bytes,
                                         const uint32_t& src_rank_idx) const {
         gin.get(world, static_cast<int>(src_rank_idx), window, offset(src_sym_ptr), window, offset(dst_ptr), num_bytes,
-                ncclCoopThread(), ncclGin_None(), ncclGinOptFlagsDefault, ncclGin_SegmentDevice());
+                ncclCoopThread(), ncclGin_None(), DG_IB_OPT_FLAGS, ncclGin_SegmentDevice());
     }
 
     // Put with a bundled WEAK signal: +1 on the 64-bit counter at `signal_sym_ptr` (local layout) on `dst_rank_idx`
@@ -69,7 +77,7 @@ struct GinIB {
                                                     const uint32_t& dst_rank_idx, const uint64_t* signal_sym_ptr) const {
         gin.put(world, static_cast<int>(dst_rank_idx), window, offset(dst_sym_ptr), window, offset(src_ptr), num_bytes,
                 ncclGin_WeakVASignalInc{window, static_cast<size_t>(offset(signal_sym_ptr))}, ncclGin_None(), ncclCoopThread(), ncclGin_None(),
-                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+                cuda::thread_scope_thread, cuda::thread_scope_device, DG_IB_OPT_FLAGS);
     }
 
     // Strong signal: +1 on the 64-bit counter at `sym_ptr` (local layout) on `dst_rank_idx`. Its visibility

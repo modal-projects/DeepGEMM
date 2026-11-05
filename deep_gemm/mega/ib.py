@@ -20,6 +20,8 @@ SHARING = int(os.environ.get('DG_MEGA_MOE_IB_SHARING', '0'))
 if SHARING >= 1:
     os.environ.setdefault('DG_MEGA_MOE_IB_CONTEXTS', '72')
     os.environ.setdefault('NCCL_GIN_GDAKI_QP_DEPTH', '1024')
+if os.environ.get('DG_MEGA_MOE_IB_SKIP_CREDIT'):  # skipping the availability check needs a deep send queue
+    os.environ.setdefault('NCCL_GIN_GDAKI_QP_DEPTH', '1024')
 NUM_GIN_CONTEXTS = int(os.environ.get('DG_MEGA_MOE_IB_CONTEXTS', '4'))
 
 _CPP = r'''

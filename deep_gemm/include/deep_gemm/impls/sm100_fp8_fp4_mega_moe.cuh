@@ -506,69 +506,105 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Sort-key scratch: shared memory (the epilogue's store buffer, unused before the first task) when it fits
     constexpr uint32_t kIBSortSmemOff = 1024;  // after the D1 per-expert counts
     constexpr uint32_t kIBNumKeys = kNumExpertsPerRank + 1;
-    constexpr uint32_t kIBSortSmemFixed = kIBSortSmemOff + kIBNumKeys * 4 + kIBChunk * 4;
+    constexpr uint32_t kIBSortWarps = kNumEpilogueWarps;
+    // [kIBSortWarps][keys] per-warp counts / bases, [keys] bucket starts, then the chunk's inverse map
+    constexpr uint32_t kIBSortSmemFixed = kIBSortSmemOff + (kIBSortWarps + 1) * kIBNumKeys * 4 + kIBChunk * 4;
     constexpr bool kIBKeysInSmem = kIBSortSmemFixed + 2 * kIBTabT * 4 <= sizeof(SharedStorage::smem_d);
     DG_STATIC_ASSERT(kIBSortSmemFixed <= sizeof(SharedStorage::smem_d), "IB sort shared memory");
     const auto ib_sort_smem = reinterpret_cast<uint8_t*>(&shared_storage.smem_d);
-    const auto ib_hist = reinterpret_cast<uint32_t*>(ib_sort_smem + kIBSortSmemOff);
-    const auto ib_inv = reinterpret_cast<uint32_t*>(ib_sort_smem + kIBSortSmemOff + kIBNumKeys * 4);
+    const auto ib_whist = reinterpret_cast<uint32_t*>(ib_sort_smem + kIBSortSmemOff);
+    const auto ib_bstart = ib_whist + kIBSortWarps * kIBNumKeys;
+    const auto ib_inv = ib_bstart + kIBNumKeys;
     const auto ib_keys = [&](const uint32_t& which) {
         return kIBKeysInSmem ? reinterpret_cast<uint32_t*>(ib_sort_smem + kIBSortSmemFixed) + which * kIBTabT
                              : ib_tab + kIBTabKeys + (sm_idx * 2 + which) * kIBTabT;
     };
     // Stable counting sort, run by all epilogue threads of an SM: pos(t) = #{t': key(t') < key(t)} + #{t' < t:
-    // key(t') == key(t)}. Every key is read with volatile loads after a CTA barrier; `emit(t, pos)` runs on warp 0.
+    // key(t') == key(t)}. Warp w owns a contiguous token range: per-warp key counts, bases = bucket start + counts of
+    // the lower warps, then each warp walks its range 32 tokens at a time (match_any for ties within a step).
+    // Every key is read with volatile loads after a CTA barrier; `emit(t, pos)` runs on any warp.
     const auto ib_stable_sort = [&](const uint32_t* keys, const uint32_t& n, const uint32_t& ep_tid, const auto& emit) {
         const auto vkeys = reinterpret_cast<const volatile uint32_t*>(keys);
-        for (uint32_t i = ep_tid; i < kIBNumKeys; i += kNumEpilogueThreads)
-            ib_hist[i] = 0;
+        const uint32_t w = ep_tid / 32;
+        const uint32_t span = math::ceil_div(n, kIBSortWarps * 32u) * 32u;
+        const uint32_t lo = cute::min(n, w * span), hi = cute::min(n, lo + span);
+        for (uint32_t i = ep_tid; i < kIBSortWarps * kIBNumKeys; i += kNumEpilogueThreads)
+            ib_whist[i] = 0;
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-        for (uint32_t t = ep_tid; t < n; t += kNumEpilogueThreads)
-            atomicAdd_block(ib_hist + vkeys[t], 1u);
+        for (uint32_t t = lo + lane_idx; t < hi; t += 32)
+            atomicAdd_block(ib_whist + w * kIBNumKeys + vkeys[t], 1u);
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+        for (uint32_t key = ep_tid; key < kIBNumKeys; key += kNumEpilogueThreads) {
+            uint32_t run = 0;
+            #pragma unroll
+            for (uint32_t j = 0; j < kIBSortWarps; ++ j) {
+                const uint32_t v = ib_whist[j * kIBNumKeys + key];
+                ib_whist[j * kIBNumKeys + key] = run;
+                run += v;
+            }
+            ib_bstart[key] = run;
+        }
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
         if (ep_tid < 32) {
             uint32_t carry = 0;
             for (uint32_t b = 0; b < kIBNumKeys; b += 32) {
                 const uint32_t i = b + lane_idx;
-                const uint32_t v = i < kIBNumKeys ? ib_hist[i] : 0u;
+                const uint32_t v = i < kIBNumKeys ? ib_bstart[i] : 0u;
                 uint32_t incl = v;
                 #pragma unroll
                 for (uint32_t d = 1; d < 32; d <<= 1) {
                     const uint32_t x = __shfl_up_sync(0xffffffffu, incl, d);
                     if (lane_idx >= d) incl += x;
                 }
-                if (i < kIBNumKeys) ib_hist[i] = carry + incl - v;
+                if (i < kIBNumKeys) ib_bstart[i] = carry + incl - v;
                 carry += __shfl_sync(0xffffffffu, incl, 31);
-            }
-            __syncwarp();
-            for (uint32_t t0 = 0; t0 < n; t0 += 32) {
-                const uint32_t t = t0 + lane_idx;
-                const bool valid = t < n;
-                const uint32_t key = valid ? vkeys[t] : 0xffffffffu;
-                const uint32_t peers = __match_any_sync(0xffffffffu, key);
-                const uint32_t rank = __popc(peers & ((1u << lane_idx) - 1u));
-                const uint32_t base = valid ? ib_hist[key] : 0u;
-                __syncwarp();
-                if (valid) {
-                    emit(t, base + rank);
-                    if (rank == 0) ib_hist[key] = base + __popc(peers);
-                }
-                __syncwarp();
             }
         }
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+        const auto my_base = ib_whist + w * kIBNumKeys;
+        for (uint32_t t0 = lo; t0 < hi; t0 += 32) {
+            const uint32_t t = t0 + lane_idx;
+            const bool valid = t < hi;
+            const uint32_t key = valid ? vkeys[t] : 0xffffffffu;
+            const uint32_t peers = __match_any_sync(0xffffffffu, key);
+            const uint32_t rank = __popc(peers & ((1u << lane_idx) - 1u));
+            const uint32_t base = valid ? ib_bstart[key] + my_base[key] : 0u;
+            __syncwarp();
+            if (valid) {
+                emit(t, base + rank);
+                if (rank == 0) my_base[key] += __popc(peers);
+            }
+            __syncwarp();
+        }
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
     };
-    // key1 (min) / key2 (max) local-expert index over a source token's picks on node n, from its top-k row
-    const auto ib_token_keys = [&](const int64_t* topk_row, const uint32_t& n, uint32_t& key1, uint32_t& key2) {
-        key1 = kNumExpertsPerRank, key2 = 0;
-        #pragma unroll
-        for (uint32_t k = 0; k < kNumTopk; ++ k) {
-            const int e = static_cast<int>(topk_row[k]);
-            if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank / ib_lsa == n) {
-                const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                key1 = cute::min(key1, le), key2 = cute::max(key2, le);
+    // Sender keys from our own top-k (flat, coalesced, batched loads; shared/global atomics): key1 = min, key2 = max
+    // local-expert index over t's picks on node n (key1 = kNumExpertsPerRank, key2 = 0 without picks there)
+    const auto ib_build_keys = [&](uint32_t* keys, const uint32_t& n_tok, const uint32_t& n, const bool& is_max, const uint32_t& ep_tid) {
+        for (uint32_t t = ep_tid; t < n_tok; t += kNumEpilogueThreads)
+            keys[t] = is_max ? 0u : kNumExpertsPerRank;
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+        const auto in_idx = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
+        constexpr uint32_t kB = 8;
+        for (uint32_t i0 = 0; i0 < n_tok * kNumTopk; i0 += kNumEpilogueThreads * kB) {
+            int64_t v[kB];
+            #pragma unroll
+            for (uint32_t u = 0; u < kB; ++ u) {
+                const uint32_t i = i0 + u * kNumEpilogueThreads + ep_tid;
+                v[u] = i < n_tok * kNumTopk ? __ldcg(reinterpret_cast<const long long*>(in_idx) + i) : -1ll;
+            }
+            #pragma unroll
+            for (uint32_t u = 0; u < kB; ++ u) {
+                const uint32_t i = i0 + u * kNumEpilogueThreads + ep_tid;
+                const int e = static_cast<int>(v[u]);
+                if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank / ib_lsa == n) {
+                    const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                    if (is_max) atomicMax(keys + i / kNumTopk, le);
+                    else atomicMin(keys + i / kNumTopk, le);
+                }
             }
         }
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
     };
     const auto ib_forward_combine = [&](const uint32_t& global_warp, const uint32_t& num_global_warps, const bool& is_leader) {
         const auto fwd_grid_idx = ptx::get_grid_idx() + 1;
@@ -1622,20 +1658,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (kIBWaveSort and q_piece > 0 and num_tokens > 0) {
                     const uint32_t c = q_piece - 1, c0 = c * kIBChunk, c1 = cute::min(c0 + kIBChunk, num_tokens);
                     const auto keys = ib_keys(0);
-                    const auto in_idx = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-                    for (uint32_t t = epilogue_thread_idx; t < num_tokens; t += kNumEpilogueThreads) {
-                        uint32_t k1, k2;
-                        ib_token_keys(in_idx + t * kNumTopk, q_n, k1, k2);
-                        *reinterpret_cast<volatile uint32_t*>(keys + t) = k1;
-                    }
+                    ib_build_keys(keys, num_tokens, q_n, false, epilogue_thread_idx);
                     ib_stable_sort(keys, num_tokens, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
                         if (pos >= c0 and pos < c1) ib_inv[pos - c0] = kIBWSMode >= 2 ? pos : t;
                     });
-                    constexpr uint32_t kRowUnits = kIBTokBytes / 16;
-                    for (uint32_t u = epilogue_thread_idx; u < (c1 - c0) * kRowUnits; u += kNumEpilogueThreads) {
-                        const uint32_t i = u / kRowUnits, w = u % kRowUnits;
-                        const auto src = reinterpret_cast<const uint4*>(ib_input_base + static_cast<int64_t>(ib_inv[i]) * kIBTokBytes) + w;
-                        reinterpret_cast<uint4*>(x_stage + static_cast<int64_t>(c0 + i) * kIBTokBytes)[w] = __ldcg(src);
+                    // Row copy with kB independent 16-byte loads in flight per thread
+                    constexpr uint32_t kRowUnits = kIBTokBytes / 16, kB = 10;
+                    const uint32_t num_units = (c1 - c0) * kRowUnits;
+                    for (uint32_t u0 = epilogue_thread_idx; u0 < num_units; u0 += kNumEpilogueThreads * kB) {
+                        uint4 v[kB];
+                        #pragma unroll
+                        for (uint32_t b = 0; b < kB; ++ b) {
+                            const uint32_t u = u0 + b * kNumEpilogueThreads;
+                            if (u < num_units)
+                                v[b] = __ldcg(reinterpret_cast<const uint4*>(ib_input_base + static_cast<int64_t>(ib_inv[u / kRowUnits]) * kIBTokBytes) + u % kRowUnits);
+                        }
+                        #pragma unroll
+                        for (uint32_t b = 0; b < kB; ++ b) {
+                            const uint32_t u = u0 + b * kNumEpilogueThreads;
+                            if (u < num_units)
+                                reinterpret_cast<uint4*>(x_stage + static_cast<int64_t>(c0 + u / kRowUnits) * kIBTokBytes)[u % kRowUnits] = v[b];
+                        }
                     }
                     __threadfence_system();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -1643,12 +1686,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // STREAM_COMBINE: the SM posting node n's SF piece also computes our records' return order from n
                 if (kIBStreamCombine and q_piece == 0 and num_tokens > 0) {
                     const auto keys = ib_keys(1);
-                    const auto in_idx = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
-                    for (uint32_t t = epilogue_thread_idx; t < num_tokens; t += kNumEpilogueThreads) {
-                        uint32_t k1, k2;
-                        ib_token_keys(in_idx + t * kNumTopk, q_n, k1, k2);
-                        *reinterpret_cast<volatile uint32_t*>(keys + t) = k2;
-                    }
+                    ib_build_keys(keys, num_tokens, q_n, true, epilogue_thread_idx);
                     ib_stable_sort(keys, num_tokens, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
                         ib_tab[kIBTabPos2 + q_nr * kIBTabT + t] = pos;
                     });

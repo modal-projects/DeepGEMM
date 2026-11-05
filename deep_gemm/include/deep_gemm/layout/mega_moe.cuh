@@ -103,7 +103,7 @@ struct alignas(128) MegaMoESignals {
     static constexpr uint32_t kNumMaxIBPairs = 1u << 16;      // max tokens x top-k per rank
     static constexpr uint32_t kNumMaxIBPoolTokens = 1u << 20;
     alignas(128) uint64_t ib_landing_ready[kNumMaxRanks];  // +1 per Gin context per launch per source (v2e)
-    alignas(128) uint64_t ib_trace[40];  // DG_MEGA_MOE_IB_TRACE: %globaltimer per stage (SM 0)
+    alignas(128) uint64_t ib_trace[48];  // DG_MEGA_MOE_IB_TRACE: %globaltimer per stage (SM 0)
     alignas(128) uint64_t ib_pairs_from[kNumMaxRanks];
     alignas(128) uint64_t ib_landing_expected[kNumMaxRanks];  // local: cumulative signals expected from each source (v3a)
     alignas(128) uint32_t ib_pack_count[2][kNumMaxRanks];  // local: rows packed per peer this launch, by epoch parity (v4)
@@ -135,9 +135,11 @@ struct alignas(128) MegaMoESignals {
     alignas(128) uint32_t ib_o_nt[kIBOMaxNodes];
     alignas(128) uint32_t ib_o_fchunk[2][kIBOMaxNodes][kIBOMaxChunks];
     alignas(128) uint32_t ib_o_fdone[2][kIBOMaxNodes];
-    alignas(128) uint32_t ib_o_fitem[2][kIBOMaxNodes];  // DG_MEGA_MOE_IB_FWD_DYN: next forward-combine item to claim
     alignas(128) uint64_t ib_o_meta_posted;
     alignas(128) uint64_t ib_o_scratch;  // Gin warm-up target (never read)
+    alignas(128) uint32_t ib_o_fitem[2][kIBOMaxNodes];  // overlap: forward-combine work items claimed, by parity
+    alignas(128) uint64_t ib_o_order_ready[64];  // overlap: epoch once our D1 wrote the slot / perm2 tables of remote source k
+    alignas(128) uint64_t ib_o_landed[kIBOMaxNodes][kIBOMaxChunks];  // PULL_FLAG_GATE: epoch once (source node, x chunk) landed in our mirror
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 

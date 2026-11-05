@@ -169,6 +169,16 @@ static void sm100_fp8_fp4_mega_moe(
         (std::getenv("DG_MEGA_MOE_IB_SHARING") != nullptr ? std::format("#define DG_MEGA_MOE_IB_SHARING {}\n", std::getenv("DG_MEGA_MOE_IB_SHARING")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_IB_XSITES") != nullptr ? std::format("#define DG_MEGA_MOE_IB_XSITES {}\n", std::getenv("DG_MEGA_MOE_IB_XSITES")) : std::string()) +
         std::string(std::getenv("DG_MEGA_MOE_IB_META_FIRST_ALL") != nullptr ? "#define DG_MEGA_MOE_IB_META_FIRST_ALL 1\n" : "") +
+        (std::getenv("DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS") != nullptr ?
+            std::format("#define DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS {}\n", std::getenv("DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS")) : std::string()) +
+        std::string(std::getenv("DG_MEGA_MOE_IB_HDR_CTX") != nullptr ? "#define DG_MEGA_MOE_IB_HDR_CTX 1\n" : "") +
+        std::string(std::getenv("DG_MEGA_MOE_IB_PULL_FLAG_GATE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_PULL_FLAG_GATE")) != "0" ? "#define DG_MEGA_MOE_IB_PULL_FLAG_GATE 1\n" : "") +
+        (std::getenv("DG_MEGA_MOE_IB_PULL_GATE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_PULL_GATE")) != "0" ?
+            std::format("#define DG_MEGA_MOE_IB_PULL_GATE {}\n", std::getenv("DG_MEGA_MOE_IB_PULL_GATE")) : std::string()) +
+        (std::getenv("DG_MEGA_MOE_IB_WAVE_SORT") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_WAVE_SORT")) != "0" ?
+            std::format("#define DG_MEGA_MOE_IB_WAVE_SORT {}\n", std::getenv("DG_MEGA_MOE_IB_WAVE_SORT")) : std::string()) +
+        (std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE")) != "0" ?
+            std::format("#define DG_MEGA_MOE_IB_STREAM_COMBINE {}\n", std::getenv("DG_MEGA_MOE_IB_STREAM_COMBINE")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_IB_DIAG") != nullptr ? std::format("#define DG_MEGA_MOE_IB_DIAG {}\n", std::getenv("DG_MEGA_MOE_IB_DIAG")) : std::string()) + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 

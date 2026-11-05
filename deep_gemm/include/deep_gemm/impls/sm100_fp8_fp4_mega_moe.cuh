@@ -654,6 +654,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const int64_t off = static_cast<int64_t>(c) * kIBChunk * kIBRecBytes;
                     const auto g = make_gin_site(8, ctx_chunk(nr, c, c + nr), c + nr, ib_xbase);
                     g.put(ret_dst + off, fst + off, static_cast<uint64_t>(size) * kIBRecBytes, s);
+                    IB_TRACE_MAX(14, true);  // proxy: return record chunk put issued, last one
 #if defined(DG_MEGA_MOE_IB_RET_DB) and DG_MEGA_MOE_IB_RET_DB
                     // Late-tail doorbell: the last op on a context can sit unprocessed until the next op on it, so each
                     // record chunk is followed by an 8 B put of the (idempotent) return header on the same context
@@ -2159,6 +2160,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        IB_TRACE_MAX(15, epilogue_thread_idx == 0);  // source: final combine loop starts, slowest SM
+#endif
         const auto grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
@@ -2260,6 +2264,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto sptr = reinterpret_cast<uint32_t*>(rec + kHidden + col / 128 * 4);
                         uint64_t q = qv[j];
                         IB_POLL(q == ~0ull, q = ptx::ld_volatile(qptr), "c3_q", n, token_idx);
+                        IB_TRACE_MAX(21, lane_idx == 0 and j == 0);  // source: a return record seen, last one
                         uint32_t sbits = sv[j];
                         IB_POLL(sbits == 0xffffffffu, sbits = ptx::ld_volatile(sptr), "c3_s", n, token_idx);
                         if (hit) {
@@ -2350,10 +2355,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx == 0 and ib_epoch % 16 == 0) {
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
-            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu | pre_fetch=%.1f fetched=%.1f\n",
+            printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f | max over SMs: hdr=%.1f scan=%.1f counts=%.1f pull_end=%.1f rem_row_last=%.1f ring_wait_max=%.1f ring_wait_last_end=%.1f xpost_last=%.1f sfpost=%.1f | remote rows not landed at first pull: %llu of %llu | pre_fetch=%.1f fetched=%.1f | rec_put_last=%.1f comb_start=%.1f rec_seen_last=%.1f\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
                    us(25), us(26), us(28), us(27), us(31),
-                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11], us(12), us(13));
+                   ((t[29] >> 40) == ib_epoch ? static_cast<double>(t[29] & ((1ull << 40) - 1)) / 1e3 : 0.0), us(30), us(7), us(8), (unsigned long long) t[10], (unsigned long long) t[11], us(12), us(13), us(14), us(15), us(21));
         }
 #endif
     }

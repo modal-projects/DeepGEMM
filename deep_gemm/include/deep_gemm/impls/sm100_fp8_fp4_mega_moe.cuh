@@ -819,7 +819,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE_MAX(28, thread_idx == 0);  // NVLink build (DG_MEGA_MOE_NVL_TRACE): counts, slowest SM
 #endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        __threadfence_system();  // acquire: pairs with the proxy's fence before its count add (entries, per-source counts)
+        // acquire: pairs with the D1 fence before its count add (entries, per-source counts). D1 runs on THIS GPU's SMs,
+        // so GPU scope suffices; DG_MEGA_MOE_IB_GPU_ACQ=1 uses it (the system fence costs ~2.5 us on the slowest SM)
+#if defined(DG_MEGA_MOE_IB_GPU_ACQ) and DG_MEGA_MOE_IB_GPU_ACQ
+        __threadfence();
+#else
+        __threadfence_system();
+#endif
         IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(28, thread_idx == 0);  // counts, slowest SM
 #endif

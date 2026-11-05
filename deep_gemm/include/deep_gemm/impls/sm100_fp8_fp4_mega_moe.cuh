@@ -1143,6 +1143,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
             uint32_t slot_idx = token_idx_in_expert;
             uint32_t token_idx_in_rank;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_LOCAL_FIRST) and DG_MEGA_MOE_IB_LOCAL_FIRST
+            // LOCAL_FIRST: the expert's node-local sources take the first slots (round-robin among them), then the
+            // remote sources (round-robin among them, so each block still takes every remote source's earliest rows).
+            // Block 0 then needs only local rows plus the front of the remote range. Only the pull uses this mapping
+            // (the combine reads each pool row's TokenSrcMetadata).
+            {
+                uint32_t num_local_in_lane = 0;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    num_local_in_lane += (j < kNumRanks and not is_remote(j)) ? stored_rank_count[i] : 0u;
+                }
+                const uint32_t num_local = __reduce_add_sync(0xffffffff, num_local_in_lane);
+                const bool in_local = slot_idx < num_local;
+                if (not in_local)
+                    slot_idx -= num_local;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    remaining[i] = (j < kNumRanks and is_remote(j) != in_local) ? stored_rank_count[i] : 0u;
+                }
+            }
+#endif
             while (true) {
                 // Compute active count and min across all ranks
                 // NOTES: reduce within each lane first, then warp-reduce once

@@ -1471,10 +1471,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t nr = lane_idx % 16, n = ib_node_of_slot(nr);
                 const auto gin = lane_idx < 16 ? make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase) : make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
-                if (lane_idx < 16)
+                if (lane_idx < 16) {
                     gin.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(kIBT * kNumTopk * 12), ib_cp(sym_buffer.rank_idx, n));
-                else
+                    // HDR_CTX: this context carries nothing else, and the last op on a context can sit unprocessed until
+                    // the next one (late-tail); a trailing 8-byte put of the (identical) header value pushes it through
+                    if (kIBHdrCtx)
+                        gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, ib_cp(sym_buffer.rank_idx, n));
+                } else {
                     gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, ib_cp(sym_buffer.rank_idx, n));
+                    if (kIBHdrCtx)  // doorbell: a second identical header write pushes the first (same late-tail reason)
+                        gin.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, ib_cp(sym_buffer.rank_idx, n));
+                }
             }
             __syncwarp();
             IB_TRACE(24, epilogue_thread_idx == 0);
@@ -1510,8 +1517,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);
-                make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
-                                       static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
+                const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
+                gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
+                          static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
+                if (kIBHdrCtx)  // doorbell (see the full-batch branch): identical header value, pushes the meta put through
+                    gin_m.put_value(reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens,
+                                    ib_cp(sym_buffer.rank_idx, n));
             }
             __syncwarp();
             // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire

@@ -137,9 +137,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define IB_TRACE(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_trace[i] = t_; } } while (0)
 // max over every SM that reaches the point (absolute %globaltimer, so no per-launch reset is needed)
 #define IB_TRACE_MAX(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); atomicMax(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + (i)), static_cast<unsigned long long>(t_)); } } while (0)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+#define IB_HIST(h, cond) do { if ((cond) and ib_epoch % 16 == 0) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); \
+    const int64_t d_ = static_cast<int64_t>(t_) - static_cast<int64_t>(ptx::ld_volatile(workspace.signals->ib_trace + 16)); \
+    const uint32_t b_ = d_ < 0 ? 0u : (d_ / 8000 > 63 ? 63u : static_cast<uint32_t>(d_ / 8000)); \
+    atomicAdd(&workspace.signals->ib_hist[(h)][b_], 1u); } } while (0)
+#else
+#define IB_HIST(h, cond) do {} while (0)
+#endif
 #else
 #define IB_TRACE(i, cond) do {} while (0)
 #define IB_TRACE_MAX(i, cond) do {} while (0)
+#define IB_HIST(h, cond) do {} while (0)
 #endif
 
     // Mega MoE over IB, opus design (REDESIGN_OPUS.md): counterpart forwarding. Every cross-node byte moves between
@@ -1474,6 +1483,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (not ib_rem)
                     issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
+                IB_HIST(ib_rem ? 2 : 3, lane_idx == 0);
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
@@ -1671,6 +1681,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     uint64_t t_;
                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
                     atomicMin(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[40]), static_cast<unsigned long long>(t_));
+                    IB_HIST(0, true);
                 }
                 __syncwarp();
 #endif
@@ -1684,6 +1695,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 if (task_info.block_phase == sched::BlockPhase::Linear2)
                     l2_k_block_dependency.wait(k_block_idx);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                if (task_info.block_phase == sched::BlockPhase::Linear2 and k_block_idx == 0 and cute::elect_one_sync())
+                    IB_HIST(1, true);
+                __syncwarp();
+#endif
 
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -2974,8 +2990,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    static_cast<double>(static_cast<int64_t>(t[35])) / 1e3, static_cast<double>(static_cast<int64_t>(t[36])) / 1e3, (unsigned long long) t[37]);
             printf("OPUS_TRACE3 rank=%u epoch=%llu | overlap: xpost_first=%.1f xpost_last=%.1f l1_first=%.1f rem_row_first=%.1f rem_row_last=%.1f rem_row_last_e0=%.1f ret_chunk_first=%.1f ret_chunk_last=%.1f ws=%d sc=%d\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(46), us(47), us(40), us(41), us(42), us(43), us(44), us(45), (int) kIBWaveSort, (int) kIBStreamCombine);
-            printf("OPUS_TRACE4 rank=%u epoch=%llu | counts_early: posted=%.1f landed_max=%.1f mismatches=%llu ce=%d\n",
-                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(32), us(38), (unsigned long long) t[39], (int) kIBCountsEarly);
+            printf("OPUS_TRACE4 rank=%u epoch=%llu | counts_early: posted=%.1f landed_max=%.1f mismatches=%llu ce=%d | split_scan tables_done=%.1f ss=%d\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(32), us(38), (unsigned long long) t[39], (int) kIBCountsEarly,
+                   us(32), (int) kIBSplitScan);
+            // 8-us histograms (bucket i = [8i, 8i+8) us from kernel start), then reset for the next printed launch
+            for (uint32_t h = 0; h < 4; ++ h) {
+                char buf[64 * 6 + 1]; uint32_t n = 0;
+                for (uint32_t b = 0; b < 64; ++ b) {
+                    uint32_t v = ptx::ld_volatile(&workspace.signals->ib_hist[h][b]);
+                    workspace.signals->ib_hist[h][b] = 0;
+                    char tmp[6]; uint32_t m = 0;
+                    do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < 5);
+                    while (m) buf[n ++] = tmp[-- m];
+                    buf[n ++] = b == 63 ? '\0' : ',';
+                }
+                printf("OPUS_HIST rank=%u epoch=%llu h=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h, buf);
+            }
         }
 #endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)

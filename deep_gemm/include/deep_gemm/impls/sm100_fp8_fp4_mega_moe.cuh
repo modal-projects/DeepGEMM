@@ -218,6 +218,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ctx_rhdr = [&](const uint32_t& nr, const uint32_t& orig) {
         return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + ib_R * kIBM + nr : orig; };
     const uint32_t ib_xbase = ib_R * (4 + 2 * kIBM);
+    // DG_MEGA_MOE_IB_HDR_CTX=1 (shared-context mode): the meta and the meta header get contexts of their own
+    // ([0, R) and [R, 2R)) and the x/SF pieces use [2R, CONTEXTS), so the header never queues behind an x chunk on the same
+    // QP (with the default indices the header (nr + 2) and x piece q = 1 (q + 1) share context 2 for any context count)
+#if defined(DG_MEGA_MOE_IB_HDR_CTX) and DG_MEGA_MOE_IB_HDR_CTX
+    constexpr bool kIBHdrCtx = true;
+#else
+    constexpr bool kIBHdrCtx = false;
+#endif
+    DG_STATIC_ASSERT(not kIBHdrCtx or DG_MEGA_MOE_IB_CONTEXTS >= 3, "DG_MEGA_MOE_IB_HDR_CTX needs >= 3 Gin contexts");
+    const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
+    const auto piece_orig = [&](const uint32_t& q) {
+        return kIBHdrCtx ? 2 * ib_R + q % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R) : q + 1; };
     if (kIBThreadCtx and ib_R * (4 + 2 * kIBM) > DG_MEGA_MOE_IB_CONTEXTS) {
         if (blockIdx.x == 0 and threadIdx.x == 0)
             printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING>=1 needs %u Gin contexts (R=%u, M=%u), have %d\n",
@@ -1426,7 +1438,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
             if (epilogue_warp_idx == 0 and lane_idx % 16 + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx % 16, n = ib_node_of_slot(nr);
-                const auto gin = lane_idx < 16 ? make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase) : make_gin_site(2, ctx_mhdr(nr, nr + 2), nr + 2, ib_xbase);
+                const auto gin = lane_idx < 16 ? make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase) : make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
                 if (lane_idx < 16)
                     gin.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(kIBT * kNumTopk * 12), ib_cp(sym_buffer.rank_idx, n));
@@ -1500,7 +1512,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t t0 = (piece - 1) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
-                    make_gin_site(4, ctx_piece(q, q + 1), q + 1, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
+                    make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, ib_input_base + off, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
                 }
                 __syncwarp();

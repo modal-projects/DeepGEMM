@@ -395,6 +395,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     if (sm_idx == 0 and thread_idx == 0) {
         workspace.signals->ib_trace[25] = workspace.signals->ib_trace[27] = workspace.signals->ib_trace[28] = ~0ull;
         workspace.signals->ib_trace[26] = workspace.signals->ib_trace[29] = workspace.signals->ib_trace[30] = 0;
+        workspace.signals->ib_trace[1] = ~0ull, workspace.signals->ib_trace[31] = 0;
         __threadfence();
     }
 #endif
@@ -1001,6 +1002,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
                 constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = 5;
+#if defined(DG_MEGA_MOE_IB_PULL_GATE) and DG_MEGA_MOE_IB_PULL_GATE
+                // Gate: one lane polls the row's last 16 bytes with a pause before the warp reads the row (hundreds of
+                // warps spinning on the proxy's HBM while its NIC writes there slows the NIC down, ms-scale on GB200)
+                if (lane_idx == 0) {
+                    const auto last = src_base_ptr + kIBTokBytes - 16;
+                    IB_POLL(ib_is_sentinel4(ib_ldv4(last)), __nanosleep(DG_MEGA_MOE_IB_PULL_GATE), "pull_gate", current_rank_in_expert_idx, src_token_idx);
+                }
+                __syncwarp();
+#endif
                 #pragma unroll
                 for (uint32_t u0 = 0; u0 < kUnits; u0 += kBatch) {
                     uint4 v[kBatch];
@@ -1663,6 +1673,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const auto src = kIBWaveSort and kIBWSMode != 3 and piece > 0 ? x_stage + off : ib_input_base + off;
                     make_gin(ctx_piece(q, q + 1)).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                    {
+                        uint64_t t_;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
+                        atomicMin(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[1]), static_cast<unsigned long long>(t_));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[31]), static_cast<unsigned long long>(t_));
+                    }
+#endif
                 }
                 __syncwarp();
             }
@@ -2432,9 +2450,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto* t = workspace.signals->ib_trace;
             const auto us = [&](const uint32_t& i) { return ((int64_t) t[i] - (int64_t) t[16]) / 1e3; };
             printf("OPUS_TRACE rank=%u epoch=%llu us from kernel start: d0_start=%.1f staged=%.1f posted=%.1f pre_pull_barrier=%.1f d1_hdr=%.1f d1_slots=%.1f d1_done=%.1f counts=%.1f pull_end=%.1f l2_flags=%.1f fwd_done=%.1f combine_end=%.1f prev_cleanup_end=%.1f"
-                   " l1_first=%.1f rem_row_first=%.1f rem_row_last=%.1f rem_row_last_e0=%.1f ret_chunk_first=%.1f ret_chunk_last=%.1f ws=%d sc=%d\n",
+                   " xpost_first=%.1f xpost_last=%.1f l1_first=%.1f rem_row_first=%.1f rem_row_last=%.1f rem_row_last_e0=%.1f ret_chunk_first=%.1f ret_chunk_last=%.1f ws=%d sc=%d\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(23), us(24), us(0), us(2), us(20), us(22), us(19), us(3), us(4), us(5), us(6), us(9), t[18] / 1e3,
-                   us(25), us(27), us(26), us(30), us(28), us(29), (int) kIBWaveSort, (int) kIBStreamCombine);
+                   us(1), us(31), us(25), us(27), us(26), us(30), us(28), us(29), (int) kIBWaveSort, (int) kIBStreamCombine);
         }
 #endif
     }

@@ -189,7 +189,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // own context, which works because each piece / chunk is posted exactly once per launch by exactly one thread.
     // Layout over R = remote nodes, M = chunks per node: [meta R][meta header R][x/SF pieces R*(1+M)][combine chunks R*M]
     // [return header R] = R * (4 + 2M) contexts. Otherwise the original (shared, modulo) indices.
-    constexpr bool kIBThreadCtx = DG_MEGA_MOE_IB_SHARING == 2;
+    constexpr bool kIBThreadCtx = DG_MEGA_MOE_IB_SHARING >= 1;
     constexpr uint32_t kIBM = (kIBT + kIBChunk - 1) / kIBChunk;
     const uint32_t ib_R = ib_num_nodes - 1;
     const auto ctx_meta = [&](const uint32_t& nr, const uint32_t& orig) { return kIBThreadCtx ? nr : orig; };
@@ -201,7 +201,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + ib_R * kIBM + nr : orig; };
     if (kIBThreadCtx and ib_R * (4 + 2 * kIBM) > DG_MEGA_MOE_IB_CONTEXTS) {
         if (blockIdx.x == 0 and threadIdx.x == 0)
-            printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING=2 needs %u Gin contexts (R=%u, M=%u), have %d\n",
+            printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING>=1 needs %u Gin contexts (R=%u, M=%u), have %d\n",
                    ib_R * (4 + 2 * kIBM), ib_R, kIBM, DG_MEGA_MOE_IB_CONTEXTS);
         __trap();
     }

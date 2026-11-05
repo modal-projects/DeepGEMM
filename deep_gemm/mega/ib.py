@@ -17,7 +17,7 @@ IB_MAGIC = 0x1B1B1B1B1B1B1B1B
 # needs R * (4 + 2 * ceil(max_tokens / 32)) contexts (R = remote nodes): 72 covers EP16 <= 1024 tok and EP32 <= 256 tok.
 # A deep send queue keeps a put from ever polling the CQ for a free slot. Both are read by NCCL / the JIT later.
 SHARING = int(os.environ.get('DG_MEGA_MOE_IB_SHARING', '0'))
-if SHARING == 2:
+if SHARING >= 1:
     os.environ.setdefault('DG_MEGA_MOE_IB_CONTEXTS', '72')
     os.environ.setdefault('NCCL_GIN_GDAKI_QP_DEPTH', '1024')
 NUM_GIN_CONTEXTS = int(os.environ.get('DG_MEGA_MOE_IB_CONTEXTS', '4'))
@@ -166,7 +166,7 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
     gin_type = int(os.environ.get('DG_MEGA_MOE_IB_GIN_TYPE', '0'))  # 0 any, 2 proxy, 3 GDAKI, 5 EFA GDA
     virtual_lsa = int(os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0'))
     state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(uid[0], rank, world, num_bytes, NUM_GIN_CONTEXTS, gin_type,
-                                                                 virtual_lsa, 1 if SHARING == 2 else 0)
+                                                                 virtual_lsa, 1 if SHARING >= 1 else 0)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
     # DG_MEGA_MOE_IB_FORCE=1: compile the IB kernel even when all ranks share one NVLink domain (compile and
     # local-path checks on single-node clusters; Gin paths are never taken since every rank is load/store-reachable)

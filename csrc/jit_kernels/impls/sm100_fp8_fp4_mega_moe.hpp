@@ -159,6 +159,7 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(std::getenv("DG_MEGA_MOE_IB_SKIP_CREDIT") != nullptr ? "#define DG_MEGA_MOE_IB_SKIP_CREDIT 1\n" : "") +
         (std::getenv("DG_MEGA_MOE_IB_ORACLE") != nullptr ? std::format("#define DG_MEGA_MOE_IB_ORACLE {}\n", std::getenv("DG_MEGA_MOE_IB_ORACLE")) : std::string()) +
         std::string(std::getenv("DG_MEGA_MOE_IB_RET_DB") != nullptr ? "#define DG_MEGA_MOE_IB_RET_DB 1\n" : "") +
+        std::string(std::getenv("DG_MEGA_MOE_IB_FRONT") != nullptr ? "#define DG_MEGA_MOE_IB_FRONT 1\n" : "") +
         std::string(std::getenv("DG_MEGA_MOE_IB_DEBUG_D0") != nullptr ? "#define DG_MEGA_MOE_IB_DEBUG_D0 1\n" : "") +
         (std::getenv("DG_MEGA_MOE_IB_CONTEXTS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_CONTEXTS {}\n", std::getenv("DG_MEGA_MOE_IB_CONTEXTS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_IB_SHARING") != nullptr ? std::format("#define DG_MEGA_MOE_IB_SHARING {}\n", std::getenv("DG_MEGA_MOE_IB_SHARING")) : std::string()) +

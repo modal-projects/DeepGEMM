@@ -161,6 +161,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     constexpr bool kIBOracle = DG_MEGA_MOE_IB_ORACLE >= 1;
     const bool ib_oracle_now = kIBOracle and ib_epoch > 2;
+    // DG_MEGA_MOE_IB_FRONT=1 (front-end layout; the oracle showed D1 cannot finish before ~28 us @128 because the meta
+    // SM and the x posters are D1 SMs): the meta is staged and sent by SM 0 (one contiguous idx..header put), the x/SF
+    // pieces go out from SMs 1.. upward, so the last num_remote SMs (D1) start their header polls at once; the
+    // meta-posted release is issued only when META_FIRST needs it
+#if defined(DG_MEGA_MOE_IB_FRONT) and DG_MEGA_MOE_IB_FRONT
+    constexpr bool kIBFront = true;
+#else
+    constexpr bool kIBFront = false;
+#endif
+#if defined(DG_MEGA_MOE_IB_META_FIRST_ALL) and DG_MEGA_MOE_IB_META_FIRST_ALL
+    constexpr bool kIBMetaFirstAll = true;
+#else
+    constexpr bool kIBMetaFirstAll = false;
+#endif
+    constexpr uint32_t kIBMetaSM = kIBFront ? 0 : kNumSMs - 1;
     // DG_MEGA_MOE_IB_ORACLE=2: also no puts from epoch 3 on (no NIC traffic at all: the GB200 NIC-vs-NVLink-read
     // contention cannot show up; slightly optimistic, the put issue cost is gone too)
     const bool ib_gin_active = not (kIBOracle and DG_MEGA_MOE_IB_ORACLE >= 2 and ib_epoch > 2);
@@ -1485,12 +1500,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Gin posting). The meta (top-k idx, weights, header) is staged by the last SM into the mirror slot of our own
         // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
-        IB_TRACE(23, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
+        IB_TRACE(23, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
         if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
             printf("OPUS_D0 rank=%u epoch=%llu num_tokens=%u enter\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, num_tokens);
 #endif
-        if (sm_idx == kNumSMs - 1 and num_tokens == kIBT) {
+        if (sm_idx == kIBMetaSM and num_tokens == kIBT and not kIBFront) {
             // Full batch: every top-k / weight row is polled by the proxy, so the input slices go out as they are
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
             if (epilogue_warp_idx == 0 and lane_idx % 16 + 1 < ib_num_nodes) {
@@ -1513,7 +1528,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_thread_idx == 0)
                 ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
-        } else if (sm_idx == kNumSMs - 1) {
+        } else if (sm_idx == kIBMetaSM) {
             const auto stg = ib_mirror(ib_parity, ib_my_node);
             const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);
             const auto in_w = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffW);
@@ -1552,7 +1567,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
             // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire
-            if (epilogue_thread_idx == 0)
+            if (epilogue_thread_idx == 0 and (kIBMetaFirstAll or not kIBFront))
                 ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
         }
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
@@ -1562,7 +1577,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         {
             const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
-            for (uint32_t q = kNumSMs - 2 - sm_idx; sm_idx + 2 <= kNumSMs and q < (ib_num_nodes - 1) * num_pieces; q += kNumSMs) {
+            const uint32_t q0 = kIBFront ? sm_idx - 1 : kNumSMs - 2 - sm_idx;
+            const bool q_ok = kIBFront ? sm_idx >= 1 : sm_idx + 2 <= kNumSMs;
+            for (uint32_t q = q0; q_ok and q < (ib_num_nodes - 1) * num_pieces; q += (kIBFront ? kNumSMs - 1 : kNumSMs)) {
                 if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
                     // Meta first (x / SF posted only after the meta put): opt-in only; on GB200 it turns into ms-scale
                     // stalls (EP32 with the proxy D1, EP16 with the host scan; mechanism not identified)
@@ -1588,7 +1605,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         }
-        IB_TRACE(0, sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0);
+        IB_TRACE(0, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
         // D1 (host scan; v1 had the proxy do this and push tables over NVLink, measured ~20 us slower): every GPU scans,
         // for each remote source r, r's mirror on r's counterpart in this node (over NVLink, or locally when that is
         // us) and builds its OWN tables for its own experts exactly like the upstream receiver-side state: per-source

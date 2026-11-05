@@ -164,6 +164,7 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(is_ib and std::getenv("DG_MEGA_MOE_PULL_META_EARLY") != nullptr ? "#define DG_MEGA_MOE_PULL_META_EARLY 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_COUNTS_EARLY") != nullptr ? "#define DG_MEGA_MOE_IB_COUNTS_EARLY 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_LOCAL_FIRST") != nullptr ? "#define DG_MEGA_MOE_IB_LOCAL_FIRST 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_SPLIT_SCAN") != nullptr ? "#define DG_MEGA_MOE_IB_SPLIT_SCAN 1\n" : "") +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_XDELAY_NS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_XDELAY_NS {}\n", std::getenv("DG_MEGA_MOE_IB_XDELAY_NS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_L2_PREFETCH") != nullptr ? std::format("#define DG_MEGA_MOE_L2_PREFETCH {}\n", std::getenv("DG_MEGA_MOE_L2_PREFETCH")) : std::string()) +
         std::string(std::getenv("DG_MEGA_MOE_IB_FWD_DYN") != nullptr ? "#define DG_MEGA_MOE_IB_FWD_DYN 1\n" : "") +

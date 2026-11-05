@@ -199,6 +199,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + nr * kIBM + c : orig; };
     const auto ctx_rhdr = [&](const uint32_t& nr, const uint32_t& orig) {
         return kIBThreadCtx ? 2 * ib_R + ib_R * (1 + kIBM) + ib_R * kIBM + nr : orig; };
+    // DG_MEGA_MOE_IB_HDR_CTX=1 (port of a3a34d7 on jamesl/mega-moe-ib-opus-base, shared-context mode): the meta and the
+    // meta header get contexts of their own ([0, R) and [R, 2R)) and the x/SF pieces use [2R, CONTEXTS), so the header
+    // never queues behind an x chunk on the same QP
+#if defined(DG_MEGA_MOE_IB_HDR_CTX) and DG_MEGA_MOE_IB_HDR_CTX
+    constexpr bool kIBHdrCtx = true;
+#else
+    constexpr bool kIBHdrCtx = false;
+#endif
+    DG_STATIC_ASSERT(not kIBHdrCtx or DG_MEGA_MOE_IB_CONTEXTS >= 3, "DG_MEGA_MOE_IB_HDR_CTX needs >= 3 Gin contexts");
+    const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
+    const auto piece_orig = [&](const uint32_t& q) {
+        return kIBHdrCtx ? 2 * ib_R + q % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R) : q + 1; };
     if (kIBThreadCtx and ib_R * (4 + 2 * kIBM) > DG_MEGA_MOE_IB_CONTEXTS) {
         if (blockIdx.x == 0 and threadIdx.x == 0)
             printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING>=1 needs %u Gin contexts (R=%u, M=%u), have %d\n",
@@ -1072,7 +1084,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
                 constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = 5;
                 if constexpr (kIBFlagGate) {
-                    if (lane_idx == 0) {
+                    // Probe first: one load of the row's first and last 16-byte units per lane; only a row that has not
+                    // fully landed waits on the (NVLink) chunk flag, so landed rows pay nothing extra
+                    const bool landed = __all_sync(0xffffffffu,
+                        not ib_is_sentinel4(ib_ldv4(src_base_ptr + lane_idx * 16)) and
+                        not ib_is_sentinel4(ib_ldv4(src_base_ptr + kIBTokBytes - 512 + lane_idx * 16)));
+                    if (not landed and lane_idx == 0) {
                         const auto flag = sym_buffer.map(&workspace.signals->ib_o_landed[current_rank_in_expert_idx / ib_lsa][ib_xslot / kIBChunk], ib_proxy);
                         IB_POLL(ptx::ld_acq_sys(flag) != ib_epoch, (void) 0, "pull_flag", current_rank_in_expert_idx, ib_xslot);
                     }
@@ -1663,7 +1680,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
             if (epilogue_warp_idx == 0 and lane_idx % 16 + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx % 16, n = ib_node_of_slot(nr);
-                const auto gin = make_gin(lane_idx < 16 ? ctx_meta(nr, nr) : ctx_mhdr(nr, nr + 2));
+                const auto gin = make_gin(lane_idx < 16 ? ctx_meta(nr, nr) : ctx_mhdr(nr, hdr_orig(nr)));
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
                 if (lane_idx < 16)
                     gin.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(kIBT * kNumTopk * 12), ib_cp(sym_buffer.rank_idx, n));
@@ -1778,7 +1795,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
                     const auto src = ib_ws_on(num_tokens) and kIBWSMode != 3 and piece > 0 ? x_stage + off : ib_input_base + off;
-                    make_gin(ctx_piece(q, q + 1)).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
+                    make_gin(ctx_piece(q, piece_orig(q))).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     {

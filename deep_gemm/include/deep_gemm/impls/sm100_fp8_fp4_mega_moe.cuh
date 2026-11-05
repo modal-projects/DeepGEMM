@@ -1294,7 +1294,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (is_remote(current_rank_in_expert_idx)) {
                     const uint32_t k_t = ib_k_of_rank(current_rank_in_expert_idx);
                     if (not ((ib_order_seen >> k_t) & 1ull)) {
-                        IB_POLL(ptx::ld_acq_sys(kIBSenderTables ? &workspace.signals->ib_o_tab_ready[k_t] : &workspace.signals->ib_o_order_ready[k_t]) != ib_epoch,
+                        IB_POLL(ptx::ld_acq_sys(&workspace.signals->ib_o_tab_ready[k_t]) != ib_epoch,
                                 (void) 0, "tab_ready", k_t, 0);
                         ib_order_seen |= 1ull << k_t;
                     }
@@ -2486,7 +2486,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
                 }
+                if (kIBEarlyPublish and not ib_st_on(nt))
+                    __threadfence();  // slot entries written by the scan above
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // EarlyPublish: remote-row pulls wait for this source's slot table; raise it as soon as the scan wrote it,
+                // not after the overlap sort below (B300: +11 / +16 us @128 Flash / MegaSeek when it came after the sort)
+                if (kIBEarlyPublish and not ib_st_on(nt) and epilogue_thread_idx == 0)
+                    ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
                 if constexpr (not kIBEarlyPublish)
                     IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
                 if constexpr (not kIBEarlyPublish) {
@@ -2533,8 +2539,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     if (epilogue_thread_idx == 0)
                         ptx::st_rel_sys(&workspace.signals->ib_o_order_ready[k], ib_epoch);
-                    if (kIBSenderTables and not ib_st_on(nt) and epilogue_thread_idx == 0)  // tables came from the scan above
-                        ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
                 }
             }
         }

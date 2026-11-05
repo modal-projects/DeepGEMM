@@ -156,19 +156,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // NIC writes is ever re-armed and, from epoch 3 on, the epoch tags are not checked, so every wait on remote data
     // passes at once with the identical previous launch's bytes (both parities filled by epochs 1-2); all puts still
     // run. Kernel time then = this design with zero network wait. NVLink-written partials keep their re-arm.
-#if defined(DG_MEGA_MOE_IB_ORACLE) and DG_MEGA_MOE_IB_ORACLE
-    constexpr bool kIBOracle = true;
-#else
-    constexpr bool kIBOracle = false;
+#ifndef DG_MEGA_MOE_IB_ORACLE
+#define DG_MEGA_MOE_IB_ORACLE 0
 #endif
+    constexpr bool kIBOracle = DG_MEGA_MOE_IB_ORACLE >= 1;
     const bool ib_oracle_now = kIBOracle and ib_epoch > 2;
+    // DG_MEGA_MOE_IB_ORACLE=2: also no puts from epoch 3 on (no NIC traffic at all: the GB200 NIC-vs-NVLink-read
+    // contention cannot show up; slightly optimistic, the put issue cost is gone too)
+    const bool ib_gin_active = not (kIBOracle and DG_MEGA_MOE_IB_ORACLE >= 2 and ib_epoch > 2);
     const uint32_t ib_lsa = sym_buffer.num_lsa_ranks;
     const uint32_t ib_my_node = sym_buffer.rank_idx / ib_lsa;
     const uint32_t ib_num_nodes = kNumRanks / ib_lsa;
     const auto is_remote = [&](const uint32_t& r) { return not sym_buffer.is_lsa(r); };
     const auto ib_cp = [&](const uint32_t& r, const uint32_t& n) { return n * ib_lsa + r % ib_lsa; };  // counterpart of r on node n
     const auto ib_node_of_slot = [&](const uint32_t& nr) { return nr < ib_my_node ? nr : nr + 1; };     // nr-th remote node
-    const auto make_gin = [&](const uint32_t& ctx) { return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx); };
+    const auto make_gin = [&](const uint32_t& ctx) { auto g = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx); g.active = ib_gin_active; return g; };
     // Bisect knob for exclusive contexts: DG_MEGA_MOE_IB_XSITES = bitmask of posting sites that use their exclusive
     // index + DG_MEGA_MOE_IB_SHARING (1 meta, 2 meta header, 4 x/SF pieces, 8 combine chunks, 16 return header when a
     // node sent nothing, 32 return header after the last chunk); the other sites use GPU sharing on a separate pool of
@@ -177,12 +179,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_XSITES 63
 #endif
     const auto make_gin_site = [&](const uint32_t& site, const uint32_t& xctx, const uint32_t& orig, const uint32_t& xbase) {
-        if (DG_MEGA_MOE_IB_SHARING >= 1 and (DG_MEGA_MOE_IB_XSITES & site))
-            return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, xctx);
-        if (DG_MEGA_MOE_IB_SHARING >= 1)  // shared pool above the exclusive range
-            return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base,
-                               xbase + orig % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - xbase), 0);
-        return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, orig);
+        const auto build = [&]() {
+            if (DG_MEGA_MOE_IB_SHARING >= 1 and (DG_MEGA_MOE_IB_XSITES & site))
+                return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, xctx);
+            if (DG_MEGA_MOE_IB_SHARING >= 1)  // shared pool above the exclusive range
+                return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base,
+                                   xbase + orig % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - xbase), 0);
+            return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, orig);
+        };
+        auto g = build(); g.active = ib_gin_active; return g;
     };
     // Mirror layout = the upstream input region layout: x [T][H] fp8, SF [T][H/32], top-k idx [T][K] i64, weights [T][K] f32
     constexpr int64_t kIBT = kNumMaxTokensPerRank;

@@ -169,6 +169,15 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_SENDER_TABLES") != nullptr ? "#define DG_MEGA_MOE_IB_SENDER_TABLES 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_PULL_SKIP_SCAN") != nullptr ? "#define DG_MEGA_MOE_IB_PULL_SKIP_SCAN 1\n" : "") +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_SCAN_BATCH") != nullptr ? std::format("#define DG_MEGA_MOE_IB_SCAN_BATCH {}\n", std::getenv("DG_MEGA_MOE_IB_SCAN_BATCH")) : std::string()) +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_JOIN") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_FWD_JOIN")) != "0" ? "#define DG_MEGA_MOE_IB_FWD_JOIN 1\n" : "") +
+        (is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_BATCH") != nullptr ? std::format("#define DG_MEGA_MOE_IB_FWD_BATCH {}\n", std::getenv("DG_MEGA_MOE_IB_FWD_BATCH")) : std::string()) +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_PREFETCH") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_FWD_PREFETCH")) != "0" ? "#define DG_MEGA_MOE_IB_FWD_PREFETCH 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_C3_EARLY") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_C3_EARLY")) != "0" ? "#define DG_MEGA_MOE_IB_C3_EARLY 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_DEFER_REARM") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_FWD_DEFER_REARM")) != "0" ? "#define DG_MEGA_MOE_IB_FWD_DEFER_REARM 1\n" : "") +
+        (is_ib and std::getenv("DG_MEGA_MOE_IB_RET_GROUP") != nullptr ? std::format("#define DG_MEGA_MOE_IB_RET_GROUP {}\n", std::getenv("DG_MEGA_MOE_IB_RET_GROUP")) : std::string()) +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_C3_REPOLL") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_C3_REPOLL")) != "0" ? "#define DG_MEGA_MOE_IB_C3_REPOLL 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_C3_SPLIT") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_C3_SPLIT")) != "0" ? "#define DG_MEGA_MOE_IB_C3_SPLIT 1\n" : "") +
+        (is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_BATCH_D") != nullptr ? std::format("#define DG_MEGA_MOE_IB_FWD_BATCH_D {}\n", std::getenv("DG_MEGA_MOE_IB_FWD_BATCH_D")) : std::string()) +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_XDELAY_NS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_XDELAY_NS {}\n", std::getenv("DG_MEGA_MOE_IB_XDELAY_NS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_L2_PREFETCH") != nullptr ? std::format("#define DG_MEGA_MOE_L2_PREFETCH {}\n", std::getenv("DG_MEGA_MOE_L2_PREFETCH")) : std::string()) +
         std::string(std::getenv("DG_MEGA_MOE_IB_FWD_DYN") != nullptr ? "#define DG_MEGA_MOE_IB_FWD_DYN 1\n" : "") +

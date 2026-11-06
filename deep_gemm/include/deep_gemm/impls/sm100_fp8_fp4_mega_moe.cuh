@@ -1293,8 +1293,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // the same hazard but RET_GROUP is dropped; mixing RET_GROUP and non-RET_GROUP arms on one buffer is unsafe.
                 // Both parities: this launch's own counter too, so a launch never depends on what earlier (possibly
                 // older-header) variants left behind. Safe: every claim happens after the dispatch grid sync below.
+#if defined(DG_MEGA_MOE_IB_LEGACY_FITEM_RESET) and DG_MEGA_MOE_IB_LEGACY_FITEM_RESET
+                // A/B only: the old reset (other parity, FWD_JOIN variants only)
+                if (kIBFwdDyn and thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
+                    workspace.signals->ib_o_fitem[ib_parity ^ 1][thread_idx] = 0;
+#else
                 if (thread_idx < 2 * layout::MegaMoESignals::kIBOMaxNodes)
                     workspace.signals->ib_o_fitem[thread_idx / layout::MegaMoESignals::kIBOMaxNodes][thread_idx % layout::MegaMoESignals::kIBOMaxNodes] = 0;
+#endif
             }
         }
 #endif

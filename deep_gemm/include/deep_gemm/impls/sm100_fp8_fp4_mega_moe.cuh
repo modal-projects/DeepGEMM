@@ -880,7 +880,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_SLICE_MIN
 #define DG_MEGA_MOE_IB_SLICE_MIN 8192
 #endif
-    const uint32_t ib_P = (kIBScanSlices > 1 and num_tokens * kNumTopk >= DG_MEGA_MOE_IB_SLICE_MIN) ? kIBScanSlices : 1u;
+    // ... and the scan SMs (remote sources x P) stay within DG_MEGA_MOE_IB_SLICE_MAX_SMS (default 32): at EP32 (24 remote
+    // sources) P=4 took 96 SMs out of the pull rotation and MegaSeek 1024 got +86 us (B300 and4, 2026-11-06)
+#ifndef DG_MEGA_MOE_IB_SLICE_MAX_SMS
+#define DG_MEGA_MOE_IB_SLICE_MAX_SMS 32
+#endif
+    const uint32_t ib_P = [&]() {
+        if (kIBScanSlices <= 1 or num_tokens * kNumTopk < DG_MEGA_MOE_IB_SLICE_MIN) return 1u;
+        const uint32_t nrem = cute::max(1u, kNumRanks - ib_lsa);
+        uint32_t p = kIBScanSlices;
+        while (p > 1 and nrem * p > DG_MEGA_MOE_IB_SLICE_MAX_SMS) -- p;
+        return p;
+    }();
     DG_STATIC_ASSERT(kIBScanSlices == 1 or not (kIBEarlyPublish or kIBCountsEarly or kIBWaveSort), "SCAN_SLICES excludes CIM / SPLIT_SCAN / COUNTS_EARLY / WAVE_SORT");
     DG_STATIC_ASSERT(kNumExpertsPerRank <= 256, "IB scan slice counts");
     constexpr uint32_t kIBSliceScratch = 64 * 4 * 256 + 2 * 64 * 4 * 2;  // counts u32 + two u64 flag arrays
@@ -2718,7 +2729,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_XO_MIN
 #define DG_MEGA_MOE_IB_XO_MIN 8192
 #endif
-                    const bool xo_on = kIBXOrder and num_tokens * kNumTopk >= DG_MEGA_MOE_IB_XO_MIN;
+                    // and only with one remote node: the order chain spans every remote node's pieces (q), so at EP32 (3 remote
+                    // nodes) it tripled the serialized put issue (MegaSeek 1024 +92 us on top of TS2, B300 and4)
+                    const bool xo_on = kIBXOrder and num_tokens * kNumTopk >= DG_MEGA_MOE_IB_XO_MIN and ib_R == 1;
                     if (xo_on and q >= xo_nctx and q - xo_nctx < 256)  // previous piece on this context issued first
                         IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + (q - xo_nctx)) != ib_epoch, (void) 0, "x_order", q, 0);
                     make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),

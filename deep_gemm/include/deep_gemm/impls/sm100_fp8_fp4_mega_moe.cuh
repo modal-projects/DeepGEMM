@@ -2658,6 +2658,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
                 const uint32_t stage_rows = static_cast<uint32_t>(kIBT);
 #endif
+#if defined(DG_MEGA_MOE_IB_STAGE_NOUNROLL) and DG_MEGA_MOE_IB_STAGE_NOUNROLL
+                #pragma unroll 1
+#endif
                 for (uint32_t i0 = 0; i0 < stage_rows * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
                     uint64_t vi[kSB];
                     uint32_t vw[kSB];

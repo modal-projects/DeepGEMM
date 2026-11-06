@@ -452,7 +452,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint64_t kIBIdxSentinel = 0x8000000000000000ull;
 // Spin back-off on failed sentinel re-polls: measured neutral-to-negative (EP16 +5-7 us), off by default
 #if defined(DG_MEGA_MOE_IB_BACKOFF) and DG_MEGA_MOE_IB_BACKOFF
-#define IB_BACKOFF(n) do { if ((n) > 8) __nanosleep(256); } while (0)
+// DG_MEGA_MOE_IB_BACKOFF_NS=N (default 256; GB200 stall study: fewer polls of NIC-written lines)
+#ifndef DG_MEGA_MOE_IB_BACKOFF_NS
+#define DG_MEGA_MOE_IB_BACKOFF_NS 256
+#endif
+#define IB_BACKOFF_NS DG_MEGA_MOE_IB_BACKOFF_NS
+#define IB_BACKOFF(n) do { if ((n) > 8) __nanosleep(IB_BACKOFF_NS); } while (0)
 #else
 #define IB_BACKOFF(n) do {} while (0)
 #endif
@@ -3787,6 +3792,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 miss |= (qv[j] == ~0ull) or (sv[j] == 0xffffffffu);
                             if (not __any_sync(0xffffffffu, miss))
                                 break;
+#if defined(DG_MEGA_MOE_IB_BACKOFF) and DG_MEGA_MOE_IB_BACKOFF
+                            __nanosleep(IB_BACKOFF_NS);
+#endif
                             #pragma unroll
                             for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                                 const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;

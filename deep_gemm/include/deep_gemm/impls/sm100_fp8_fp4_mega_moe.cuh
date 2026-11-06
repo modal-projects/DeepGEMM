@@ -336,8 +336,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // context (so it never sits on an idle one), before the header doorbell. Receivers publish those counts as soon as they
     // land, then the scan only builds the slot tables (SPLIT_SCAN protocol: ib_o_order_ready, remote pulls acquire it).
     // The scan's own per-expert totals are checked against them (trace slot 39 = sticky mismatch total).
+    // Compile-time size gate (DG_MEGA_MOE_IB_ST_MIN against kNumMaxTokensPerRank * K): with SENDER_TABLES requested, both
+    // SENDER_TABLES and COUNTS_IN_META are compiled out for small max-token kernels. The runtime gate alone still cost
+    // +5..+7 us @128 (B300 dev server, gated-off code in the hot paths; SKIP_SCAN + LOCAL_FIRST alone cost nothing there)
+#ifndef DG_MEGA_MOE_IB_ST_MIN
+#define DG_MEGA_MOE_IB_ST_MIN 0
+#endif
+    constexpr bool kIBLargeT = static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk >= static_cast<int64_t>(DG_MEGA_MOE_IB_ST_MIN);
+#if defined(DG_MEGA_MOE_IB_SENDER_TABLES) and DG_MEGA_MOE_IB_SENDER_TABLES
+    constexpr bool kIBSTRequested = true;
+#else
+    constexpr bool kIBSTRequested = false;
+#endif
 #if defined(DG_MEGA_MOE_IB_COUNTS_IN_META) and DG_MEGA_MOE_IB_COUNTS_IN_META
-    constexpr bool kIBCountsInMeta = true;
+    constexpr bool kIBCountsInMeta = not kIBSTRequested or kIBLargeT;
 #else
     constexpr bool kIBCountsInMeta = false;
 #endif
@@ -356,17 +368,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // right after the counts on the same context. Receivers copy only their own slice (~T*K/16 entries per source instead
     // of scanning all T*K) and skip the scan, except the proxy's sort keys for its own counterpart (local memory). Remote
     // pulls poll the weight sentinel themselves (rule A, previously done by the scan).
-#if defined(DG_MEGA_MOE_IB_SENDER_TABLES) and DG_MEGA_MOE_IB_SENDER_TABLES
-    constexpr bool kIBSenderTables = true;
-#else
-    constexpr bool kIBSenderTables = false;
-#endif
+    constexpr bool kIBSenderTables = kIBSTRequested and kIBLargeT;
     // DG_MEGA_MOE_IB_ST_MIN=N: use the sender tables only for a source with num_tokens * K >= N top-k entries (sender and
     // receivers agree through the header's num_tokens); below that the receiver's scan is cheaper (B300 dev server:
     // MegaSeek 128 tok +17 us with tables, 1024 tok -20 us)
-#ifndef DG_MEGA_MOE_IB_ST_MIN
-#define DG_MEGA_MOE_IB_ST_MIN 0
-#endif
     const auto ib_st_on = [&](const uint32_t& ntok) { return kIBSenderTables and ntok * kNumTopk >= static_cast<uint32_t>(DG_MEGA_MOE_IB_ST_MIN); };
     // With SENDER_TABLES, COUNTS_IN_META follows the same size gate (B300 traces: early counts alone do not start the
     // pulls earlier, they only pay off together with the tables + SKIP_SCAN, and cost +4..+16 us otherwise). Below the gate

@@ -3696,7 +3696,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         done_bits |= 1u << j;
                     }
                 }
-                if (done_bits != all_mine) __nanosleep(500);
+#ifndef DG_MEGA_MOE_IB_C3_GATE_SLEEP_NS
+#define DG_MEGA_MOE_IB_C3_GATE_SLEEP_NS 500
+#endif
+                if (done_bits != all_mine) __nanosleep(DG_MEGA_MOE_IB_C3_GATE_SLEEP_NS);
                 if (clock64() - t0 > (1ll << 34)) {
                     printf("OPUS_HANG c3_tailgate rank=%u lane=%u done=%x epoch=%llu\n", sym_buffer.rank_idx, lane_idx, done_bits, (unsigned long long) ib_epoch);
                     asm volatile("trap;");
@@ -3840,7 +3843,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t rec_pos = ib_sc_on(num_tokens) ? ib_tab[kIBTabPos2 + nr * kIBTabT + token_idx] : token_idx;
                 if constexpr (kIBC3Gate == 2) {
                     if (lane_idx == 0)
-                        IB_POLL(ptx::ld_acq_gpu(c3_gate + n * 64 + rec_pos / kIBChunk) != ib_epoch, __nanosleep(100), "c3_cflag", n, rec_pos);
+                        IB_POLL(ptx::ld_volatile(c3_gate + n * 64 + rec_pos / kIBChunk) != ib_epoch, __nanosleep(100), "c3_cflag", n, rec_pos);  // a hint only: every record is still sentinel-checked (rule A), so no acquire
                     __syncwarp();
                 }
                 if constexpr (kIBFp8Combine) {

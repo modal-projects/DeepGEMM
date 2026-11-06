@@ -1095,8 +1095,53 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
     };
+    // DG_MEGA_MOE_IB_NO_OVERLAP (measurement arm: the same kernel without IB / GEMM overlap; 1 = both gates, 2 = dispatch
+    // gate only, 3 = return gate only). Dispatch gate: no routed L1 GEMM on any GPU of a node starts before every IB x / SF
+    // byte destined to that node has landed (each GPU checks the mirrors it proxies, then pushes its epoch to every node
+    // peer; the L1 loader waits for all node peers). Return gate: no forward-combine (the only IB return path) starts before
+    // every GPU of the node has finished its L2 (each GPU pushes its epoch after the epilogue grid sync). NVLink overlap is
+    // unchanged. Timing only: every pull and every reduce still polls each byte, so correctness does not depend on the flags.
+    // Flags: ib_o_landed[own node][slot + node-local rank] (the flag gate only uses remote-node rows).
+#if defined(DG_MEGA_MOE_IB_NO_OVERLAP) and DG_MEGA_MOE_IB_NO_OVERLAP
+    constexpr uint32_t kIBNoOv = DG_MEGA_MOE_IB_NO_OVERLAP;
+#else
+    constexpr uint32_t kIBNoOv = 0;
+#endif
+    constexpr bool kIBNoOvDispatch = kIBNoOv == 1 or kIBNoOv == 2;
+    constexpr bool kIBNoOvReturn = kIBNoOv == 1 or kIBNoOv == 3;
+    constexpr uint32_t kIBNoOvLandedSlot = 16, kIBNoOvL2Slot = 40;
+    const auto ib_noov_push = [&](const uint32_t& slot) {  // one thread
+        for (uint32_t i = 0; i < ib_lsa; ++ i)
+            ptx::st_rel_sys(sym_buffer.map(&workspace.signals->ib_o_landed[ib_my_node][slot + sym_buffer.rank_idx % ib_lsa],
+                                           ib_my_node * ib_lsa + i), ib_epoch);
+    };
+    const auto ib_noov_wait = [&](const uint32_t& slot) {  // whole warp
+        if (lane_idx < ib_lsa)
+            while (ptx::ld_acq_sys(&workspace.signals->ib_o_landed[ib_my_node][slot + lane_idx]) < ib_epoch);
+        __syncwarp();
+    };
+    const auto ib_noov_landed_check = [&]() {  // whole warp: every x row and the SF piece of every remote source we proxy
+        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+            const auto mir = ib_mirror(ib_parity, ib_node_of_slot(nr));
+            uint64_t h;
+            do { h = ptx::ld_volatile(reinterpret_cast<const uint64_t*>(mir + kIBOffHdr)); } while ((h >> 32) != (ib_epoch & 0xffffffffull));
+            const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
+            for (uint32_t r = lane_idx; r < nt; r += 32) {
+                const auto row = mir + static_cast<int64_t>(r) * kIBTokBytes;
+                while (ib_is_sentinel4(ib_ldv4(row)) or ib_is_sentinel4(ib_ldv4(row + kIBTokBytes - 16)));
+            }
+            if (nt > 0 and lane_idx == 0)
+                while (ib_is_sentinel4(ib_ldv4(mir + kIBOffSF + static_cast<int64_t>(nt) * kIBSFBytes - 16)));
+        }
+        __syncwarp();
+        if (lane_idx == 0)
+            ib_noov_push(kIBNoOvLandedSlot);
+        __syncwarp();
+    };
     const auto ib_forward_combine = [&](const uint32_t& global_warp, const uint32_t& num_global_warps, const bool& is_leader,
                                         auto batch_tag, const bool& from_epilogue) {
+        if constexpr (kIBNoOvReturn)
+            ib_noov_wait(kIBNoOvL2Slot);
         constexpr uint32_t kBatch = static_cast<uint32_t>(decltype(batch_tag)::value);
         DG_STATIC_ASSERT(kBatch >= 1 and kBatch <= 8, "IB forward batch");
         const auto fwd_grid_idx = ptx::get_grid_idx() + 1;
@@ -2240,7 +2285,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // GEMM TMA load warp for tokens with SFA
         task_info_t task_info;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        bool ib_noov_published = false, ib_noov_ready = false;
+#endif
         while (scheduler.get_next_task(task_info)) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if constexpr (kIBNoOvDispatch) {
+                const bool routed = task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::Linear2;
+                if (routed and sm_idx == 0 and not ib_noov_published)
+                    ib_noov_landed_check(), ib_noov_published = true;
+                if (task_info.block_phase == sched::BlockPhase::Linear1 and not ib_noov_ready)
+                    ib_noov_wait(kIBNoOvLandedSlot), ib_noov_ready = true;
+            }
+#endif
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts :
                                           task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts :
@@ -2314,6 +2371,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBNoOvDispatch) {
+            if (sm_idx == 0 and not ib_noov_published)  // no routed task here: still publish, the node's L1 loaders wait for it
+                ib_noov_landed_check();
+        }
+#endif
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -3789,6 +3852,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
         IB_TRACE(5, sm_idx == 0 and epilogue_thread_idx == 0);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBNoOvReturn) {
+            if (sm_idx == 0 and epilogue_thread_idx == 0)
+                ib_noov_push(kIBNoOvL2Slot);
+        }
+#endif
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if constexpr (kIBFwdJoin) {

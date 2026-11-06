@@ -2557,7 +2557,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffCnt, stg + kIBOffCnt + static_cast<int64_t>(n) * static_cast<int64_t>(cb),
                               cb, ib_cp(sym_buffer.rank_idx, n));
                 }
-                if (kIBHdrCtx)  // doorbell (see the full-batch branch): identical header value, pushes the meta put through
+                // DG_MEGA_MOE_IB_NO_META_DOORBELL=1 drops it: the "last op on an idle context lands late" sightings were
+                // root-caused to per-rank JIT compile skew (CORRECTNESS_LOG), and the extra put costs ~4.5 us on SM 0
+#if defined(DG_MEGA_MOE_IB_NO_META_DOORBELL) and DG_MEGA_MOE_IB_NO_META_DOORBELL
+                constexpr bool kMetaDoorbell = false;
+#else
+                constexpr bool kMetaDoorbell = true;
+#endif
+                if (kIBHdrCtx and kMetaDoorbell)  // doorbell (see the full-batch branch): identical header value, pushes the meta put through
                     gin_m.put_value(reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens,
                                     ib_cp(sym_buffer.rank_idx, n));
                 SL_TR(0, 26, true);

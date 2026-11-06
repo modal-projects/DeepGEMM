@@ -202,9 +202,14 @@ def transform_weights_for_mega_moe(
 def _mega_moe_call(call, sym_buffer: 'SymmBuffer') -> None:
     call()
     if _C.mega_moe_launch_skipped():
+        import os
+        import time
+        t_compiled = time.time()
         torch.cuda.synchronize()
         dist.barrier(group=sym_buffer.group)
         torch.cuda.synchronize()
+        if os.environ.get('DG_MOE_RDV_LOG', '0') == '1':
+            print(f'OPUS_RDV rank={dist.get_rank()} compiled_at={t_compiled:.2f} released_at={time.time():.2f}', flush=True)
         call()
         assert not _C.mega_moe_launch_skipped()
 

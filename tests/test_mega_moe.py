@@ -365,6 +365,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         import time as _time
         dist.barrier()
         _t_sync = _time.time()
+        print(f'OPUS_SYNC rank={rank_idx} t={_t_sync:.2f}', flush=True)
         for i in range(num_correctness_tests):
             create_inputs()
             if i == 0:

@@ -316,6 +316,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kIBPTabStride = static_cast<int64_t>(kNumRanks) * kNumExpertsPerRank * kIBT * 4;
     constexpr int64_t kIBNodeStride = 2 * kIBMirrorStride + 2 * kIBRetStride + kIBPCombStride + kIBFStageStride + kIBPTabStride;
     constexpr uint32_t kIBChunk = 32;  // tokens per dispatch x put and per return put
+    // DG_MEGA_MOE_IB_X_PIECE=N: tokens per dispatch x put (sender only; receivers poll rows), default kIBChunk.
+    // DG_MEGA_MOE_IB_X_NCTX=C: x / SF pieces spread over at most C contexts (HDR_CTX). With X_ORDER, fewer and larger
+    // pieces cut the serialized put-issue cost (~5-7 us per put through the CPU proxy, B300 trace) and keep in-order landing
+#ifndef DG_MEGA_MOE_IB_X_PIECE
+#define DG_MEGA_MOE_IB_X_PIECE 32
+#endif
+#ifndef DG_MEGA_MOE_IB_X_NCTX
+#define DG_MEGA_MOE_IB_X_NCTX 64
+#endif
+    constexpr uint32_t kIBXPiece = DG_MEGA_MOE_IB_X_PIECE;
     DG_STATIC_ASSERT(kIBT <= kIBChunk * layout::MegaMoESignals::kIBOMaxChunks, "IB chunk table");
     // Gin context assignment. DG_MEGA_MOE_IB_SHARING == 2 (exclusive THREAD contexts): every concurrent issuer gets its
     // own context, which works because each piece / chunk is posted exactly once per launch by exactly one thread.
@@ -412,8 +422,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_early_on = [&](const uint32_t& ntok) { return kIBSplitScan or ib_cim_on(ntok); };
     DG_STATIC_ASSERT(2 * kNumExpertsPerRank + 2 <= 256, "D1 counters live in the first 1 KB of smem_d");
     const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
+    const auto ib_xnctx = [&]() { return cute::max(1u, cute::min(static_cast<uint32_t>(DG_MEGA_MOE_IB_X_NCTX), static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R)); };
     const auto piece_orig = [&](const uint32_t& q) {
-        return kIBHdrCtx ? 2 * ib_R + q % cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R) : q + 1; };
+        return kIBHdrCtx ? 2 * ib_R + q % ib_xnctx() : q + 1; };
     if (kIBThreadCtx and ib_R * (4 + 2 * kIBM) > DG_MEGA_MOE_IB_CONTEXTS) {
         if (blockIdx.x == 0 and threadIdx.x == 0)
             printf("DeepGEMM IB: DG_MEGA_MOE_IB_SHARING>=1 needs %u Gin contexts (R=%u, M=%u), have %d\n",
@@ -2582,7 +2593,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             printf("OPUS_D0 rank=%u epoch=%llu meta posted\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch);
 #endif
         {
-            const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk;
+            DG_STATIC_ASSERT(kIBXPiece == kIBChunk or not kIBWaveSort, "X_PIECE != 32 excludes WAVE_SORT");
+            const uint32_t num_x_chunks = (num_tokens + kIBXPiece - 1) / kIBXPiece;
             const uint32_t num_pieces = 1 + num_x_chunks;  // SF, x chunks
             const uint32_t q0 = kIBFront ? sm_idx - 1 : kNumSMs - 2 - sm_idx;
             const bool q_ok = kIBFront ? sm_idx >= 1 : sm_idx + 2 <= kNumSMs;
@@ -2649,12 +2661,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (piece == 0) {
                         off = kIBOffSF, bytes = static_cast<int64_t>(num_tokens) * kIBSFBytes;
                     } else {
-                        const uint32_t t0 = (piece - 1) * kIBChunk, t1 = cute::min(t0 + kIBChunk, num_tokens);
+                        const uint32_t t0 = (piece - 1) * kIBXPiece, t1 = cute::min(t0 + kIBXPiece, num_tokens);
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
                     const auto src = ib_ws_on(num_tokens) and kIBWSMode != 3 and piece > 0 ? x_stage + off : ib_input_base + off;
                     constexpr uint32_t kXOCtx = kIBHdrCtx ? cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2u) : 1u;
-                    const uint32_t xo_nctx = kIBHdrCtx ? cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R) : kXOCtx;
+                    const uint32_t xo_nctx = kIBHdrCtx ? ib_xnctx() : kXOCtx;
                     if (kIBXOrder and q >= xo_nctx and q - xo_nctx < 256)  // previous piece on this context issued first
                         IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + (q - xo_nctx)) != ib_epoch, (void) 0, "x_order", q, 0);
                     make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),

@@ -2687,13 +2687,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t t0 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * scan_j / kIBScanSlices);
                     const uint32_t t1 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * (scan_j + 1) / kIBScanSlices);
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);  // cnt / cnt2 zeroed above
-                    // Pass A: count this slice's entries for our experts
-                    for (uint32_t i = t0 * kNumTopk + epilogue_thread_idx; i < t1 * kNumTopk; i += kNumEpilogueThreads) {
-                        uint64_t v = ptx::ld_volatile(idx + i);
-                        IB_POLL(v == kIBIdxSentinel, v = ptx::ld_volatile(idx + i), "sl_idx", r, i);
-                        const int e = static_cast<int>(static_cast<int64_t>(v));
-                        if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx)
-                            atomicAdd_block(cnt + static_cast<uint32_t>(e) % kNumExpertsPerRank, 1u);
+                    // Pass A: count this slice's entries for our experts. kSLB loads in flight per thread (NVLink latency-bound:
+                    // one dependent load per iteration made the slices slower than the single-SM scan, B300 trace)
+                    constexpr uint32_t kSLB = 8;
+                    const uint32_t e0 = t0 * kNumTopk, e1 = t1 * kNumTopk;
+                    for (uint32_t i0 = e0; i0 < e1; i0 += kNumEpilogueThreads * kSLB) {
+                        uint64_t v[kSLB];
+                        #pragma unroll
+                        for (uint32_t u = 0; u < kSLB; ++ u) {
+                            const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                            v[u] = i < e1 ? ptx::ld_volatile(idx + i) : 0ull;
+                        }
+                        #pragma unroll
+                        for (uint32_t u = 0; u < kSLB; ++ u) {
+                            const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                            if (i < e1) {
+                                IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "sl_idx", r, i);
+                                const int e = static_cast<int>(static_cast<int64_t>(v[u]));
+                                if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx)
+                                    atomicAdd_block(cnt + static_cast<uint32_t>(e) % kNumExpertsPerRank, 1u);
+                            }
+                        }
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     uint32_t* const my_cnt = ib_sl_cnt + (k * 4 + scan_j) * 256;
@@ -2726,13 +2740,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     // Pass B: slot entries (token order within the slice; slices are in token order); rule A for the weights
-                    for (uint32_t i = t0 * kNumTopk + epilogue_thread_idx; i < t1 * kNumTopk; i += kNumEpilogueThreads) {
-                        const int e = static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + i)));
-                        uint32_t wv = ptx::ld_volatile(wts + i);
-                        IB_POLL(wv == 0xffffffffu, wv = ptx::ld_volatile(wts + i), "sl_w", r, i);
-                        if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
-                            const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                            *workspace.get_src_token_topk_idx_ptr(le, r, cnt2[le] + atomicAdd_block(cnt + le, 1u)) = i;
+                    for (uint32_t i0 = e0; i0 < e1; i0 += kNumEpilogueThreads * kSLB) {
+                        uint64_t v[kSLB];
+                        uint32_t wv[kSLB];
+                        #pragma unroll
+                        for (uint32_t u = 0; u < kSLB; ++ u) {
+                            const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                            v[u] = i < e1 ? ptx::ld_volatile(idx + i) : 0ull;
+                            wv[u] = i < e1 ? ptx::ld_volatile(wts + i) : 0u;
+                        }
+                        #pragma unroll
+                        for (uint32_t u = 0; u < kSLB; ++ u) {
+                            const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                            if (i < e1) {
+                                IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "sl_w", r, i);
+                                const int e = static_cast<int>(static_cast<int64_t>(v[u]));
+                                if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
+                                    const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
+                                    *workspace.get_src_token_topk_idx_ptr(le, r, cnt2[le] + atomicAdd_block(cnt + le, 1u)) = i;
+                                }
+                            }
                         }
                     }
                     __threadfence();

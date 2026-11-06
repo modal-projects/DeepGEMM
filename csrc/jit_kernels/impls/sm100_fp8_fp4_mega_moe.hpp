@@ -177,6 +177,8 @@ static void sm100_fp8_fp4_mega_moe(
         (is_ib and std::getenv("DG_MEGA_MOE_IB_RET_GROUP") != nullptr ? std::format("#define DG_MEGA_MOE_IB_RET_GROUP {}\n", std::getenv("DG_MEGA_MOE_IB_RET_GROUP")) : std::string()) +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_C3_REPOLL") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_C3_REPOLL")) != "0" ? "#define DG_MEGA_MOE_IB_C3_REPOLL 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_C3_SPLIT") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_C3_SPLIT")) != "0" ? "#define DG_MEGA_MOE_IB_C3_SPLIT 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_EARLY_REARM") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_EARLY_REARM")) != "0" ? "#define DG_MEGA_MOE_IB_EARLY_REARM 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_NO_RET_HDR") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_NO_RET_HDR")) != "0" ? "#define DG_MEGA_MOE_IB_NO_RET_HDR 1\n" : "") +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_BATCH_D") != nullptr ? std::format("#define DG_MEGA_MOE_IB_FWD_BATCH_D {}\n", std::getenv("DG_MEGA_MOE_IB_FWD_BATCH_D")) : std::string()) +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_XDELAY_NS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_XDELAY_NS {}\n", std::getenv("DG_MEGA_MOE_IB_XDELAY_NS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_L2_PREFETCH") != nullptr ? std::format("#define DG_MEGA_MOE_L2_PREFETCH {}\n", std::getenv("DG_MEGA_MOE_L2_PREFETCH")) : std::string()) +

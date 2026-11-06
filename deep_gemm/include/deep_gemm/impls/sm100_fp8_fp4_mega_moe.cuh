@@ -818,6 +818,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBDeferRearm = false;
 #endif
+    // DG_MEGA_MOE_IB_EARLY_REARM=1 (tail 3, end of kernel): the dispatch warps re-arm the mirrors BEFORE the cleanup barrier, as
+    // soon as every node-local rank has published its combine-ready flag (= its L2 grid sync, so all its L1 pulls from our
+    // mirrors are done) and our forward-combine polled every row, instead of after the cleanup barrier at the very end
+#if defined(DG_MEGA_MOE_IB_EARLY_REARM) and DG_MEGA_MOE_IB_EARLY_REARM
+    constexpr bool kIBEarlyRearm = true;
+#else
+    constexpr bool kIBEarlyRearm = false;
+#endif
+    // DG_MEGA_MOE_IB_NO_RET_HDR=1 (tail 3): with tokens to return, the proxy posts no return header (the source polls every byte of
+    // every record anyway, rule A) and the source skips the rule-H header wait; zero-token proxies still post it. Removes one
+    // Gin put (and its serial issue on the warp that completes the last chunk) per remote node at the end of every launch
+#if defined(DG_MEGA_MOE_IB_NO_RET_HDR) and DG_MEGA_MOE_IB_NO_RET_HDR
+    constexpr bool kIBNoRetHdr = true;
+#else
+    constexpr bool kIBNoRetHdr = false;
+#endif
     // Runtime size gate (per source: the sender uses its token count, the receivers / proxy the source's header count,
     // so both sides always agree): below DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS the old order is used
 #ifndef DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS
@@ -1228,10 +1244,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
 #endif
                 }
-                if (state == 2 and lane_idx == 1)
+                if (state == 2 and lane_idx == 1 and not kIBNoRetHdr)
                     make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
 #if defined(DG_MEGA_MOE_IB_RET_DB) and DG_MEGA_MOE_IB_RET_DB
-                if (state == 2 and lane_idx == 1)  // doorbell for the header itself
+                if (state == 2 and lane_idx == 1 and not kIBNoRetHdr)  // doorbell for the header itself
                     make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
 #endif
                 __syncwarp();
@@ -1922,6 +1938,55 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
         TT_MAX(11, thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        const auto ib_rearm_mirrors = [&]() {
+        // E: re-arm the mirrors of this parity. Every node-local pull from them is done (barrier above); the
+        // forward-combine polled every row (fdone), so every byte the NIC wrote this launch has landed (rule A)
+        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+            const uint32_t n = ib_node_of_slot(nr);
+            const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+            const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
+            if (thread_idx == 0)
+                IB_POLL(ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks * (kIBRetGroups > 0 ? kIBRetGroups : 1u), (void) 0, "e_fdone", n, nchunks);
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            const auto mir = ib_mirror(ib_parity, n);
+            const uint32_t gtid = sm_idx * kNumDispatchThreads + thread_idx;
+            constexpr uint32_t kGThreads = kNumSMs * kNumDispatchThreads;
+            const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+            const uint4 idx_sentinel = {0u, 0x80000000u, 0u, 0x80000000u};
+            if (kIBOracle) continue;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBTokBytes / 16; u += kGThreads)
+                reinterpret_cast<uint4*>(mir)[u] = ones;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBSFBytes / 16; u += kGThreads)
+                reinterpret_cast<uint4*>(mir + kIBOffSF)[u] = ones;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk * 8 / 16; u += kGThreads)
+                reinterpret_cast<uint4*>(mir + kIBOffIdx)[u] = idx_sentinel;
+            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk; u += kGThreads)
+                reinterpret_cast<uint32_t*>(mir + kIBOffW)[u] = 0xffffffffu;
+            if (gtid == 0)
+                *reinterpret_cast<uint64_t*>(mir + kIBOffHdr) = ~0ull;
+            if (kIBSenderTables) {
+                for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk; u += kGThreads)
+                    reinterpret_cast<uint32_t*>(mir + kIBOffSTab)[u] = 0xffffffffu;
+            }
+            if (kIBCountsEarly or kIBCountsInMeta) {
+                for (int64_t u = gtid; u < kIBCntBytes / 4; u += kGThreads)
+                    reinterpret_cast<uint32_t*>(mir + kIBOffCnt)[u] = 0xffffffffu;
+            }
+        }
+        };
+        if constexpr (kIBEarlyRearm) {
+            // EARLY_REARM: every node-local rank (ourselves included) has passed its L2 grid sync, so its pulls from our mirrors
+            // are done; the forward-combine's fdone wait inside the re-arm covers rule A
+            const uint64_t er_grid_idx = ptx::get_grid_idx() + 1;
+            if (thread_idx < kNumRanks and not is_remote(thread_idx)) {
+                const auto fp = workspace.get_combine_ready_grid_idx_ptr(thread_idx);
+                IB_POLL(ptx::ld_acq_sys(fp) != er_grid_idx, (void) 0, "early_rearm_ready", thread_idx, 0);
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            ib_rearm_mirrors();
+        }
+#endif
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if constexpr (kIBDeferRearm) {
             // One warp per token: re-arm the node-local slots' partial rows (the forward-combine read every one of them)
             const uint32_t gw = warp_idx * kNumSMs + sm_idx;
@@ -2020,40 +2085,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             [&]() { return make_gin(0); }, ib_epoch, true, false, false);
         TT_MAX(12, thread_idx == 0);
-        // E: re-arm the mirrors of this parity. Every node-local pull from them is done (barrier above); the
-        // forward-combine polled every row (fdone), so every byte the NIC wrote this launch has landed (rule A)
-        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
-            const uint32_t n = ib_node_of_slot(nr);
-            const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
-            const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
-            if (thread_idx == 0)
-                IB_POLL(ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks * (kIBRetGroups > 0 ? kIBRetGroups : 1u), (void) 0, "e_fdone", n, nchunks);
-            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            const auto mir = ib_mirror(ib_parity, n);
-            const uint32_t gtid = sm_idx * kNumDispatchThreads + thread_idx;
-            constexpr uint32_t kGThreads = kNumSMs * kNumDispatchThreads;
-            const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
-            const uint4 idx_sentinel = {0u, 0x80000000u, 0u, 0x80000000u};
-            if (kIBOracle) continue;
-            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBTokBytes / 16; u += kGThreads)
-                reinterpret_cast<uint4*>(mir)[u] = ones;
-            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBSFBytes / 16; u += kGThreads)
-                reinterpret_cast<uint4*>(mir + kIBOffSF)[u] = ones;
-            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk * 8 / 16; u += kGThreads)
-                reinterpret_cast<uint4*>(mir + kIBOffIdx)[u] = idx_sentinel;
-            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk; u += kGThreads)
-                reinterpret_cast<uint32_t*>(mir + kIBOffW)[u] = 0xffffffffu;
-            if (gtid == 0)
-                *reinterpret_cast<uint64_t*>(mir + kIBOffHdr) = ~0ull;
-            if (kIBSenderTables) {
-                for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk; u += kGThreads)
-                    reinterpret_cast<uint32_t*>(mir + kIBOffSTab)[u] = 0xffffffffu;
-            }
-            if (kIBCountsEarly or kIBCountsInMeta) {
-                for (int64_t u = gtid; u < kIBCntBytes / 4; u += kGThreads)
-                    reinterpret_cast<uint32_t*>(mir + kIBOffCnt)[u] = 0xffffffffu;
-            }
-        }
+        if (not kIBEarlyRearm)
+            ib_rearm_mirrors();
         IB_TRACE(17, sm_idx == 0 and thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
         if (sm_idx == 0 and thread_idx == 0)
@@ -3846,7 +3879,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         TT_MAX(9, epilogue_thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // Rule H: the return header of every proxy is awaited (even with zero tokens), then re-armed
-        if (sm_idx == 0 and epilogue_thread_idx + 1 < ib_num_nodes) {
+        if (sm_idx == 0 and epilogue_thread_idx + 1 < ib_num_nodes and not (kIBNoRetHdr and num_tokens > 0)) {
             const uint32_t n = ib_node_of_slot(epilogue_thread_idx);
             const auto hdr = reinterpret_cast<uint64_t*>(ib_ret(ib_parity, n) + kIBRetHdr);
             comm::wait_until([&]() { return (ib_oracle_now and ptx::ld_volatile(hdr) != ~0ull) or ptx::ld_volatile(hdr) == ib_epoch; }, [&]() {

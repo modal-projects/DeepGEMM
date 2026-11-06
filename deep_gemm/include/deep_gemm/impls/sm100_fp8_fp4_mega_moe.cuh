@@ -632,9 +632,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const uint32_t i = threadIdx.x;
         if (i < 32) {
             auto* tt = tl_ttrace;
-            const bool is_time = i < 16;
+            const bool is_time = i < 16 or i >= 27;  // 27-31: end-of-kernel stamps (absolute max, reset to 0 per launch)
             tt[32 + i] = is_time ? static_cast<uint64_t>(static_cast<int64_t>(tt[i]) - static_cast<int64_t>(t16)) : tt[i];
-            if (not is_time) tt[i] = 0;
+            if (i >= 16) tt[i] = 0;
             if ((kTTMinMask >> i) & 1u) tt[i] = ~0ull;
         } else if (i >= 64 and i < 128) {
             auto* tc = tl_tchunk;
@@ -3920,6 +3920,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 printf("OPUS_TRACE8 rank=%u epoch=%llu | prev launch chunk puts 16-31: c16=%.1f c17=%.1f c18=%.1f c19=%.1f c20=%.1f c21=%.1f c22=%.1f c23=%.1f c24=%.1f c25=%.1f c26=%.1f c27=%.1f c28=%.1f c29=%.1f c30=%.1f c31=%.1f\n",
                        sym_buffer.rank_idx, (unsigned long long) ib_epoch, cu(16), cu(17), cu(18), cu(19), cu(20), cu(21), cu(22), cu(23), cu(24), cu(25), cu(26), cu(27), cu(28), cu(29), cu(30), cu(31));
             }
+            printf("OPUS_TRACEB rank=%u epoch=%llu | prev launch end: dispatch_last=%.1f epilogue_last=%.1f other_last=%.1f after_sysfence=%.1f epi_after_sysfence=%.1f\n",
+                   sym_buffer.rank_idx, (unsigned long long) ib_epoch, pu(27), pu(28), pu(29), pu(30), pu(31));
             printf("OPUS_TRACE6 rank=%u epoch=%llu | prev launch tail counts: fwd_items=%llu fwd_part_miss=%llu fwd_x_miss=%llu fwd_item_ns=%.0f c3_rec_miss=%llu c3_tokens=%llu c3_token_ns=%.0f ret_puts=%llu fwd_items_epi=%llu rearm_done=%.1f c3_loc_last=%.1f c3_after_loc_ns=%.0f puts_after_l2=%llu | knobs join=%d batch=%d batch_d=%d pf=%d c3e=%d defer=%d repoll=%d retg=%d split=%d\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, (unsigned long long) tt[16], (unsigned long long) tt[17], (unsigned long long) tt[19],
                    tt[16] > tt[17] ? static_cast<double>(tt[20]) / static_cast<double>(tt[16] - tt[17]) : 0.0,
@@ -3943,6 +3945,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
         IB_TRACE_MAX(34, epilogue_thread_idx == 0);  // epilogue warps done, slowest SM (reported by the next launch)
     }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+    {
+        // End-of-kernel gap: each warp's last instruction by role (27 dispatch, 28 epilogue, 29 TMA / MMA / scheduler), then the
+        // same after a system-scope fence (30 any warp, 31 epilogue warps): a long fence = outstanding writes still draining
+        const uint32_t eslot = warp_idx < kNumDispatchWarps ? 27u : (warp_idx < kNumDispatchWarps + 4 ? 29u : 28u);
+        const uint32_t emask = __activemask();
+        __syncwarp(emask);
+        TT_MAX(eslot, lane_idx == static_cast<uint32_t>(__ffs(emask) - 1));
+        __threadfence_system();
+        __syncwarp(emask);
+        TT_MAX(30, lane_idx == static_cast<uint32_t>(__ffs(emask) - 1));
+        TT_MAX(31, eslot == 28u and lane_idx == static_cast<uint32_t>(__ffs(emask) - 1));
+    }
+#endif
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");

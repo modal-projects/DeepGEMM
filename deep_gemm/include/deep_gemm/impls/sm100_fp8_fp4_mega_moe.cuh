@@ -788,6 +788,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // DG_MEGA_MOE_IB_FWD_ROTATE=1 (with FWD_JOIN, EP > 16; lighter alternative to FWD_INTERLEAVE): each warp starts its walk over the
     // remote nodes at slot (global warp % R), so the warps spread over the nodes from the start; each node keeps its own claim counter
     // and a warp moves on to the next node once its current one has no items left
+#ifndef DG_MEGA_MOE_IB_FWD_ROTATE_MIN
+#define DG_MEGA_MOE_IB_FWD_ROTATE_MIN 512
+#endif
 #if defined(DG_MEGA_MOE_IB_FWD_ROTATE) and DG_MEGA_MOE_IB_FWD_ROTATE
     constexpr bool kIBFwdRotate = kIBFwdDyn and kNumRanks > 16;
 #else
@@ -1087,7 +1090,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             fi_g = fi_claim();
         }
         for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
-            const uint32_t nr = fi_on ? fi_g % fi_R : (kIBFwdRotate ? (nr_it + global_warp) % (ib_num_nodes - 1) : nr_it);
+            // FWD_ROTATE runtime gate (local decision, any value is correct): only from DG_MEGA_MOE_IB_FWD_ROTATE_MIN tokens on (EP32 MS 128: +2.3)
+            const bool rot_on = kIBFwdRotate and num_tokens >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN;
+            const uint32_t nr = fi_on ? fi_g % fi_R : (rot_on ? (nr_it + global_warp) % (ib_num_nodes - 1) : nr_it);
             const uint32_t n = ib_node_of_slot(nr);
             const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
             const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);

@@ -851,7 +851,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // only when there is a lot to scan (MegaSeek 1024: -34 us); below DG_MEGA_MOE_IB_SLICE_MIN top-k entries per rank the
     // single-SM scan and its SM layout are used unchanged (P4L cost +3 / +8 us at 128 and +3 at Flash 1024).
 #ifndef DG_MEGA_MOE_IB_SLICE_MIN
-#define DG_MEGA_MOE_IB_SLICE_MIN 12288
+#define DG_MEGA_MOE_IB_SLICE_MIN 8192
 #endif
     const uint32_t ib_P = (kIBScanSlices > 1 and num_tokens * kNumTopk >= DG_MEGA_MOE_IB_SLICE_MIN) ? kIBScanSlices : 1u;
     DG_STATIC_ASSERT(kIBScanSlices == 1 or not (kIBEarlyPublish or kIBCountsEarly or kIBWaveSort), "SCAN_SLICES excludes CIM / SPLIT_SCAN / COUNTS_EARLY / WAVE_SORT");

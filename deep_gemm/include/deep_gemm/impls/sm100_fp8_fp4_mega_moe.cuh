@@ -779,7 +779,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // wave order). Without it every warp drains node slot 0's items before it claims any of slot 1's, so during L2 all warps wait on
     // slot 0 and the other nodes' items are all left for after L2. No effect with one remote node (EP16).
 #if defined(DG_MEGA_MOE_IB_FWD_INTERLEAVE) and DG_MEGA_MOE_IB_FWD_INTERLEAVE
-    constexpr bool kIBFwdInterleave = kIBFwdDyn;
+    // compiled in only for EP > 16 (>= 2 remote nodes with 8-GPU NVLink domains): at EP16 the extra code alone cost +13.8 us at MegaSeek
+    // 1024 (dispatch-warp register pressure; the runtime path was off), so EP16 builds keep the old loop
+    constexpr bool kIBFwdInterleave = kIBFwdDyn and kNumRanks > 16;
 #else
     constexpr bool kIBFwdInterleave = false;
 #endif

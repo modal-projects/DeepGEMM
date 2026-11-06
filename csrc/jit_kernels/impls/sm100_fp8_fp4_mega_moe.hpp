@@ -187,6 +187,7 @@ static void sm100_fp8_fp4_mega_moe(
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_EARLY_REARM") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_EARLY_REARM")) != "0" ? "#define DG_MEGA_MOE_IB_EARLY_REARM 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_NO_RET_HDR") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_NO_RET_HDR")) != "0" ? "#define DG_MEGA_MOE_IB_NO_RET_HDR 1\n" : "") +
         std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_INTERLEAVE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_FWD_INTERLEAVE")) != "0" ? "#define DG_MEGA_MOE_IB_FWD_INTERLEAVE 1\n" : "") +
+        std::string(is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_ROTATE") != nullptr and std::string(std::getenv("DG_MEGA_MOE_IB_FWD_ROTATE")) != "0" ? "#define DG_MEGA_MOE_IB_FWD_ROTATE 1\n" : "") +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_FWD_BATCH_D") != nullptr ? std::format("#define DG_MEGA_MOE_IB_FWD_BATCH_D {}\n", std::getenv("DG_MEGA_MOE_IB_FWD_BATCH_D")) : std::string()) +
         (is_ib and std::getenv("DG_MEGA_MOE_IB_XDELAY_NS") != nullptr ? std::format("#define DG_MEGA_MOE_IB_XDELAY_NS {}\n", std::getenv("DG_MEGA_MOE_IB_XDELAY_NS")) : std::string()) +
         (std::getenv("DG_MEGA_MOE_L2_PREFETCH") != nullptr ? std::format("#define DG_MEGA_MOE_L2_PREFETCH {}\n", std::getenv("DG_MEGA_MOE_L2_PREFETCH")) : std::string()) +

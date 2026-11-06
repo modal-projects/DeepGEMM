@@ -2696,7 +2696,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 120) = num_tokens;
 #endif
             IB_TRACE(24, epilogue_thread_idx == 0);
-            if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+            // DG_MEGA_MOE_IB_META_SPLIT=1 (with STAGE_NT): the meta goes as two concurrent puts from two warps: the idx rows
+            // < num_tokens (meta context; the receiver's idx rows >= nt are sentinels: it re-arms every row it was sent),
+            // and the weight region + header (header context). Drops the (kIBT - nt) * K * 8 idx bytes of sentinels from the
+            // critical put (kIBT = 1920 on the dev server: MegaSeek 1024 sends 292 KB of idx instead of 155 KB).
+#if defined(DG_MEGA_MOE_IB_META_SPLIT) and DG_MEGA_MOE_IB_META_SPLIT
+            constexpr bool kMetaSplit = true;
+            DG_STATIC_ASSERT(not kMetaSplit or (kIBHdrCtx and not kIBCountsInMeta and not kIBSenderTables), "META_SPLIT needs HDR_CTX, no CIM / ST");
+#else
+            constexpr bool kMetaSplit = false;
+#endif
+            if (kMetaSplit and epilogue_warp_idx <= 1 and lane_idx + 1 < ib_num_nodes) {
+                const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
+                const auto dst = ib_mirror(ib_parity, ib_my_node);
+                const uint32_t cp = ib_cp(sym_buffer.rank_idx, n);
+                if (epilogue_warp_idx == 0) {
+                    SL_TR(0, 24, true);
+                    if (num_tokens > 0)
+                        make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put(dst + kIBOffIdx, stg + kIBOffIdx,
+                            static_cast<uint64_t>(num_tokens) * kNumTopk * 8, cp);
+                    SL_TR(0, 25, true);
+                } else {
+                    const auto gin_h = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
+                    gin_h.put(dst + kIBOffW, stg + kIBOffW, static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffW), cp);
+#if not (defined(DG_MEGA_MOE_IB_NO_META_DOORBELL) and DG_MEGA_MOE_IB_NO_META_DOORBELL)
+                    gin_h.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
+#endif
+                    SL_TR(0, 26, true);
+                }
+            }
+            if (not kMetaSplit and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);
                 SL_TR(0, 24, true);  // meta put: before issue (slot 24), after the put (25), after the doorbell (26)
                 const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);

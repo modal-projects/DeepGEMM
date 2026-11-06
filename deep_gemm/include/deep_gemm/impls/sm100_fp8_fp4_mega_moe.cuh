@@ -3650,10 +3650,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // C3 gate (DG_MEGA_MOE_IB_C3_HDR_GATE, defined with NO_RET_HDR): 1 = all return headers, 2 = per-chunk tail flags
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         uint64_t* const c3_gate = reinterpret_cast<uint64_t*>(tl_fgroup);  // [16 nodes][64 chunks] epoch words (mode 1: word 0)
-        const bool c3_poller = kIBC3Gate == 2 and sm_idx == 0 and epilogue_warp_idx == 0;
-        const uint32_t c3_gw = epilogue_warp_idx * kNumSMs + sm_idx - (kIBC3Gate == 2 ? 1u : 0u);  // the poller takes no items
-        constexpr uint32_t c3_nw = kNumSMs * kNumEpilogueWarps - (kIBC3Gate == 2 ? 1u : 0u);
+        // DG_MEGA_MOE_IB_C3_GATE_MIN=T: gate 2 only for a source with >= T tokens (source-side only, so a runtime decision
+        // per source is consistent; GB200 MegaSeek 128: the gate costs ~+45 us there while the stall regime needs size)
+#ifndef DG_MEGA_MOE_IB_C3_GATE_MIN
+#define DG_MEGA_MOE_IB_C3_GATE_MIN 0
+#endif
+        const bool c3_g2 = kIBC3Gate == 2 and num_tokens >= DG_MEGA_MOE_IB_C3_GATE_MIN;
+        const bool c3_poller = c3_g2 and sm_idx == 0 and epilogue_warp_idx == 0;
+        const uint32_t c3_gw = epilogue_warp_idx * kNumSMs + sm_idx - (c3_g2 ? 1u : 0u);  // the poller takes no items
+        const uint32_t c3_nw = kNumSMs * kNumEpilogueWarps - (c3_g2 ? 1u : 0u);
 #else
+        constexpr bool c3_g2 = false;
         constexpr bool c3_poller = false;
         const uint32_t c3_gw = epilogue_warp_idx * kNumSMs + sm_idx;
         constexpr uint32_t c3_nw = kNumSMs * kNumEpilogueWarps;
@@ -3841,7 +3848,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const bool hit = (ib_nodes_hit >> n) & 1u;
                 // STREAM_COMBINE: node n's proxy returned our records in its wave order (pos2, computed in D0)
                 const uint32_t rec_pos = ib_sc_on(num_tokens) ? ib_tab[kIBTabPos2 + nr * kIBTabT + token_idx] : token_idx;
-                if constexpr (kIBC3Gate == 2) {
+                if (kIBC3Gate == 2 and c3_g2) {
                     if (lane_idx == 0)
                         IB_POLL(ptx::ld_volatile(c3_gate + n * 64 + rec_pos / kIBChunk) != ib_epoch, __nanosleep(100), "c3_cflag", n, rec_pos);  // a hint only: every record is still sentinel-checked (rule A), so no acquire
                     __syncwarp();

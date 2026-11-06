@@ -343,6 +343,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     DG_STATIC_ASSERT(not kIBCountsInMeta or (kIBFront and kIBHdrCtx and not kIBCountsEarly), "COUNTS_IN_META needs FRONT + HDR_CTX, not COUNTS_EARLY");
     constexpr bool kIBEarlyPublish = kIBSplitScan or kIBCountsInMeta;
+    // DG_MEGA_MOE_IB_CIM_DISPATCH=1 (with COUNTS_IN_META): the counts come from the dispatch warps' expert_send_count
+    // (final after the dispatch grid sync) and SM 0's dispatch thread puts them on the META context, plus a header doorbell,
+    // instead of the meta SM counting every top-k entry while staging (B300: CIM alone +5..+10 @128, +12 @MegaSeek 1024)
+#if defined(DG_MEGA_MOE_IB_CIM_DISPATCH) and DG_MEGA_MOE_IB_CIM_DISPATCH
+    constexpr bool kIBCimDispatch = true;
+#else
+    constexpr bool kIBCimDispatch = false;
+#endif
     // DG_MEGA_MOE_IB_SENDER_TABLES=1 (with COUNTS_IN_META; prior art: DeepEP notify_dispatch / layout.cu): the meta SM also
     // builds the compact per-(destination rank, expert) entry lists for each remote node, in token order, and puts them
     // right after the counts on the same context. Receivers copy only their own slice (~T*K/16 entries per source instead
@@ -1077,7 +1085,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     expert_status);
             }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if constexpr (kIBCountsEarly) {
+            if constexpr (kIBCountsEarly or kIBCimDispatch) {
                 // Stage the remote-destination counts ([destination rank][local expert] u32) in our own node's mirror slot
                 // (unused locally) and put each remote node's slice to our counterpart there (same offset)
                 const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;
@@ -1089,11 +1097,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
                 if (thread_idx + 1 < ib_num_nodes) {
                     const uint32_t nr = thread_idx, n = ib_node_of_slot(nr);
-                    const auto gin = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
+                    const auto gin = kIBCimDispatch ? make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase)
+                                                    : make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
                     const uint64_t bytes = static_cast<uint64_t>(ib_lsa) * kNumExpertsPerRank * 4;
                     const auto src = stg + static_cast<int64_t>(n) * static_cast<int64_t>(bytes);
                     gin.put(stg, src, bytes, ib_cp(sym_buffer.rank_idx, n));
-                    gin.put(stg, src, bytes, ib_cp(sym_buffer.rank_idx, n));  // doorbell: identical bytes push the first through
+                    if (kIBCimDispatch)  // doorbell on the meta context: the (identical) header value pushes the counts through
+                        gin.put_value(reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens,
+                                      ib_cp(sym_buffer.rank_idx, n));
+                    else
+                        gin.put(stg, src, bytes, ib_cp(sym_buffer.rank_idx, n));  // doorbell: identical bytes push the first through
                 }
                 IB_TRACE(32, thread_idx == 0);
             }
@@ -2113,14 +2126,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = vi[u];
                         reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = vw[u];
                     }
-                    if constexpr (kIBCountsInMeta) {
+                    if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
                         const int e = static_cast<int>(static_cast<int64_t>(vi[u]));
                         if (i < num_tokens * kNumTopk and e >= 0 and static_cast<uint32_t>(e) / cim_node_experts != ib_my_node)
                             atomicAdd_block(cim_cnt + e, 1u);
                     }
                 }
             }
-            if constexpr (kIBCountsInMeta) {
+            if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 for (uint32_t g = epilogue_thread_idx; g < kNumExperts; g += kNumEpilogueThreads)
                     if (g / cim_node_experts != ib_my_node)
@@ -2136,7 +2149,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
                 gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
                           static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
-                if constexpr (kIBCountsInMeta) {
+                if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
                     const uint64_t cb = static_cast<uint64_t>(cim_node_experts) * 4;
                     gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffCnt, stg + kIBOffCnt + static_cast<int64_t>(n) * static_cast<int64_t>(cb),
                               cb, ib_cp(sym_buffer.rank_idx, n));
@@ -2146,6 +2159,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     ib_cp(sym_buffer.rank_idx, n));
             }
             __syncwarp();
+            if (kIBCimDispatch and ib_st_on(num_tokens)) {
+                // CIM_DISPATCH: the staging loop did not count; the tables need per-expert counts for their prefix
+                for (uint32_t g = epilogue_thread_idx; g < kNumExperts; g += kNumEpilogueThreads)
+                    cim_cnt[g] = 0;
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                for (uint32_t i = epilogue_thread_idx; i < num_tokens * kNumTopk; i += kNumEpilogueThreads) {
+                    const int e = static_cast<int>(static_cast<int64_t>(__ldcg(reinterpret_cast<const unsigned long long*>(in_idx) + i)));
+                    if (e >= 0 and static_cast<uint32_t>(e) / cim_node_experts != ib_my_node)
+                        atomicAdd_block(cim_cnt + e, 1u);
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            }
             if (ib_st_on(num_tokens)) {
                 // Built AFTER the meta + counts are posted (the build cost ~30 us of meta latency when it came first)
                 // Exclusive prefix over remote experts in global order (our node's experts count 0): each thread owns a

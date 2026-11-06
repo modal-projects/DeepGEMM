@@ -283,6 +283,18 @@ struct MegaMoEScheduler {
         return get_pool_block_offset(kNumExpertsPerRank);
     }
 
+    // ROUTED_FIRST: non-blocking "every expert's counts arrived from every rank" (warp-uniform)
+    CUTLASS_DEVICE bool expert_recv_count_ready() const {
+        bool ok = true;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            if (expert_idx < kNumExpertsPerRank)
+                ok &= static_cast<uint32_t>(ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx)) >> 32) == kNumSMs * kNumRanks;
+        }
+        return __all_sync(0xffffffff, ok);
+    }
+
     CUTLASS_DEVICE void fetch_expert_recv_count() {
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
@@ -433,13 +445,17 @@ struct MegaMoEScheduler {
     }
 
     template <BlockPhase kBlockPhase, uint32_t kShapeN, uint32_t kShapeK>
-    CUTLASS_DEVICE void shared_mainloop(const uint32_t& num_tokens, const uint32_t& lane_idx, const uint32_t* task_count_ptr) {
+    CUTLASS_DEVICE void shared_mainloop(const uint32_t& num_tokens, const uint32_t& lane_idx, const uint32_t* task_count_ptr,
+                                        const bool& yield_on_counts = false) {
         constexpr uint32_t kNumNClusters = kShapeN / BLOCK_N / 2;
         DG_STATIC_ASSERT(kNumNClusters % kNumLocalityDomains == 0, "Each domain must take whole clusters");
         const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
         uint32_t m_block_idx, n_cluster_idx;
         while (true) {
             task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            // ROUTED_FIRST: stop claiming shared tasks once the routed counts are known (the rest run after the routed ones)
+            if (yield_on_counts and expert_recv_count_ready())
+                break;
 
             // Use dynamic scheduling to reduce tailing across shared L1/L2 tile shapes.
             if (not get_next_task_idx<kNumNClusters>(task_count_ptr, num_m_blocks, m_block_idx, n_cluster_idx))
@@ -456,11 +472,19 @@ struct MegaMoEScheduler {
         // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
         constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
         const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
+#if defined(DG_MEGA_MOE_ROUTED_FIRST) and DG_MEGA_MOE_ROUTED_FIRST
+        // DG_MEGA_MOE_ROUTED_FIRST=1: routed tasks get priority over the shared expert. Shared L1 tasks fill the count wait
+        // only; once every count is known the scheduler stops claiming them, runs the routed tasks, then claims the rest of
+        // the shared L1 and all shared L2 at the tail (where SMs otherwise wait on the combine / network).
+        constexpr bool kRoutedFirst = true;
+#else
+        constexpr bool kRoutedFirst = false;
+#endif
         if constexpr (kHasShared) {
             // Shared expert L1 tasks do not depend on dispatch.
             shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
-                num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr());
-            if (is_shared_l2_early)
+                num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr(), kRoutedFirst);
+            if (is_shared_l2_early and not kRoutedFirst)
                 shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }
@@ -479,7 +503,10 @@ struct MegaMoEScheduler {
         } while (task_info.is_valid());
 
         if constexpr (kHasShared) {
-            if (not is_shared_l2_early)
+            if (kRoutedFirst)  // remaining shared L1 claims (the counter continues where the yield left it)
+                shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
+                    num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr());
+            if (not is_shared_l2_early or kRoutedFirst)
                 shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }

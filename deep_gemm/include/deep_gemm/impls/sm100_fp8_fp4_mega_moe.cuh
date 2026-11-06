@@ -147,6 +147,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define IB_TRACE(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_trace[i] = t_; } } while (0)
 // max over every SM that reaches the point (absolute %globaltimer, so no per-launch reset is needed)
 #define IB_TRACE_MAX(i, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); atomicMax(reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + (i)), static_cast<unsigned long long>(t_)); } } while (0)
+#define SL_TR(j, p, cond) do { if (cond) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); atomicMax(reinterpret_cast<unsigned long long*>(ib_sl_tr + 5 * (j) + (p)), static_cast<unsigned long long>(t_)); } } while (0)
+#define SL_ADD(i, cond) do { if (cond) atomicAdd(reinterpret_cast<unsigned long long*>(ib_sl_tr + 20 + (i)), 1ull); } while (0)
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
 #define IB_HIST(h, cond) do { if ((cond) and ib_epoch % 16 == 0) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); \
     const int64_t d_ = static_cast<int64_t>(t_) - static_cast<int64_t>(ptx::ld_volatile(workspace.signals->ib_trace + 16)); \
@@ -164,6 +166,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
 #define IB_TRACE(i, cond) do {} while (0)
 #define IB_TRACE_MAX(i, cond) do {} while (0)
+#define SL_TR(j, p, cond) do {} while (0)
+#define SL_ADD(i, cond) do {} while (0)
 #define IB_HIST(h, cond) do {} while (0)
 #define TT_MAX(i, cond) do {} while (0)
 #define TT_MIN(i, cond) do {} while (0)
@@ -840,10 +844,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kIBScanSlices == 1 or not (kIBEarlyPublish or kIBCountsEarly or kIBWaveSort), "SCAN_SLICES excludes CIM / SPLIT_SCAN / COUNTS_EARLY / WAVE_SORT");
     DG_STATIC_ASSERT(kNumExpertsPerRank <= 256, "IB scan slice counts");
     constexpr uint32_t kIBSliceScratch = 64 * 4 * 256 + 2 * 64 * 4 * 2;  // counts u32 + two u64 flag arrays
-    DG_STATIC_ASSERT(kIBTabKeys + kNumSMs * 2 * kIBTabT + 4096 + kIBSliceScratch <= layout::MegaMoESignals::kNumMaxIBPoolTokens, "IB scan slice scratch");
+    DG_STATIC_ASSERT(kIBTabKeys + kNumSMs * 2 * kIBTabT + 4096 + kIBSliceScratch + 64 <= layout::MegaMoESignals::kNumMaxIBPoolTokens, "IB scan slice scratch");
     uint32_t* const ib_sl_cnt = workspace.signals->ib_pool_combine_idx + layout::MegaMoESignals::kNumMaxIBPoolTokens - 4096 - kIBSliceScratch;  // [64 sources][4 slices][256 experts]
     uint64_t* const ib_sl_cflag = reinterpret_cast<uint64_t*>(ib_sl_cnt + 64 * 4 * 256);  // [64][4] epoch: slice counts written
     uint64_t* const ib_sl_tflag = ib_sl_cflag + 64 * 4;                                  // [64][4] epoch: slice slot entries written
+    // Slice trace (DG_MEGA_MOE_IB_TRACE): [0, 20) = max %globaltimer per (slice j, phase p) at 5 * j + p
+    // (p: 0 header seen, 1 pass A done, 2 base ready, 3 pass B loop done, 4 tflag raised); [20, 24) counters
+    uint64_t* const ib_sl_tr = reinterpret_cast<uint64_t*>(ib_sl_cnt - 64);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+    if (kIBScanSlices > 1 and sm_idx == 0 and thread_idx < 4) ib_sl_tr[20 + thread_idx] = 0;  // counters (before grid sync 0)
+#endif
     // remote-source index k of rank r (the D1 scan order) and remote-node slot of node n
     const auto ib_nr_of_node = [&](const uint32_t& n) { return n < ib_my_node ? n : n - 1; };
     const auto ib_k_of_rank = [&](const uint32_t& r) { return ib_nr_of_node(r / ib_lsa) * ib_lsa + r % ib_lsa; };
@@ -2687,6 +2697,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t t0 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * scan_j / kIBScanSlices);
                     const uint32_t t1 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * (scan_j + 1) / kIBScanSlices);
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);  // cnt / cnt2 zeroed above
+                    SL_TR(scan_j, 0, epilogue_thread_idx == 0);
                     // Pass A: count this slice's entries for our experts. kSLB loads in flight per thread (NVLink latency-bound:
                     // one dependent load per iteration made the slices slower than the single-SM scan, B300 trace)
                     constexpr uint32_t kSLB = 8;
@@ -2702,6 +2713,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t u = 0; u < kSLB; ++ u) {
                             const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                             if (i < e1) {
+                                SL_ADD(0, v[u] == kIBIdxSentinel);
                                 IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "sl_idx", r, i);
                                 const int e = static_cast<int>(static_cast<int64_t>(v[u]));
                                 if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx)
@@ -2717,6 +2729,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     if (epilogue_thread_idx == 0)
                         ptx::st_rel(ib_sl_cflag + k * 4 + scan_j, ib_epoch);
+                    SL_TR(scan_j, 1, epilogue_thread_idx == 0);
                     // Partial count publish (count-arrival protocol: the shares of the P slices sum to kNumSMs)
                     const uint64_t share = scan_j == 0 ? kNumSMs - (kIBScanSlices - 1) * (kNumSMs / kIBScanSlices) : kNumSMs / kIBScanSlices;
                     for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
@@ -2739,6 +2752,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         cnt[i] = 0;  // reused as the slot cursor
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    SL_TR(scan_j, 2, epilogue_thread_idx == 0);
                     // Pass B: slot entries (token order within the slice; slices are in token order); rule A for the weights
                     for (uint32_t i0 = e0; i0 < e1; i0 += kNumEpilogueThreads * kSLB) {
                         uint64_t v[kSLB];
@@ -2753,6 +2767,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t u = 0; u < kSLB; ++ u) {
                             const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                             if (i < e1) {
+                                SL_ADD(1, wv[u] == 0xffffffffu);
                                 IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "sl_w", r, i);
                                 const int e = static_cast<int>(static_cast<int64_t>(v[u]));
                                 if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
@@ -2762,10 +2777,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
                     }
+                    SL_TR(scan_j, 3, true);
                     __threadfence();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     if (epilogue_thread_idx == 0)
                         ptx::st_rel_sys(ib_sl_tflag + k * 4 + scan_j, ib_epoch);
+                    SL_TR(scan_j, 4, epilogue_thread_idx == 0);
                     IB_TRACE_MAX(32, epilogue_thread_idx == 0);  // slice tables done
                 }
                 // Overlap orders: key1 (wave sort; every receiver) and key2 (stream combine; only r's proxy)
@@ -3766,6 +3783,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             printf("OPUS_TRACE4 rank=%u epoch=%llu | counts_early: posted=%.1f landed_max=%.1f mismatches=%llu ce=%d | split_scan tables_done=%.1f ss=%d cim=%d\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(32), us(38), (unsigned long long) t[39], (int) kIBCountsEarly,
                    us(32), (int) kIBSplitScan, (int) kIBCountsInMeta);
+            if constexpr (kIBScanSlices > 1) {
+                const auto su = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_SLICES rank=%u epoch=%llu P=%u | j0 %.1f %.1f %.1f %.1f %.1f | j1 %.1f %.1f %.1f %.1f %.1f | j2 %.1f %.1f %.1f %.1f %.1f | j3 %.1f %.1f %.1f %.1f %.1f | idx_miss=%llu w_miss=%llu\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, kIBScanSlices,
+                       su(0), su(1), su(2), su(3), su(4), su(5), su(6), su(7), su(8), su(9),
+                       su(10), su(11), su(12), su(13), su(14), su(15), su(16), su(17), su(18), su(19),
+                       (unsigned long long) ib_sl_tr[20], (unsigned long long) ib_sl_tr[21]);
+            }
             // 8-us histograms (bucket i = [8i, 8i+8) us from kernel start), then reset for the next printed launch
             for (uint32_t h = 0; h < 4; ++ h) {
                 char buf[64 * 6 + 1]; uint32_t n = 0;

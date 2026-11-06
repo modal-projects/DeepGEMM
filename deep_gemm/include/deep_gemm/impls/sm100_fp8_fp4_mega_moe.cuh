@@ -2115,31 +2115,55 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kSB = 4;  // independent loads first, then the stores
             const auto cim_cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);  // COUNTS_IN_META: per global expert
             const uint32_t cim_node_experts = kNumExpertsPerRank * ib_lsa;
-            if constexpr (kIBCountsInMeta) {
+            // Two copies of the staging loop: the counting branch (COUNTS_IN_META) costs ~6 us of meta latency even when
+            // gated off at runtime (B300 trace, MegaSeek 128), so the plain loop carries no counting code at all
+            const bool cim_count_here = kIBCountsInMeta and not kIBCimDispatch and ib_cim_on(num_tokens);
+            if (cim_count_here) {
+            {
                 for (uint32_t g = epilogue_thread_idx; g < kNumExperts; g += kNumEpilogueThreads)
                     cim_cnt[g] = 0;
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
-            for (uint32_t i0 = 0; i0 < kIBT * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
-                uint64_t vi[kSB];
-                uint32_t vw[kSB];
-                #pragma unroll
-                for (uint32_t u = 0; u < kSB; ++ u) {
-                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                    vi[u] = i < num_tokens * kNumTopk ? __ldcg(reinterpret_cast<const unsigned long long*>(in_idx) + i) : kIBIdxSentinel;
-                    vw[u] = i < num_tokens * kNumTopk ? __ldcg(in_w + i) : 0xffffffffu;
-                }
-                #pragma unroll
-                for (uint32_t u = 0; u < kSB; ++ u) {
-                    const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                    if (i < kIBT * kNumTopk) {
-                        reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = vi[u];
-                        reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = vw[u];
+                for (uint32_t i0 = 0; i0 < kIBT * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
+                    uint64_t vi[kSB];
+                    uint32_t vw[kSB];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kSB; ++ u) {
+                        const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                        vi[u] = i < num_tokens * kNumTopk ? __ldcg(reinterpret_cast<const unsigned long long*>(in_idx) + i) : kIBIdxSentinel;
+                        vw[u] = i < num_tokens * kNumTopk ? __ldcg(in_w + i) : 0xffffffffu;
                     }
-                    if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
-                        const int e = static_cast<int>(static_cast<int64_t>(vi[u]));
-                        if (ib_cim_on(num_tokens) and i < num_tokens * kNumTopk and e >= 0 and static_cast<uint32_t>(e) / cim_node_experts != ib_my_node)
-                            atomicAdd_block(cim_cnt + e, 1u);
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kSB; ++ u) {
+                        const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                        if (i < kIBT * kNumTopk) {
+                            reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = vi[u];
+                            reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = vw[u];
+                        }
+                        if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
+                            const int e = static_cast<int>(static_cast<int64_t>(vi[u]));
+                            if (i < num_tokens * kNumTopk and e >= 0 and static_cast<uint32_t>(e) / cim_node_experts != ib_my_node)
+                                atomicAdd_block(cim_cnt + e, 1u);
+                        }
+                    }
+                }
+            } else {
+                for (uint32_t i0 = 0; i0 < kIBT * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
+                    uint64_t vi[kSB];
+                    uint32_t vw[kSB];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kSB; ++ u) {
+                        const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                        vi[u] = i < num_tokens * kNumTopk ? __ldcg(reinterpret_cast<const unsigned long long*>(in_idx) + i) : kIBIdxSentinel;
+                        vw[u] = i < num_tokens * kNumTopk ? __ldcg(in_w + i) : 0xffffffffu;
+                    }
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kSB; ++ u) {
+                        const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
+                        if (i < kIBT * kNumTopk) {
+                            reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = vi[u];
+                            reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = vw[u];
+                        }
                     }
                 }
             }

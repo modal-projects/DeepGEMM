@@ -1089,10 +1089,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             fi_g = fi_claim();
         }
+        // FWD_ROTATE: start slot, computed once (local decision, any value is correct); only from DG_MEGA_MOE_IB_FWD_ROTATE_MIN tokens on
+        const uint32_t rot0 = (kIBFwdRotate and num_tokens >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN) ? global_warp % fi_R : 0u;
         for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
-            // FWD_ROTATE runtime gate (local decision, any value is correct): only from DG_MEGA_MOE_IB_FWD_ROTATE_MIN tokens on (EP32 MS 128: +2.3)
-            const bool rot_on = kIBFwdRotate and num_tokens >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN;
-            const uint32_t nr = fi_on ? fi_g % fi_R : (rot_on ? (nr_it + global_warp) % (ib_num_nodes - 1) : nr_it);
+            uint32_t nr = fi_on ? fi_g % fi_R : nr_it + rot0;
+            if (kIBFwdRotate and nr >= fi_R) nr -= fi_R;
             const uint32_t n = ib_node_of_slot(nr);
             const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
             const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);

@@ -1824,11 +1824,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
             }
-            if (ib_rem) {
+            // DG_MEGA_MOE_IB_LOCAL_REGPULL=1 (Flash 128 latency): node-local rows take the register path too (all 16-byte
+            // loads of the row in flight, posted stores) instead of TMA load -> mbarrier wait -> TMA store -> store wait
+#if defined(DG_MEGA_MOE_IB_LOCAL_REGPULL) and DG_MEGA_MOE_IB_LOCAL_REGPULL
+            constexpr bool kIBLocalReg = true;
+#else
+            constexpr bool kIBLocalReg = false;
+#endif
+            const bool ib_reg = ib_rem or kIBLocalReg;
+            if (ib_reg) {
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
                 constexpr uint32_t kUnits = kIBTokBytes / (32 * 16), kBatch = kIBPullWhole ? kUnits : 5;
-                if constexpr (kIBFlagGate) {
+                if (kIBFlagGate and ib_rem) {
                     // Probe first: one load of the row's first and last 16-byte units per lane; only a row that has not
                     // fully landed waits on the (NVLink) chunk flag, so landed rows pay nothing extra
                     const bool landed = __all_sync(0xffffffffu,
@@ -1858,7 +1866,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     // slot 10: remote rows whose FIRST load batch still saw a sentinel (row not fully landed when pulled);
                     // slot 11: remote rows pulled (both reset by SM 0 at kernel start; the pull follows a grid barrier)
-                    if (u0 == 0) {
+                    if (u0 == 0 and ib_rem) {
                         bool miss = false;
                         #pragma unroll
                         for (uint32_t b = 0; b < kBatch; ++ b)
@@ -1874,13 +1882,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t b = 0; b < kBatch; ++ b) {
                         if (u0 + b < kUnits) {
                             const uint32_t o = ((u0 + b) * 32 + lane_idx) * 16;
-                            IB_POLL(ib_is_sentinel4(v[b]), v[b] = ib_ldv4(src_base_ptr + o), "pull_x", current_rank_in_expert_idx, src_token_idx);
+                            IB_POLL(ib_rem and ib_is_sentinel4(v[b]), v[b] = ib_ldv4(src_base_ptr + o), "pull_x", current_rank_in_expert_idx, src_token_idx);
                             *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o) = v[b];
                         }
                     }
                 }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                if (lane_idx == 0) {
+                if (lane_idx == 0 and ib_rem) {
                     uint64_t t_;
                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
                     atomicMin(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[41]), static_cast<unsigned long long>(t_));
@@ -1890,10 +1898,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
 #endif
                 asm volatile("fence.proxy.async.global;" ::: "memory");  // generic stores, read by the GEMM's TMA
-                IB_TRACE_MAX(31, lane_idx == 0);  // last remote row fully landed + copied, slowest warp
+                IB_TRACE_MAX(31, lane_idx == 0 and ib_rem);  // last remote row fully landed + copied, slowest warp
             }
 #else
             constexpr bool ib_rem = false;
+            constexpr bool ib_reg = false;
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
 #endif
@@ -1906,7 +1915,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cute::tma_store_arrive();
                 ptx::tma_store_wait<0>();
             };
-            if (not ib_rem and cute::elect_one_sync()) {
+            if (not ib_reg and cute::elect_one_sync()) {
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumChunks; ++ i) {
                     ptx::tma_load_1d(
@@ -1975,7 +1984,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
                 // Complete last chunk's store
-                if (not ib_rem)
+                if (not ib_reg)
                     issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 IB_HIST(ib_rem ? 2 : 3, lane_idx == 0);

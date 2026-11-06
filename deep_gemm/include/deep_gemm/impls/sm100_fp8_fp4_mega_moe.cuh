@@ -2617,6 +2617,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Two copies of the staging loop: the counting branch (COUNTS_IN_META) costs ~6 us of meta latency even when
             // gated off at runtime (B300 trace, MegaSeek 128), so the plain loop carries no counting code at all
             const bool cim_count_here = kIBCountsInMeta and not kIBCimDispatch and ib_cim_on(num_tokens);
+            // DG_MEGA_MOE_IB_META_LEAN_LO / _HI (top-k entries per rank): STAGE_NT / META_SPLIT apply only when nt * K <= LO
+            // (front-latency-bound small batches) or >= HI (scan-bound large K * T). In between (Flash 1024 = 6144) the meta
+            // posted earlier competes with the x pieces, which bind there (+1.5..+2.4 us measured)
+#ifndef DG_MEGA_MOE_IB_META_LEAN_LO
+#define DG_MEGA_MOE_IB_META_LEAN_LO 4096
+#endif
+#ifndef DG_MEGA_MOE_IB_META_LEAN_HI
+#define DG_MEGA_MOE_IB_META_LEAN_HI 8192
+#endif
+            const bool meta_lean = num_tokens * kNumTopk <= DG_MEGA_MOE_IB_META_LEAN_LO or num_tokens * kNumTopk >= DG_MEGA_MOE_IB_META_LEAN_HI;
             if (cim_count_here) {
             {
                 for (uint32_t g = epilogue_thread_idx; g < kNumExperts; g += kNumEpilogueThreads)
@@ -2654,7 +2664,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // every mirror row >= nt stays a sentinel for later launches with more tokens (rule A).
 #if defined(DG_MEGA_MOE_IB_STAGE_NT) and DG_MEGA_MOE_IB_STAGE_NT
                 auto* const stg_prev = reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 120);
-                const uint32_t stage_rows = cute::max(num_tokens, cute::min(ptx::ld_volatile(stg_prev), static_cast<uint32_t>(kIBT)));
+                const uint32_t stage_rows = meta_lean ? cute::max(num_tokens, cute::min(ptx::ld_volatile(stg_prev), static_cast<uint32_t>(kIBT)))
+                                                      : static_cast<uint32_t>(kIBT);
 #else
                 const uint32_t stage_rows = static_cast<uint32_t>(kIBT);
 #endif
@@ -2706,7 +2717,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
             constexpr bool kMetaSplit = false;
 #endif
-            if (kMetaSplit and epilogue_warp_idx <= 1 and lane_idx + 1 < ib_num_nodes) {
+            if (kMetaSplit and meta_lean and epilogue_warp_idx <= 1 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
                 const uint32_t cp = ib_cp(sym_buffer.rank_idx, n);
@@ -2725,7 +2736,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     SL_TR(0, 26, true);
                 }
             }
-            if (not kMetaSplit and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+            if (not (kMetaSplit and meta_lean) and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);
                 SL_TR(0, 24, true);  // meta put: before issue (slot 24), after the put (25), after the doorbell (26)
                 const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);

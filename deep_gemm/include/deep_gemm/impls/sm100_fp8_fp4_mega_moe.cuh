@@ -875,6 +875,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kIBC3Gate <= 2, "C3_HDR_GATE is 0, 1 or 2");
     DG_STATIC_ASSERT(kIBC3Gate == 0 or kIBRetGroup == 1, "C3_HDR_GATE uses the RET_GROUP scratch (tl_fgroup)");
     constexpr bool kIBRetHdrPut = not kIBNoRetHdr or kIBC3Gate == 1;
+    // DG_MEGA_MOE_IB_META_DIRECT=1 (Flash 128 latency; FRONT + HDR_CTX, no COUNTS_IN_META / SENDER_TABLES): the meta SM puts
+    // the top-k idx rows and weight rows (rows < num_tokens) straight from the input region (no staging: the staging copy
+    // was ~4-6 us of the meta's critical path) and the header, as three concurrent puts from three warps.
+#if defined(DG_MEGA_MOE_IB_META_DIRECT) and DG_MEGA_MOE_IB_META_DIRECT
+    constexpr bool kIBMetaDirect = true;
+#else
+    constexpr bool kIBMetaDirect = false;
+#endif
     // Runtime size gate (per source: the sender uses its token count, the receivers / proxy the source's header count,
     // so both sides always agree): below DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS the old order is used
 #ifndef DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS
@@ -2064,9 +2072,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 reinterpret_cast<uint4*>(mir)[u] = ones;
             for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBSFBytes / 16; u += kGThreads)
                 reinterpret_cast<uint4*>(mir + kIBOffSF)[u] = ones;
-            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk * 8 / 16; u += kGThreads)
+            const int64_t meta_rows = static_cast<int64_t>(nt);
+            for (int64_t u = gtid; u < meta_rows * kNumTopk * 8 / 16; u += kGThreads)
                 reinterpret_cast<uint4*>(mir + kIBOffIdx)[u] = idx_sentinel;
-            for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kNumTopk; u += kGThreads)
+            for (int64_t u = gtid; u < meta_rows * kNumTopk; u += kGThreads)
                 reinterpret_cast<uint32_t*>(mir + kIBOffW)[u] = 0xffffffffu;
             if (gtid == 0)
                 *reinterpret_cast<uint64_t*>(mir + kIBOffHdr) = ~0ull;
@@ -2570,6 +2579,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (epilogue_thread_idx == 0)
                 { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_o_meta_posted_t = t_; }
                 ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
+        } else if (kIBMetaDirect and sm_idx == kIBMetaSM) {
+            DG_STATIC_ASSERT(not kIBMetaDirect or (kIBFront and kIBHdrCtx and not kIBCountsInMeta and not kIBSenderTables and not kIBCountsEarly),
+                             "META_DIRECT needs FRONT + HDR_CTX and no COUNTS_IN_META / SENDER_TABLES / COUNTS_EARLY");
+            // Three puts from three warps, issued concurrently, straight from the input region (rows < num_tokens only, so no
+            // stale row ever reaches a mirror): warp 0 the top-k idx rows (meta context), warp 1 the header, warp 2 the
+            // weight rows (both on the header context). Receivers poll every idx / weight unit (rule A) and learn nt from
+            // the header, so the three may land in any order.
+            IB_TRACE(24, epilogue_thread_idx == 0);
+            if (epilogue_warp_idx <= 2 and lane_idx + 1 < ib_num_nodes) {
+                const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
+                const auto dst = ib_mirror(ib_parity, ib_my_node);
+                const uint32_t cp = ib_cp(sym_buffer.rank_idx, n);
+                if (epilogue_warp_idx == 0) {
+                    SL_TR(0, 24, true);
+                    if (num_tokens > 0)
+                        make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put(dst + kIBOffIdx, ib_input_base + kIBOffIdx,
+                            static_cast<uint64_t>(num_tokens) * kNumTopk * 8, cp);
+                    SL_TR(0, 25, true);
+                } else if (epilogue_warp_idx == 1) {
+                    make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase).put_value(
+                        reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
+                    SL_TR(0, 26, true);
+                } else if (num_tokens > 0) {
+                    make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase).put(dst + kIBOffW, ib_input_base + kIBOffW,
+                        static_cast<uint64_t>(num_tokens) * kNumTopk * 4, cp);
+                }
+            }
+            __syncwarp();
         } else if (sm_idx == kIBMetaSM) {
             const auto stg = ib_mirror(ib_parity, ib_my_node);
             const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);

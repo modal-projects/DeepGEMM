@@ -1312,7 +1312,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     TT_MAX(4, true);
                     TT_ADD(23, true, 1);
                     TT_ADD(26, workspace.signals->ib_trace[5] > workspace.signals->ib_trace[16], 1);  // put after our L2 grid sync
-                    make_gin_site(8, ctx_chunk(nr, pc0, pc0 + nr), pc0 + nr, ib_xbase).put(ret_dst + off, fst + off, static_cast<uint64_t>(precs) * kIBRecBytes, s);
+                    {
+                        const auto gin_c = make_gin_site(8, ctx_chunk(nr, pc0, pc0 + nr), pc0 + nr, ib_xbase);
+                        gin_c.put(ret_dst + off, fst + off, static_cast<uint64_t>(precs) * kIBRecBytes, s);
+                        // DG_MEGA_MOE_IB_RET_CHUNK_DB=1: a trailing 8-byte put on the same context after the LAST chunk of
+                        // this node (=2: after every chunk), the header-doorbell workaround applied to the return chunks
+                        // (the last op on a CPU-proxy context can sit until the next one; with NO_RET_HDR nothing follows it)
+#if defined(DG_MEGA_MOE_IB_RET_CHUNK_DB) and DG_MEGA_MOE_IB_RET_CHUNK_DB
+                        if (DG_MEGA_MOE_IB_RET_CHUNK_DB >= 2 or state == 2)
+                            gin_c.put_value(&workspace.signals->ib_o_scratch, ib_epoch, s);
+#endif
+                    }
                     TT_MAX(5, true);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     if (nr == 0 and pc0 < 64) { TT_NOW(t_); tl_tchunk[pc0] = t_; }

@@ -857,13 +857,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kIBScanSlices == 1 or not (kIBEarlyPublish or kIBCountsEarly or kIBWaveSort), "SCAN_SLICES excludes CIM / SPLIT_SCAN / COUNTS_EARLY / WAVE_SORT");
     DG_STATIC_ASSERT(kNumExpertsPerRank <= 256, "IB scan slice counts");
     constexpr uint32_t kIBSliceScratch = 64 * 4 * 256 + 2 * 64 * 4 * 2;  // counts u32 + two u64 flag arrays
-    DG_STATIC_ASSERT(kIBTabKeys + kNumSMs * 2 * kIBTabT + 4096 + kIBSliceScratch + 64 <= layout::MegaMoESignals::kNumMaxIBPoolTokens, "IB scan slice scratch");
+    DG_STATIC_ASSERT(kIBTabKeys + kNumSMs * 2 * kIBTabT + 4096 + kIBSliceScratch + 64 + 512 <= layout::MegaMoESignals::kNumMaxIBPoolTokens, "IB scan slice scratch");
     uint32_t* const ib_sl_cnt = workspace.signals->ib_pool_combine_idx + layout::MegaMoESignals::kNumMaxIBPoolTokens - 4096 - kIBSliceScratch;  // [64 sources][4 slices][256 experts]
     uint64_t* const ib_sl_cflag = reinterpret_cast<uint64_t*>(ib_sl_cnt + 64 * 4 * 256);  // [64][4] epoch: slice counts written
     uint64_t* const ib_sl_tflag = ib_sl_cflag + 64 * 4;                                  // [64][4] epoch: slice slot entries written
     // Slice trace (DG_MEGA_MOE_IB_TRACE): [0, 20) = max %globaltimer per (slice j, phase p) at 5 * j + p
     // (p: 0 header seen, 1 pass A done, 2 base ready, 3 pass B loop done, 4 tflag raised); [20, 24) counters
     uint64_t* const ib_sl_tr = reinterpret_cast<uint64_t*>(ib_sl_cnt - 64);
+    // X_ORDER: per-piece "put issued" epoch flags ([256] u64 below the slice trace)
+    uint64_t* const ib_xo_flag = reinterpret_cast<uint64_t*>(ib_sl_cnt - 64 - 512);
+    // DG_MEGA_MOE_IB_X_ORDER=1: the x / SF pieces of a Gin context are issued in piece (token) order: piece q waits until
+    // piece q - (pieces' context count) was issued. Without it the ~33 pieces per node are issued by as many SMs at
+    // once in racy order, the NIC shares bandwidth across the contexts, and every chunk lands near the end of the x
+    // window (B300 Flash 1024 trace: pulls starting earlier found remote rows not landed), so no block can start early.
+#if defined(DG_MEGA_MOE_IB_X_ORDER) and DG_MEGA_MOE_IB_X_ORDER
+    constexpr bool kIBXOrder = true;
+#else
+    constexpr bool kIBXOrder = false;
+#endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
     if (kIBScanSlices > 1 and sm_idx == 0 and thread_idx < 4) ib_sl_tr[20 + thread_idx] = 0;  // counters (before grid sync 0)
 #endif
@@ -2468,9 +2479,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);
+                SL_TR(0, 24, true);  // meta put: before issue (slot 24), after the put (25), after the doorbell (26)
                 const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
                 gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
                           static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
+                SL_TR(0, 25, true);
                 if (kIBCountsInMeta and not kIBCimDispatch and ib_cim_on(num_tokens)) {
                     const uint64_t cb = static_cast<uint64_t>(cim_node_experts) * 4;
                     gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffCnt, stg + kIBOffCnt + static_cast<int64_t>(n) * static_cast<int64_t>(cb),
@@ -2479,6 +2492,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (kIBHdrCtx)  // doorbell (see the full-batch branch): identical header value, pushes the meta put through
                     gin_m.put_value(reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens,
                                     ib_cp(sym_buffer.rank_idx, n));
+                SL_TR(0, 26, true);
             }
             __syncwarp();
             if (kIBCimDispatch and ib_st_on(num_tokens)) {
@@ -2639,8 +2653,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         off = static_cast<int64_t>(t0) * kIBTokBytes, bytes = static_cast<int64_t>(t1 - t0) * kIBTokBytes;
                     }
                     const auto src = ib_ws_on(num_tokens) and kIBWSMode != 3 and piece > 0 ? x_stage + off : ib_input_base + off;
+                    constexpr uint32_t kXOCtx = kIBHdrCtx ? cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2u) : 1u;
+                    const uint32_t xo_nctx = kIBHdrCtx ? cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R) : kXOCtx;
+                    if (kIBXOrder and q >= xo_nctx and q - xo_nctx < 256)  // previous piece on this context issued first
+                        IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + (q - xo_nctx)) != ib_epoch, (void) 0, "x_order", q, 0);
                     make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
+                    if (kIBXOrder and q < 256)
+                        ptx::st_rel(ib_xo_flag + q, ib_epoch);
+                    SL_TR(0, 27, q == 0);
+                    SL_TR(0, 28, true);
                     IB_TRACE_MAX(7, true);   // x/SF piece put issued, slowest poster
                     IB_TRACE_MAX(8, q == 0); // first piece (SF) issued
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -3822,6 +3844,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             printf("OPUS_TRACE4 rank=%u epoch=%llu | counts_early: posted=%.1f landed_max=%.1f mismatches=%llu ce=%d | split_scan tables_done=%.1f ss=%d cim=%d\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, us(32), us(38), (unsigned long long) t[39], (int) kIBCountsEarly,
                    us(32), (int) kIBSplitScan, (int) kIBCountsInMeta);
+            {
+                const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_META rank=%u epoch=%llu | meta put: before=%.1f after_put=%.1f after_doorbell=%.1f | x pieces: first_issued=%.1f last_issued=%.1f | xorder=%d\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(24), mu(25), mu(26), mu(27), mu(28), (int) kIBXOrder);
+            }
             if constexpr (kIBScanSlices > 1) {
                 const auto su = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
                 printf("OPUS_SLICES rank=%u epoch=%llu P=%u | j0 %.1f %.1f %.1f %.1f %.1f | j1 %.1f %.1f %.1f %.1f %.1f | j2 %.1f %.1f %.1f %.1f %.1f | j3 %.1f %.1f %.1f %.1f %.1f | idx_miss=%llu w_miss=%llu\n",

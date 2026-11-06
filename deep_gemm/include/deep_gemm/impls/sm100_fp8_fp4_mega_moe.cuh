@@ -2610,7 +2610,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
             } else {
-                for (uint32_t i0 = 0; i0 < kIBT * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
+                // DG_MEGA_MOE_IB_STAGE_NT=1 (Flash 128 latency: staging all kIBT rows took ~5.4 us of the meta's critical path):
+                // rows >= num_tokens of this parity's staging slot already hold sentinels unless the previous same-parity
+                // launch had more tokens, so only rows < max(num_tokens, previous count) are (re)written. The previous
+                // count lives in the staging header slot's last 8 bytes (never put). The put still carries every row, so
+                // every mirror row >= nt stays a sentinel for later launches with more tokens (rule A).
+#if defined(DG_MEGA_MOE_IB_STAGE_NT) and DG_MEGA_MOE_IB_STAGE_NT
+                auto* const stg_prev = reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 120);
+                const uint32_t stage_rows = cute::max(num_tokens, cute::min(ptx::ld_volatile(stg_prev), static_cast<uint32_t>(kIBT)));
+#else
+                const uint32_t stage_rows = static_cast<uint32_t>(kIBT);
+#endif
+                for (uint32_t i0 = 0; i0 < stage_rows * kNumTopk; i0 += kNumEpilogueThreads * kSB) {
                     uint64_t vi[kSB];
                     uint32_t vw[kSB];
                     #pragma unroll
@@ -2622,7 +2633,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t u = 0; u < kSB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        if (i < kIBT * kNumTopk) {
+                        if (i < stage_rows * kNumTopk) {
                             reinterpret_cast<uint64_t*>(stg + kIBOffIdx)[i] = vi[u];
                             reinterpret_cast<uint32_t*>(stg + kIBOffW)[i] = vw[u];
                         }
@@ -2639,6 +2650,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *reinterpret_cast<uint64_t*>(stg + kIBOffHdr) = (ib_epoch << 32) | num_tokens;
             __threadfence();
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+#if defined(DG_MEGA_MOE_IB_STAGE_NT) and DG_MEGA_MOE_IB_STAGE_NT
+            // after the barrier: every thread has read the previous count; the meta put does not cover these bytes
+            if (epilogue_thread_idx == 0 and not cim_count_here)
+                *reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 120) = num_tokens;
+#endif
             IB_TRACE(24, epilogue_thread_idx == 0);
             if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t n = ib_node_of_slot(lane_idx);

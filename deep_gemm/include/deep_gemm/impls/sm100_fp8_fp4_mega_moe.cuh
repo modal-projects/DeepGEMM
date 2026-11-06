@@ -774,6 +774,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_FWD_BATCH_D 1
 #endif
     constexpr bool kIBFwdDyn = kIBCombineWarp or kIBFwdJoin;
+    // DG_MEGA_MOE_IB_FWD_SKIP_XPOLL=1 (tail, fewer forward-combine bytes): skip rule A's x / SF row poll for a token that has a node-local
+    // expert. Every such row is pulled whole by the GPU hosting that expert, and its pull polls every byte before L1, while the mirror
+    // re-arm (E) runs only after the node cleanup barrier (all pulls done). Rows of tokens without node-local experts are still polled
+    // here. Saves ~1.3 KB of reads and one HBM round trip per item.
+#if defined(DG_MEGA_MOE_IB_FWD_SKIP_XPOLL) and DG_MEGA_MOE_IB_FWD_SKIP_XPOLL
+    constexpr bool kIBSkipXPoll = true;
+#else
+    constexpr bool kIBSkipXPoll = false;
+#endif
     // DG_MEGA_MOE_IB_FWD_INTERLEAVE=1 (with FWD_JOIN; tail, EP32): with >= 2 remote nodes the forward-combine items of all of them are
     // claimed from ONE counter, round-robin over the nodes (claim g -> node slot g % R, item g / R, each node's items still in its own
     // wave order). Without it every warp drains node slot 0's items before it claims any of slot 1's, so during L2 all warps wait on
@@ -1178,7 +1187,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 TT_CLOCK(tt_item0);
                 bool tt_miss = false;
                 // Rule A: this item's part of the token's x row (and, for quarter 0, its SF row) has landed
-                {
+                if (not (kIBSkipXPoll and not pf_on and on_mask != 0)) {
                     constexpr uint32_t kU = (kXUnitsPerItem + 31) / 32;
                     const uint32_t xslot = ib_ws_on(nt) ? ptx::ld_volatile(ib_tab + kIBTabSlot + k_s * kIBTabT + t) : t;
                     const auto xrow = mir + static_cast<int64_t>(xslot) * kIBTokBytes + static_cast<int64_t>(qtr) * kXUnitsPerItem * 16;

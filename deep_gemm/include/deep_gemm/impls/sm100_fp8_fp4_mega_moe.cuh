@@ -878,6 +878,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // DG_MEGA_MOE_IB_META_DIRECT=1 (Flash 128 latency; FRONT + HDR_CTX, no COUNTS_IN_META / SENDER_TABLES): the meta SM puts
     // the top-k idx rows and weight rows (rows < num_tokens) straight from the input region (no staging: the staging copy
     // was ~4-6 us of the meta's critical path) and the header, as three concurrent puts from three warps.
+#ifndef DG_MEGA_MOE_IB_LEAN_MIN_TOPK
+#define DG_MEGA_MOE_IB_LEAN_MIN_TOPK 8
+#endif
+    constexpr bool kIBLeanMeta = kNumTopk >= DG_MEGA_MOE_IB_LEAN_MIN_TOPK;
 #if defined(DG_MEGA_MOE_IB_META_DIRECT) and DG_MEGA_MOE_IB_META_DIRECT
     constexpr bool kIBMetaDirect = true;
 #else
@@ -1835,7 +1839,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // DG_MEGA_MOE_IB_LOCAL_REGPULL=1 (Flash 128 latency): node-local rows take the register path too (all 16-byte
             // loads of the row in flight, posted stores) instead of TMA load -> mbarrier wait -> TMA store -> store wait
 #if defined(DG_MEGA_MOE_IB_LOCAL_REGPULL) and DG_MEGA_MOE_IB_LOCAL_REGPULL
-            constexpr bool kIBLocalReg = true;
+            constexpr bool kIBLocalReg = kIBLeanMeta;
 #else
             constexpr bool kIBLocalReg = false;
 #endif
@@ -2617,16 +2621,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Two copies of the staging loop: the counting branch (COUNTS_IN_META) costs ~6 us of meta latency even when
             // gated off at runtime (B300 trace, MegaSeek 128), so the plain loop carries no counting code at all
             const bool cim_count_here = kIBCountsInMeta and not kIBCimDispatch and ib_cim_on(num_tokens);
-            // DG_MEGA_MOE_IB_META_LEAN_LO / _HI (top-k entries per rank): STAGE_NT / META_SPLIT apply only when nt * K <= LO
-            // (front-latency-bound small batches) or >= HI (scan-bound large K * T). In between (Flash 1024 = 6144) the meta
-            // posted earlier competes with the x pieces, which bind there (+1.5..+2.4 us measured)
-#ifndef DG_MEGA_MOE_IB_META_LEAN_LO
-#define DG_MEGA_MOE_IB_META_LEAN_LO 4096
-#endif
-#ifndef DG_MEGA_MOE_IB_META_LEAN_HI
-#define DG_MEGA_MOE_IB_META_LEAN_HI 8192
-#endif
-            const bool meta_lean = num_tokens * kNumTopk <= DG_MEGA_MOE_IB_META_LEAN_LO or num_tokens * kNumTopk >= DG_MEGA_MOE_IB_META_LEAN_HI;
+            // STAGE_NT / META_SPLIT (and LOCAL_REGPULL) are compiled in only for kernels with top-k >= DG_MEGA_MOE_IB_LEAN_MIN_TOPK
+            // (default 8: MegaSeek 19 yes, Flash 6 no). Measured (B300 EP16, 5 rounds): MegaSeek 128 -5.1, 1024 -16.3; Flash 128
+            // -1.9 but Flash 1024 +2.8 (the x pieces bind there), and a runtime size gate measured ~10 us slower at MegaSeek
+            // 1024 than the always-on form, so the decision is per kernel (compile time).
+            constexpr bool meta_lean = kIBLeanMeta;
             if (cim_count_here) {
             {
                 for (uint32_t g = epilogue_thread_idx; g < kNumExperts; g += kNumEpilogueThreads)
@@ -2665,7 +2664,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB_STAGE_NT) and DG_MEGA_MOE_IB_STAGE_NT
                 auto* const stg_prev = reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 120);
                 const uint32_t stage_rows = meta_lean ? cute::max(num_tokens, cute::min(ptx::ld_volatile(stg_prev), static_cast<uint32_t>(kIBT)))
-                                                      : static_cast<uint32_t>(kIBT);
+                                                      : static_cast<uint32_t>(kIBT);  // meta_lean is constexpr
 #else
                 const uint32_t stage_rows = static_cast<uint32_t>(kIBT);
 #endif
@@ -2703,7 +2702,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 #if defined(DG_MEGA_MOE_IB_STAGE_NT) and DG_MEGA_MOE_IB_STAGE_NT
             // after the barrier: every thread has read the previous count; the meta put does not cover these bytes
-            if (epilogue_thread_idx == 0 and not cim_count_here)
+            if (kIBLeanMeta and epilogue_thread_idx == 0 and not cim_count_here)
                 *reinterpret_cast<uint32_t*>(stg + kIBOffHdr + 120) = num_tokens;
 #endif
             IB_TRACE(24, epilogue_thread_idx == 0);

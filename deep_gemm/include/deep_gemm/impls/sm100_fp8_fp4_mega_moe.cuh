@@ -1291,8 +1291,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // JOIN launch could start claiming at an earlier JOIN launch's final count and never reduce the items
                 // below it (gb32 1106-024748-61af: e_fdone + c3_q hangs, no c2_* poll hang). RET_GROUP's tl_fgroup has
                 // the same hazard but RET_GROUP is dropped; mixing RET_GROUP and non-RET_GROUP arms on one buffer is unsafe.
-                if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
-                    workspace.signals->ib_o_fitem[ib_parity ^ 1][thread_idx] = 0;
+                // Both parities: this launch's own counter too, so a launch never depends on what earlier (possibly
+                // older-header) variants left behind. Safe: every claim happens after the dispatch grid sync below.
+                if (thread_idx < 2 * layout::MegaMoESignals::kIBOMaxNodes)
+                    workspace.signals->ib_o_fitem[thread_idx / layout::MegaMoESignals::kIBOMaxNodes][thread_idx % layout::MegaMoESignals::kIBOMaxNodes] = 0;
             }
         }
 #endif

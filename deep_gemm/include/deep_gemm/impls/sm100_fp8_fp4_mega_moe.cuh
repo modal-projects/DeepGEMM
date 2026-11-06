@@ -792,7 +792,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_FWD_ROTATE_MIN 512
 #endif
 #if defined(DG_MEGA_MOE_IB_FWD_ROTATE) and DG_MEGA_MOE_IB_FWD_ROTATE
-    constexpr bool kIBFwdRotate = kIBFwdDyn and kNumRanks > 16;
+    // compiled in only for EP > 16 and a max-tokens-per-rank allocation >= FWD_ROTATE_MIN: with the code present but gated off it still
+    // costs ~+2 us at EP32 128 (code generation; measured on Flash and MegaSeek), so small-batch builds keep the old loop
+    constexpr bool kIBFwdRotate = kIBFwdDyn and kNumRanks > 16 and kNumMaxTokensPerRank >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN;
 #else
     constexpr bool kIBFwdRotate = false;
 #endif

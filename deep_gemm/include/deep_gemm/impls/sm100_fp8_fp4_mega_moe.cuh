@@ -2680,11 +2680,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const auto src = ib_ws_on(num_tokens) and kIBWSMode != 3 and piece > 0 ? x_stage + off : ib_input_base + off;
                     constexpr uint32_t kXOCtx = kIBHdrCtx ? cute::max(1u, static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2u) : 1u;
                     const uint32_t xo_nctx = kIBHdrCtx ? ib_xnctx() : kXOCtx;
-                    if (kIBXOrder and q >= xo_nctx and q - xo_nctx < 256)  // previous piece on this context issued first
+                    // Size gate (DG_MEGA_MOE_IB_XO_MIN top-k entries per rank, default 8192): MegaSeek 1024 -5.3 / -5.5 on two
+                    // servers, +0.5..+1.0 at 128 and ~0 on Flash 1024 (B300), so small batches keep the free-for-all issue
+#ifndef DG_MEGA_MOE_IB_XO_MIN
+#define DG_MEGA_MOE_IB_XO_MIN 8192
+#endif
+                    const bool xo_on = kIBXOrder and num_tokens * kNumTopk >= DG_MEGA_MOE_IB_XO_MIN;
+                    if (xo_on and q >= xo_nctx and q - xo_nctx < 256)  // previous piece on this context issued first
                         IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + (q - xo_nctx)) != ib_epoch, (void) 0, "x_order", q, 0);
                     make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
-                    if (kIBXOrder and q < 256)
+                    if (xo_on and q < 256)
                         ptx::st_rel(ib_xo_flag + q, ib_epoch);
                     SL_TR(0, 27, q == 0);
                     SL_TR(0, 28, true);

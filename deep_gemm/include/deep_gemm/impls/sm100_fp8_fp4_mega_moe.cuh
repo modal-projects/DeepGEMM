@@ -963,7 +963,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Sort-key scratch: shared memory (the epilogue's store buffer, unused before the first task) when it fits
     constexpr uint32_t kIBSortSmemOff = 1024;  // after the D1 per-expert counts
     constexpr uint32_t kIBNumKeys = kNumExpertsPerRank + 1;
-    constexpr uint32_t kIBSortWarps = kNumEpilogueWarps;
+    // Sort warps: all epilogue warps when their per-warp key histograms fit in the epilogue store buffer, else fewer (GigaSeek at small
+    // batches: 101 keys and BLOCK_M = 16 leave a 4 KB smem_d, too small for 9 x 101 counters; warps beyond kIBSortWarps get empty ranges)
+    constexpr uint32_t kIBSortRoom = static_cast<uint32_t>(sizeof(SharedStorage::smem_d)) - kIBSortSmemOff - kIBChunk * 4;
+    constexpr uint32_t kIBSortWarps =
+        (kNumEpilogueWarps + 1) * kIBNumKeys * 4 <= kIBSortRoom ? kNumEpilogueWarps :
+        (4u + 1u) * kIBNumKeys * 4 <= kIBSortRoom ? 4u : (2u + 1u) * kIBNumKeys * 4 <= kIBSortRoom ? 2u : 1u;
+    DG_STATIC_ASSERT(kIBSortWarps <= kNumEpilogueWarps, "IB sort warps");
     // [kIBSortWarps][keys] per-warp counts / bases, [keys] bucket starts, then the chunk's inverse map
     constexpr uint32_t kIBSortSmemFixed = kIBSortSmemOff + (kIBSortWarps + 1) * kIBNumKeys * 4 + kIBChunk * 4;
     constexpr bool kIBKeysInSmem = kIBSortSmemFixed + 2 * kIBTabT * 4 <= sizeof(SharedStorage::smem_d);

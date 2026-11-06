@@ -839,6 +839,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBNoRetHdr = false;
 #endif
+    // DG_MEGA_MOE_IB_C3_HDR_GATE (GB200: the NIC's writes into the return buffer are throttled to tens of MB/s while the source
+    // combine loads those lines; see CORRECTNESS_LOG 2026-11-06 05:03): 1 = no warp loads a return record before every proxy's
+    // return header landed (forces the header put even with NO_RET_HDR); 2 = per-chunk gate without headers: SM 0's first
+    // epilogue warp (which takes no combine work) polls only the last line of every return chunk and publishes a GPU-written
+    // epoch flag per (node, chunk); the combine waits on the flag of a record's chunk before loading it.
+#ifndef DG_MEGA_MOE_IB_C3_HDR_GATE
+#define DG_MEGA_MOE_IB_C3_HDR_GATE 0
+#endif
+    constexpr uint32_t kIBC3Gate = DG_MEGA_MOE_IB_C3_HDR_GATE;
+    DG_STATIC_ASSERT(kIBC3Gate <= 2, "C3_HDR_GATE is 0, 1 or 2");
+    DG_STATIC_ASSERT(kIBC3Gate == 0 or kIBRetGroup == 1, "C3_HDR_GATE uses the RET_GROUP scratch (tl_fgroup)");
+    constexpr bool kIBRetHdrPut = not kIBNoRetHdr or kIBC3Gate == 1;
     // Runtime size gate (per source: the sender uses its token count, the receivers / proxy the source's header count,
     // so both sides always agree): below DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS the old order is used
 #ifndef DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS
@@ -1260,10 +1272,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
 #endif
                 }
-                if (state == 2 and lane_idx == 1 and not kIBNoRetHdr)
+                if (state == 2 and lane_idx == 1 and kIBRetHdrPut)
                     make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
 #if defined(DG_MEGA_MOE_IB_RET_DB) and DG_MEGA_MOE_IB_RET_DB
-                if (state == 2 and lane_idx == 1 and not kIBNoRetHdr)  // doorbell for the header itself
+                if (state == 2 and lane_idx == 1 and kIBRetHdrPut)  // doorbell for the header itself
                     make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
 #endif
                 __syncwarp();
@@ -3635,20 +3647,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr bool kC3Split = false;
         float* const c3_scratch = nullptr;
 #endif
-        // DG_MEGA_MOE_IB_C3_HDR_GATE=1 (GB200 stall study): no warp touches a return record line before every proxy's return
-        // header has landed. SM 0's first epilogue warp polls the headers (one lane per remote node, with sleeps) and
-        // publishes a GPU-written epoch word; every other warp waits on that word. With C3_SPLIT the local pass runs first.
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_C3_HDR_GATE) and DG_MEGA_MOE_IB_C3_HDR_GATE
-        constexpr bool kIBC3HdrGate = true;
-        uint64_t* const c3_gate = reinterpret_cast<uint64_t*>(tl_fgroup + 2040);  // tail carve-out word, epoch-tagged (RET_GROUP off)
-        DG_STATIC_ASSERT(kIBRetGroup == 1, "C3_HDR_GATE uses a tl_fgroup word");
+        // C3 gate (DG_MEGA_MOE_IB_C3_HDR_GATE, defined with NO_RET_HDR): 1 = all return headers, 2 = per-chunk tail flags
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        uint64_t* const c3_gate = reinterpret_cast<uint64_t*>(tl_fgroup);  // [16 nodes][64 chunks] epoch words (mode 1: word 0)
+        const bool c3_poller = kIBC3Gate == 2 and sm_idx == 0 and epilogue_warp_idx == 0;
+        const uint32_t c3_gw = epilogue_warp_idx * kNumSMs + sm_idx - (kIBC3Gate == 2 ? 1u : 0u);  // the poller takes no items
+        constexpr uint32_t c3_nw = kNumSMs * kNumEpilogueWarps - (kIBC3Gate == 2 ? 1u : 0u);
 #else
-        constexpr bool kIBC3HdrGate = false;
-        uint64_t* const c3_gate = nullptr;
+        constexpr bool c3_poller = false;
+        const uint32_t c3_gw = epilogue_warp_idx * kNumSMs + sm_idx;
+        constexpr uint32_t c3_nw = kNumSMs * kNumEpilogueWarps;
 #endif
         const auto c3_gate_wait = [&]() {
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if constexpr (kIBC3HdrGate) {
+            if constexpr (kIBC3Gate == 1) {
                 if (sm_idx == 0 and epilogue_warp_idx == 0) {
                     if (lane_idx + 1 < ib_num_nodes) {
                         const auto hdr = reinterpret_cast<const uint64_t*>(ib_ret(ib_parity, ib_node_of_slot(lane_idx)) + kIBRetHdr);
@@ -3663,9 +3675,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 #endif
         };
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if (c3_poller) {
+            // Mode 2 poller: lane-strided over (remote node, chunk); one 4-byte load of the chunk's last scale per probe
+            const uint32_t nch = (num_tokens + kIBChunk - 1) / kIBChunk;
+            const uint32_t items = (ib_num_nodes - 1) * nch;
+            DG_STATIC_ASSERT(kIBFp8Combine, "C3_HDR_GATE=2 probes the fp8 record scales");
+            uint32_t done_bits = 0;  // bit j: item lane_idx + 32 * j (<= 32 items per lane)
+            const uint32_t my_items = items > lane_idx ? (items - lane_idx + 31) / 32 : 0;
+            const auto all_mine = my_items >= 32 ? 0xffffffffu : (1u << my_items) - 1u;
+            const long long t0 = clock64();
+            while (__any_sync(0xffffffffu, done_bits != all_mine)) {
+                for (uint32_t j = 0; j < my_items; ++ j) {
+                    if ((done_bits >> j) & 1u) continue;
+                    const uint32_t it = lane_idx + 32 * j, nr = it / nch, c = it % nch;
+                    const uint32_t last = cute::min(c * kIBChunk + kIBChunk, num_tokens) - 1;
+                    const auto sp = reinterpret_cast<const uint32_t*>(ib_rec_s(ib_ret(ib_parity, ib_node_of_slot(nr)), last, kHidden - 128));
+                    if (ptx::ld_volatile(sp) != 0xffffffffu) {
+                        ptx::st_rel(c3_gate + ib_node_of_slot(nr) * 64 + c, ib_epoch);
+                        done_bits |= 1u << j;
+                    }
+                }
+                if (done_bits != all_mine) __nanosleep(500);
+                if (clock64() - t0 > (1ll << 34)) {
+                    printf("OPUS_HANG c3_tailgate rank=%u lane=%u done=%x epoch=%llu\n", sym_buffer.rank_idx, lane_idx, done_bits, (unsigned long long) ib_epoch);
+                    asm volatile("trap;");
+                }
+            }
+        }
+#endif
         if (not kC3Split) c3_gate_wait();
         for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < 2; ++ c3_pass)
-        for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + (c3_poller ? num_tokens * kNumChunks : c3_gw); token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += c3_nw) {
             TT_CLOCK(tt_c0);
             const bool c3_local = not kC3Split or c3_pass == 0;
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
@@ -3797,6 +3838,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const bool hit = (ib_nodes_hit >> n) & 1u;
                 // STREAM_COMBINE: node n's proxy returned our records in its wave order (pos2, computed in D0)
                 const uint32_t rec_pos = ib_sc_on(num_tokens) ? ib_tab[kIBTabPos2 + nr * kIBTabT + token_idx] : token_idx;
+                if constexpr (kIBC3Gate == 2) {
+                    if (lane_idx == 0)
+                        IB_POLL(ptx::ld_acq_gpu(c3_gate + n * 64 + rec_pos / kIBChunk) != ib_epoch, __nanosleep(100), "c3_cflag", n, rec_pos);
+                    __syncwarp();
+                }
                 if constexpr (kIBFp8Combine) {
                     const auto rbase = ib_ret(ib_parity, n);
                     // All loads of the record part first (independent), then the sentinel checks

@@ -3635,8 +3635,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr bool kC3Split = false;
         float* const c3_scratch = nullptr;
 #endif
+        // DG_MEGA_MOE_IB_C3_HDR_GATE=1 (GB200 stall study): no warp touches a return record line before every proxy's return
+        // header has landed. SM 0's first epilogue warp polls the headers (one lane per remote node, with sleeps) and
+        // publishes a GPU-written epoch word; every other warp waits on that word. With C3_SPLIT the local pass runs first.
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_C3_HDR_GATE) and DG_MEGA_MOE_IB_C3_HDR_GATE
+        constexpr bool kIBC3HdrGate = true;
+        uint64_t* const c3_gate = reinterpret_cast<uint64_t*>(tl_fgroup + 2040);  // tail carve-out word, epoch-tagged (RET_GROUP off)
+        DG_STATIC_ASSERT(kIBRetGroup == 1, "C3_HDR_GATE uses a tl_fgroup word");
+#else
+        constexpr bool kIBC3HdrGate = false;
+        uint64_t* const c3_gate = nullptr;
+#endif
+        const auto c3_gate_wait = [&]() {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if constexpr (kIBC3HdrGate) {
+                if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                    if (lane_idx + 1 < ib_num_nodes) {
+                        const auto hdr = reinterpret_cast<const uint64_t*>(ib_ret(ib_parity, ib_node_of_slot(lane_idx)) + kIBRetHdr);
+                        IB_POLL(ptx::ld_volatile(hdr) != ib_epoch, __nanosleep(500), "c3_gate_hdr", lane_idx, 0);
+                    }
+                    __syncwarp();
+                    if (lane_idx == 0) ptx::st_rel(c3_gate, ib_epoch);
+                } else if (lane_idx == 0) {
+                    IB_POLL(ptx::ld_acq_gpu(c3_gate) != ib_epoch, __nanosleep(200), "c3_gate", 0, 0);
+                }
+                __syncwarp();
+            }
+#endif
+        };
+        if (not kC3Split) c3_gate_wait();
         for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < 2; ++ c3_pass)
-        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             TT_CLOCK(tt_c0);
             const bool c3_local = not kC3Split or c3_pass == 0;
             const uint32_t token_idx = token_chunk_idx / kNumChunks;

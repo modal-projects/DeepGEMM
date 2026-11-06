@@ -193,35 +193,20 @@ def transform_weights_for_mega_moe(
 
 
 
-# First-call rendezvous (correctness, 2026-11-06): every rank JIT-compiles a new kernel variant on its own, and the
+# First-launch rendezvous (correctness, 2026-11-06): every rank JIT-compiles a new kernel variant on its own, and the
 # compile times differ by 10s of seconds across ranks (more for traced builds). The kernel waits on its peers (NVLink
 # barriers, IB meta headers) with 60 s timeouts, so a rank that finishes compiling > 60 s after a peer turns its first
-# launch into a hang (header=ffff.. at epoch 1, 147/148 SMs at a dispatch grid sync while SM 0 waits in the NVLink
-# barrier). Compile first (no launch), then barrier the group, then launch. Keyed by every input of the JIT key the
-# host reads from the environment (DG_MEGA_MOE_* knobs) plus the static shapes. Skipped under CUDA graph capture.
-_mega_moe_ready_keys = set()
-
-
-def _mega_moe_rendezvous(call, sym_buffer: 'SymmBuffer', key: tuple) -> None:
-    import os
-    if sym_buffer.group is None or sym_buffer.group.size() == 1 or os.environ.get('DG_MOE_NO_RENDEZVOUS', '0') == '1':
-        return
-    env_key = tuple(sorted((k, v) for k, v in os.environ.items() if k.startswith('DG_MEGA_MOE_') or k == 'DG_JIT_CACHE_DIR'))
-    full_key = (id(sym_buffer.group), sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
-                sym_buffer.hidden, sym_buffer.intermediate_hidden, sym_buffer.num_shared_experts) + key + env_key
-    if full_key in _mega_moe_ready_keys:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    os.environ['DG_MOE_COMPILE_ONLY'] = '1'
-    try:
+# launch into a hang (header=ffff.. at epoch 1; 147/148 SMs at the dispatch counter while SM 0 waits in the pre-pull
+# NVLink barrier). The host skips the launch the first time it meets a kernel object (multi-rank, not capturing) and
+# reports it; we then barrier the group and call again. DG_MOE_NO_RENDEZVOUS=1 disables it.
+def _mega_moe_call(call, sym_buffer: 'SymmBuffer') -> None:
+    call()
+    if _C.mega_moe_launch_skipped():
+        torch.cuda.synchronize()
+        dist.barrier(group=sym_buffer.group)
+        torch.cuda.synchronize()
         call()
-    finally:
-        os.environ.pop('DG_MOE_COMPILE_ONLY', None)
-    torch.cuda.synchronize()
-    dist.barrier(group=sym_buffer.group)
-    torch.cuda.synchronize()
-    _mega_moe_ready_keys.add(full_key)
+        assert not _C.mega_moe_launch_skipped()
 
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
@@ -248,9 +233,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
-    _mega_moe_rendezvous(call, sym_buffer, (tuple(recipe), activation, activation_clamp, fast_math, str(l1_weights[0].dtype),
-                                            shared_l1_weights is not None, len(sym_buffer.handle.buffer_ptrs)))
-    call()
+    _mega_moe_call(call, sym_buffer)
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,

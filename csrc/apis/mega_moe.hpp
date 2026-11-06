@@ -394,6 +394,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("mega_moe_launch_skipped", []() { return mega_moe_launch_skipped(); });
     m.def("bf16_mega_moe", &bf16_mega_moe);
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <format>
+#include <unordered_set>
 #include <torch/python.h>
 
 #include <deep_gemm/layout/mega_moe.cuh>
@@ -12,6 +13,12 @@
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
+
+// Set when the last sm100_fp8_fp4_mega_moe call skipped its launch for the first-launch rendezvous
+static bool& mega_moe_launch_skipped() {
+    static bool skipped = false;
+    return skipped;
+}
 
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
@@ -242,11 +249,25 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type())));
 
-    // DG_MOE_COMPILE_ONLY=1 (set by the Python wrapper's first-call rendezvous): build / load the variant, no launch.
-    // Ranks JIT-compile independently and finish 10s of seconds apart; a kernel that waits on peers must not start
-    // before every rank has its binary (the in-kernel waits time out after 60 s: header / barrier timeouts at epoch 1).
-    if (const char* compile_only = std::getenv("DG_MOE_COMPILE_ONLY"); compile_only != nullptr and std::string(compile_only) != "0")
-        return;
+    // First-launch rendezvous (correctness, 2026-11-06): ranks JIT-compile independently and finish 10s of seconds
+    // apart, and the kernel's peer waits time out after 60 s (header / NVLink-barrier timeouts at epoch 1). The first
+    // time a multi-rank call meets a kernel object this process has not launched yet (and the stream is not capturing),
+    // nothing is launched and mega_moe_launch_skipped() is set: the Python wrapper barriers the group and calls again.
+    // Steady state: one hash-set lookup. DG_MOE_NO_RENDEZVOUS=1 disables it (A/B and repro only).
+    mega_moe_launch_skipped() = false;
+    if (num_ranks > 1) {
+        const char* no_rdv = std::getenv("DG_MOE_NO_RENDEZVOUS");
+        static std::unordered_set<const void*> launched_kernels;
+        if ((no_rdv == nullptr or std::string(no_rdv) == "0") and not launched_kernels.contains(kernel.get())) {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            DG_CUDA_RUNTIME_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream().stream(), &capture_status));
+            launched_kernels.insert(kernel.get());
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                mega_moe_launch_skipped() = true;
+                return;
+            }
+        }
+    }
 
     // Launch
     jit->launch(

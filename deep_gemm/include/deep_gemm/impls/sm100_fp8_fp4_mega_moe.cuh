@@ -1309,15 +1309,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes) {
                     workspace.signals->ib_o_fdone[ib_parity ^ 1][thread_idx] = 0;
                 }
-                if (kIBRetGroup > 1) {
-                    for (uint32_t i = thread_idx; i < layout::MegaMoESignals::kIBOMaxNodes * layout::MegaMoESignals::kIBOMaxChunks; i += kNumDispatchThreads)
-                        tl_fgroup[(ib_parity ^ 1) * 16 * 64 + i] = 0;
+                if (kIBRetGroup > 1) {  // both parities (same history-independence as the claim counters below)
+                    for (uint32_t i = thread_idx; i < 2 * layout::MegaMoESignals::kIBOMaxNodes * layout::MegaMoESignals::kIBOMaxChunks; i += kNumDispatchThreads)
+                        tl_fgroup[i] = 0;
                 }
                 // Reset in EVERY variant, not only the FWD_JOIN / combine-warp ones (correctness, 2026-11-06): on a warm
                 // buffer shared by several variants (dev server A/B), a non-JOIN launch left the counter alone, so a later
                 // JOIN launch could start claiming at an earlier JOIN launch's final count and never reduce the items
-                // below it (gb32 1106-024748-61af: e_fdone + c3_q hangs, no c2_* poll hang). RET_GROUP's tl_fgroup has
-                // the same hazard but RET_GROUP is dropped; mixing RET_GROUP and non-RET_GROUP arms on one buffer is unsafe.
+                // below it (gb32 1106-024748-61af: e_fdone + c3_q hangs, no c2_* poll hang). RET_GROUP's tl_fgroup had
+                // the same hazard (reset above, now both parities).
                 // Both parities: this launch's own counter too, so a launch never depends on what earlier (possibly
                 // older-header) variants left behind. Safe: every claim happens after the dispatch grid sync below.
 #if defined(DG_MEGA_MOE_IB_LEGACY_FITEM_RESET) and DG_MEGA_MOE_IB_LEGACY_FITEM_RESET

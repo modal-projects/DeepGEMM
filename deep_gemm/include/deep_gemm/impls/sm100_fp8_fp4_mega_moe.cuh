@@ -1286,7 +1286,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t i = thread_idx; i < layout::MegaMoESignals::kIBOMaxNodes * layout::MegaMoESignals::kIBOMaxChunks; i += kNumDispatchThreads)
                         tl_fgroup[(ib_parity ^ 1) * 16 * 64 + i] = 0;
                 }
-                if (kIBFwdDyn and thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
+                // Reset in EVERY variant, not only the FWD_JOIN / combine-warp ones (correctness, 2026-11-06): on a warm
+                // buffer shared by several variants (dev server A/B), a non-JOIN launch left the counter alone, so a later
+                // JOIN launch could start claiming at an earlier JOIN launch's final count and never reduce the items
+                // below it (gb32 1106-024748-61af: e_fdone + c3_q hangs, no c2_* poll hang). RET_GROUP's tl_fgroup has
+                // the same hazard but RET_GROUP is dropped; mixing RET_GROUP and non-RET_GROUP arms on one buffer is unsafe.
+                if (thread_idx < layout::MegaMoESignals::kIBOMaxNodes)
                     workspace.signals->ib_o_fitem[ib_parity ^ 1][thread_idx] = 0;
             }
         }

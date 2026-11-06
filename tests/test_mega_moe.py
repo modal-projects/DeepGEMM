@@ -358,9 +358,28 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # noinspection PyBroadException
     if (is_legacy_loaded or nvl_ref_buffer is not None) and num_correctness_tests > 0:
         dist_print('Running correctness tests' + ('' if is_legacy_loaded else ' (reference: NVLink-only kernel)') + ':', once_in_node=True)
+        # Correctness forensics (2026-11-06): per-rank wall time of the first fused call (JIT compile + enqueue) and of its
+        # completion, relative to a common barrier, so cross-rank first-launch skew is measured, not guessed.
+        # DG_MOE_TEST_DELAY=<rank>:<seconds> sleeps that rank right before its first fused call (models a slow
+        # JIT compile on one rank).
+        import time as _time
+        dist.barrier()
+        _t_sync = _time.time()
         for i in range(num_correctness_tests):
             create_inputs()
+            if i == 0:
+                _t_in = _time.time()
+                _dly = os.environ.get('DG_MOE_TEST_DELAY', '')
+                if _dly and int(_dly.split(':')[0]) == rank_idx:
+                    _time.sleep(float(_dly.split(':')[1]))
+                _t0 = _time.time()
             fused_y, fused_stats = run_fused()
+            if i == 0:
+                _t1 = _time.time()
+                print(f'OPUS_FIRSTCALL rank={rank_idx} inputs={_t_in - _t_sync:.2f} call={_t0 - _t_sync:.2f} '
+                      f'returned={_t1 - _t_sync:.2f}', flush=True)
+                torch.cuda.synchronize()
+                print(f'OPUS_FIRSTDONE rank={rank_idx} done={_time.time() - _t_sync:.2f}', flush=True)
             if is_legacy_loaded:
                 baseline_y, baseline_stats = run_baseline()
             else:

@@ -240,6 +240,12 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type())));
 
+    // DG_MOE_COMPILE_ONLY=1 (set by the Python wrapper's first-call rendezvous): build / load the variant, no launch.
+    // Ranks JIT-compile independently and finish 10s of seconds apart; a kernel that waits on peers must not start
+    // before every rank has its binary (the in-kernel waits time out after 60 s: header / barrier timeouts at epoch 1).
+    if (const char* compile_only = std::getenv("DG_MOE_COMPILE_ONLY"); compile_only != nullptr and std::string(compile_only) != "0")
+        return;
+
     // Launch
     jit->launch(
         kernel, {

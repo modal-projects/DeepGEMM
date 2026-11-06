@@ -3197,6 +3197,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             return math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + i * kNumEpilogueWarps) * kNumChunkBytes);
         });
         const auto combine_store_buffer  = math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + kNumEpilogueWarps * 2) * kNumChunkBytes);
+        // DG_MEGA_MOE_IB_C3_PAIR=1 (tail): each pipeline stage of the source combine loads up to TWO top-k slots (two TMA loads on
+        // one barrier), so a token-chunk with ~10 local slots (MegaSeek) takes ~5 load round trips instead of ~10; the sum order
+        // is unchanged (first slot, then second). Second-slot buffers at smem slots 3 and 4.
+#if (defined(DG_MEGA_MOE_IB_C3_PAIR) and DG_MEGA_MOE_IB_C3_PAIR) or (DG_TAIL_BITS & 64)
+        constexpr bool kC3Pair = true;
+#else
+        constexpr bool kC3Pair = false;
+#endif
+        DG_STATIC_ASSERT(not kC3Pair or 5 * kNumEpilogueWarps * kNumChunkBytes <= kNumReusableSmemBytes, "C3 pair buffers");
+        const auto combine_load_buffer2 = utils::PatternVisitor([&](const uint32_t& i) {
+            return math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + (3 + i) * kNumEpilogueWarps) * kNumChunkBytes);
+        });
 
         // Per-warp barriers
         auto combine_load_barriers = utils::PatternVisitor([&](const uint32_t& i) {
@@ -3304,11 +3316,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Move mask and load
             uint32_t mask = total_mask;
+            bool pair_two[2] = {false, false};
             const auto move_mask_and_load = [&](const uint32_t& i) {
                 if (mask) {
                     // Shared slot goes first, then routed slots in top-k order
                     const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
                     mask ^= 1 << slot_idx;
+                    uint32_t slot2 = 0xffffffffu;
+                    if (kC3Pair and mask) {
+                        slot2 = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
+                        mask ^= 1 << slot2;
+                    }
+                    pair_two[i] = slot2 != 0xffffffffu;
 
                     // Load
                     if (cute::elect_one_sync()) {
@@ -3317,7 +3336,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                                 .get_data_buffer(token_idx).get_base_ptr(),
                             chunk_byte_offset);
                         ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
-                        ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
+                        if (slot2 != 0xffffffffu) {
+                            const auto src2 = math::advance_ptr<uint8_t>(
+                                buffer.combine_token_buffer.get_rank_buffer(slot2).get_data_buffer(token_idx).get_base_ptr(),
+                                chunk_byte_offset);
+                            ptx::tma_load_1d(combine_load_buffer2[i], src2, combine_load_barriers[i], kNumChunkBytes);
+                        }
+                        ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes * (slot2 != 0xffffffffu ? 2u : 1u));
                     }
                     __syncwarp();
                     return true;
@@ -3342,6 +3367,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
                         ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                }
+                if (kC3Pair and pair_two[load_stage_idx]) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const auto uint4_values = combine_load_buffer2[load_stage_idx][j * 32 + lane_idx];
+                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                    }
                 }
                 cutlass::arch::fence_view_async_shared();
                 combine_phase ^= load_stage_idx;

@@ -368,6 +368,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_ST_MIN 0
 #endif
     const auto ib_st_on = [&](const uint32_t& ntok) { return kIBSenderTables and ntok * kNumTopk >= static_cast<uint32_t>(DG_MEGA_MOE_IB_ST_MIN); };
+    // With SENDER_TABLES, COUNTS_IN_META follows the same size gate (B300 traces: early counts alone do not start the
+    // pulls earlier, they only pay off together with the tables + SKIP_SCAN, and cost +4..+16 us otherwise). Below the gate
+    // a source takes the default path (counts published after the scan).
+    const auto ib_cim_on = [&](const uint32_t& ntok) { return kIBCountsInMeta and (not kIBSenderTables or ib_st_on(ntok)); };
+    const auto ib_early_on = [&](const uint32_t& ntok) { return kIBSplitScan or ib_cim_on(ntok); };
     DG_STATIC_ASSERT(2 * kNumExpertsPerRank + 2 <= 256, "D1 counters live in the first 1 KB of smem_d");
     const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
     const auto piece_orig = [&](const uint32_t& q) {
@@ -1085,7 +1090,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     expert_status);
             }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if constexpr (kIBCountsEarly or kIBCimDispatch) {
+            if (kIBCountsEarly or (kIBCimDispatch and ib_cim_on(num_tokens))) {
                 // Stage the remote-destination counts ([destination rank][local expert] u32) in our own node's mirror slot
                 // (unused locally) and put each remote node's slice to our counterpart there (same offset)
                 const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;
@@ -2128,14 +2133,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
                         const int e = static_cast<int>(static_cast<int64_t>(vi[u]));
-                        if (i < num_tokens * kNumTopk and e >= 0 and static_cast<uint32_t>(e) / cim_node_experts != ib_my_node)
+                        if (ib_cim_on(num_tokens) and i < num_tokens * kNumTopk and e >= 0 and static_cast<uint32_t>(e) / cim_node_experts != ib_my_node)
                             atomicAdd_block(cim_cnt + e, 1u);
                     }
                 }
             }
             if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                for (uint32_t g = epilogue_thread_idx; g < kNumExperts; g += kNumEpilogueThreads)
+                for (uint32_t g = epilogue_thread_idx; ib_cim_on(num_tokens) and g < kNumExperts; g += kNumEpilogueThreads)
                     if (g / cim_node_experts != ib_my_node)
                         reinterpret_cast<uint32_t*>(stg + kIBOffCnt)[g] = cim_cnt[g];
             }
@@ -2149,7 +2154,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto gin_m = make_gin_site(1, ctx_meta(lane_idx, lane_idx), lane_idx, ib_xbase);
                 gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffIdx, stg + kIBOffIdx,
                           static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffIdx), ib_cp(sym_buffer.rank_idx, n));
-                if constexpr (kIBCountsInMeta and not kIBCimDispatch) {
+                if (kIBCountsInMeta and not kIBCimDispatch and ib_cim_on(num_tokens)) {
                     const uint64_t cb = static_cast<uint64_t>(cim_node_experts) * 4;
                     gin_m.put(ib_mirror(ib_parity, ib_my_node) + kIBOffCnt, stg + kIBOffCnt + static_cast<int64_t>(n) * static_cast<int64_t>(cb),
                               cb, ib_cp(sym_buffer.rank_idx, n));
@@ -2399,7 +2404,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
                 constexpr uint32_t kB = 4;
 #endif
-                if constexpr (kIBEarlyPublish) {
+                if (kIBEarlyPublish and ib_early_on(nt)) {
                     // Pass 1: counts only (idx), then publish them (same protocol as below); COUNTS_IN_META reads them
                     if (ib_st_on(nt)) {
                         // All of the node's counts ([rank][expert]): ours, and the sum of the lower ranks' (our slice base)
@@ -2505,22 +2510,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                             if (not ib_st_on(nt) and e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
                                 const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
-                                const uint32_t slot = atomicAdd_block((kIBEarlyPublish ? cnt2 : cnt) + le, 1u);
+                                const uint32_t slot = atomicAdd_block((ib_early_on(nt) ? cnt2 : cnt) + le, 1u);
                                 *workspace.get_src_token_topk_idx_ptr(le, r, slot) = i;
                             }
                         }
                     }
                 }
                 if (kIBEarlyPublish and not ib_st_on(nt))
-                    __threadfence();  // slot entries written by the scan above
+                    __threadfence();  // slot entries written by the scan above (also before the late publish below)
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 // EarlyPublish: remote-row pulls wait for this source's slot table; raise it as soon as the scan wrote it,
                 // not after the overlap sort below (B300: +11 / +16 us @128 Flash / MegaSeek when it came after the sort)
                 if (kIBEarlyPublish and not ib_st_on(nt) and epilogue_thread_idx == 0)
                     ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
-                if constexpr (not kIBEarlyPublish)
+                if (not ib_early_on(nt))
                     IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-                if constexpr (not kIBEarlyPublish) {
+                if (not ib_early_on(nt)) {
                     for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
                         *workspace.get_expert_recv_count_ptr(r, i) = cnt[i];
                         if constexpr (kIBCountsEarly) {
@@ -2540,7 +2545,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     IB_TRACE_MAX(32, epilogue_thread_idx == 0);  // tables done (the counts went out before pass 2)
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                if constexpr (not kIBEarlyPublish) {
+                if (not ib_early_on(nt)) {
                     IB_TRACE(19, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
                     IB_TRACE_MAX(26, epilogue_thread_idx == 0);  // scan done, slowest scanning SM
                 }

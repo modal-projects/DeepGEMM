@@ -777,9 +777,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // DG_MEGA_MOE_IB_FWD_SKIP_XPOLL=1 (tail, fewer forward-combine bytes): skip rule A's x / SF row poll for a token that has a node-local
     // expert. Every such row is pulled whole by the GPU hosting that expert, and its pull polls every byte before L1, while the mirror
     // re-arm (E) runs only after the node cleanup barrier (all pulls done). Rows of tokens without node-local experts are still polled
-    // here. Saves ~1.3 KB of reads and one HBM round trip per item.
+    // here. Saves ~1.3 KB of reads and one HBM round trip per item. Compiled in only for top-k >= 8 at EP16 or less (B300, TS7, 5 rounds:
+    // MegaSeek 1024 -1.7, GigaSeek 1024 -6.6, 128 neutral; Flash 1024 -1.0 / +1.7 on two servers; EP32 MegaSeek 1024 +1.5: the forward tail
+    // ends 5 us sooner, but the source combine then waits longer for the remote records, which arrive no sooner)
 #if defined(DG_MEGA_MOE_IB_FWD_SKIP_XPOLL) and DG_MEGA_MOE_IB_FWD_SKIP_XPOLL
-    constexpr bool kIBSkipXPoll = true;
+    constexpr bool kIBSkipXPoll = kNumTopk >= 8 and kNumRanks <= 16;
 #else
     constexpr bool kIBSkipXPoll = false;
 #endif

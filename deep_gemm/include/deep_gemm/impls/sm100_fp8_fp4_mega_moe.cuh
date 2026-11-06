@@ -840,6 +840,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_SCAN_SLICES 1
 #endif
     constexpr uint32_t kIBScanSlices = DG_MEGA_MOE_IB_SCAN_SLICES;
+    // DG_MEGA_MOE_IB_SLICE_LIST=1: pass A keeps its matches in shared memory, so pass B reloads nothing over NVLink
+#if defined(DG_MEGA_MOE_IB_SLICE_LIST)
+    constexpr bool kIBSliceList = DG_MEGA_MOE_IB_SLICE_LIST != 0;
+#else
+    constexpr bool kIBSliceList = false;
+#endif
     DG_STATIC_ASSERT(kIBScanSlices >= 1 and kIBScanSlices <= 4, "IB scan slices");
     DG_STATIC_ASSERT(kIBScanSlices == 1 or not (kIBEarlyPublish or kIBCountsEarly or kIBWaveSort), "SCAN_SLICES excludes CIM / SPLIT_SCAN / COUNTS_EARLY / WAVE_SORT");
     DG_STATIC_ASSERT(kNumExpertsPerRank <= 256, "IB scan slice counts");
@@ -2698,6 +2704,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t t1 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * (scan_j + 1) / kIBScanSlices);
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);  // cnt / cnt2 zeroed above
                     SL_TR(scan_j, 0, epilogue_thread_idx == 0);
+                    // SLICE_LIST: matches of pass A in smem_d after the first 1 KB (counters), capacity kSLCap
+                    constexpr uint32_t kSLCap = (static_cast<uint32_t>(sizeof(SharedStorage::smem_d)) - 1024u) / 4u - 1u;
+                    uint32_t* const sl_n = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(&shared_storage.smem_d) + 1024);
+                    uint32_t* const sl_list = sl_n + 1;
+                    if constexpr (kIBSliceList) {
+                        if (epilogue_thread_idx == 0) *sl_n = 0;
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
                     // Pass A: count this slice's entries for our experts. kSLB loads in flight per thread (NVLink latency-bound:
                     // one dependent load per iteration made the slices slower than the single-SM scan, B300 trace)
                     constexpr uint32_t kSLB = 8;
@@ -2716,8 +2730,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 SL_ADD(0, v[u] == kIBIdxSentinel);
                                 IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "sl_idx", r, i);
                                 const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                                if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx)
+                                if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
                                     atomicAdd_block(cnt + static_cast<uint32_t>(e) % kNumExpertsPerRank, 1u);
+                                    if constexpr (kIBSliceList) {  // (entry, local expert) for pass B: no NVLink reload
+                                        const uint32_t q = atomicAdd_block(sl_n, 1u);
+                                        if (q < kSLCap)
+                                            sl_list[q] = (i << 8) | (static_cast<uint32_t>(e) % kNumExpertsPerRank);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2754,7 +2774,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     SL_TR(scan_j, 2, epilogue_thread_idx == 0);
                     // Pass B: slot entries (token order within the slice; slices are in token order); rule A for the weights
-                    for (uint32_t i0 = e0; i0 < e1; i0 += kNumEpilogueThreads * kSLB) {
+                    const bool sl_use_list = kIBSliceList and *sl_n <= kSLCap;
+                    if (sl_use_list) {
+                        // Only our matches: one independent weight load each (all in flight), then the local slot stores
+                        const uint32_t n = *sl_n;
+                        for (uint32_t q = epilogue_thread_idx; q < n; q += kNumEpilogueThreads) {
+                            const uint32_t ent = sl_list[q], i = ent >> 8, le = ent & 0xffu;
+                            uint32_t w = ptx::ld_volatile(wts + i);
+                            SL_ADD(1, w == 0xffffffffu);
+                            IB_POLL(w == 0xffffffffu, w = ptx::ld_volatile(wts + i), "sl_w", r, i);
+                            *workspace.get_src_token_topk_idx_ptr(le, r, cnt2[le] + atomicAdd_block(cnt + le, 1u)) = i;
+                        }
+                    }
+                    for (uint32_t i0 = e0; not sl_use_list and i0 < e1; i0 += kNumEpilogueThreads * kSLB) {
                         uint64_t v[kSLB];
                         uint32_t wv[kSLB];
                         #pragma unroll

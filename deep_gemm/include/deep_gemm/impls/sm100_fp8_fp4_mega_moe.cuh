@@ -774,6 +774,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_FWD_BATCH_D 1
 #endif
     constexpr bool kIBFwdDyn = kIBCombineWarp or kIBFwdJoin;
+    // DG_MEGA_MOE_IB_FWD_INTERLEAVE=1 (with FWD_JOIN; tail, EP32): with >= 2 remote nodes the forward-combine items of all of them are
+    // claimed from ONE counter, round-robin over the nodes (claim g -> node slot g % R, item g / R, each node's items still in its own
+    // wave order). Without it every warp drains node slot 0's items before it claims any of slot 1's, so during L2 all warps wait on
+    // slot 0 and the other nodes' items are all left for after L2. No effect with one remote node (EP16).
+#if defined(DG_MEGA_MOE_IB_FWD_INTERLEAVE) and DG_MEGA_MOE_IB_FWD_INTERLEAVE
+    constexpr bool kIBFwdInterleave = kIBFwdDyn;
+#else
+    constexpr bool kIBFwdInterleave = false;
+#endif
     // DG_MEGA_MOE_IB_FWD_PREFETCH=1 (tail): shorter dependency chain per forward-combine item: the next item is claimed and
     // its token looked up while the current one runs, and the item's x / SF sentinel loads are issued together with its
     // top-k load instead of after the on-node ballot (the tables are acquired via ib_o_order_ready, so plain L2 loads)
@@ -1047,15 +1056,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kBatch = static_cast<uint32_t>(decltype(batch_tag)::value);
         DG_STATIC_ASSERT(kBatch >= 1 and kBatch <= 8, "IB forward batch");
         const auto fwd_grid_idx = ptx::get_grid_idx() + 1;
-        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+        const uint32_t fi_R = ib_num_nodes - 1;
+        const bool fi_on = kIBFwdInterleave and fi_R > 1;
+        const auto fi_claim = [&]() {
+            uint32_t v = 0;
+            if (lane_idx == 0) v = atomicAdd(&workspace.signals->ib_o_fitem[ib_parity][ib_my_node], 1u);  // own-node slot: unused per node
+            return __shfl_sync(0xffffffffu, v, 0);
+        };
+        uint32_t fi_max = 0, fi_g = 0;
+        if (fi_on) {
+            constexpr uint32_t kFiSplit = kIBRetGroups > 0 ? kIBRetGroups : 4;
+            for (uint32_t q = 0; q < fi_R; ++ q) {
+                const uint32_t qn = ib_node_of_slot(q);
+                const uint32_t qnt = ptx::ld_volatile(&workspace.signals->ib_o_nt[qn]);
+                fi_max = cute::max(fi_max, qnt * kFiSplit);
+                if (qnt == 0 and is_leader)  // zero-token nodes: their header now, once
+                    make_gin_site(16, ctx_rhdr(q, q), q, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ib_ret(ib_parity, ib_my_node) + kIBRetHdr),
+                                                                           ib_epoch, ib_cp(sym_buffer.rank_idx, qn));
+            }
+            fi_g = fi_claim();
+        }
+        for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
+            const uint32_t nr = fi_on ? fi_g % fi_R : nr_it;
             const uint32_t n = ib_node_of_slot(nr);
             const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
             const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             const auto ret_dst = ib_ret(ib_parity, ib_my_node);
-            if (nt == 0) {
-                if (is_leader)
+            if (nt == 0 or (fi_on and fi_g / fi_R >= nt * (kIBRetGroups > 0 ? kIBRetGroups : 4))) {
+                if (not fi_on and is_leader)
                     make_gin_site(16, ctx_rhdr(nr, nr), nr, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
+                if (fi_on) fi_g = fi_claim();
                 continue;
             }
             const auto mir = ib_mirror(ib_parity, n);
@@ -1083,13 +1114,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             };
             const uint32_t num_items = nt * kSplit;
             // p = record position (= token index unless STREAM_COMBINE), t = token
-            const bool pf_on = kIBFwdPrefetch and ib_sc_on(nt);
+            const bool pf_on = kIBFwdPrefetch and ib_sc_on(nt) and not fi_on;
             const auto tok_of = [&](const uint32_t& it) -> uint32_t {
                 const uint32_t p = it / kSplit;
                 if (not ib_sc_on(nt)) return p;
                 return pf_on ? __ldcg(ib_tab + kIBTabPerm2 + nr * kIBTabT + p) : ptx::ld_volatile(ib_tab + kIBTabPerm2 + nr * kIBTabT + p);
             };
-            uint32_t item = kIBFwdDyn ? claim(0) : global_warp;
+            uint32_t item = fi_on ? fi_g / fi_R : (kIBFwdDyn ? claim(0) : global_warp);
             uint32_t t_next = item < num_items ? tok_of(item) : 0u;
             while (item < num_items) {
                 const uint32_t p_rec = item / kSplit, qtr = item % kSplit;
@@ -1279,6 +1310,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     make_gin_site(32, ctx_rhdr(nr, c + nr + 1), c + nr + 1, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
 #endif
                 __syncwarp();
+                if (fi_on)
+                    break;  // FWD_INTERLEAVE: one item per claim, the next claim may be another node's
                 if (pf_on) {
                     item = next_item;
                 } else {
@@ -1286,6 +1319,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     t_next = item < num_items ? tok_of(item) : 0u;
                 }
             }
+            if (fi_on)
+                fi_g = fi_claim();
         }
     };
 #endif

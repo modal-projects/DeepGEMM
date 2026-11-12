@@ -15,6 +15,10 @@ constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
 // Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
 template <typename pred_t, typename print_timeout_t>
 CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_timeout) {
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG >= 2
+    // DG_MEGA_MOE_IB_NO_DIAG=2: no timeout diagnostics in the barrier / header waits either (codegen budget)
+    while (not pred());
+#else
     const auto start_clock = clock64();
     while (not pred()) {
         if (clock64() - start_clock >= kNumTimeoutCycles) {
@@ -22,6 +26,7 @@ CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_
             DG_DEVICE_ASSERT(false and "Timeout");
         }
     }
+#endif
 }
 
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {

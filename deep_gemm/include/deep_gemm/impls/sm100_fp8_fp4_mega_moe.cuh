@@ -1555,7 +1555,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 const auto fp = ff_eflag((ek / kNumExpertsPerRank) % ib_lsa, ek % kNumExpertsPerRank);
                                 uint64_t fv = ptx::ld_acq_sys(fp);
                                 tt_miss |= fv != ib_epoch;
+#if defined(DG_MEGA_MOE_IB_FF_DEBUG) and DG_MEGA_MOE_IB_FF_DEBUG
+                                {
+                                    // debug: on a flag timeout print the hosting rank's task counter, its expert token count and the flag
+                                    const long long dt0 = clock64();
+                                    while (fv != ib_epoch) {
+                                        fv = ptx::ld_acq_sys(fp);
+                                        if (clock64() - dt0 > (1ll << 34)) {
+                                            const uint32_t hr = ek / kNumExpertsPerRank, he = ek % kNumExpertsPerRank;
+                                            if (lane_idx == 0)
+                                                printf("OPUS_HANG ff_eflag_dbg rank=%u token=%u host=%u e=%u ecnt=%u tokens=%llu flag=%llx epoch=%llu\n",
+                                                       sym_buffer.rank_idx, t, hr, he, ptx::ld_volatile(sym_buffer.map(ff_ecnt() + he, hr)),
+                                                       (unsigned long long) (ptx::ld_volatile(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(he), hr)) & 0xffffffffull),
+                                                       (unsigned long long) fv, (unsigned long long) ib_epoch);
+                                            asm volatile("trap;");
+                                        }
+                                    }
+                                }
+#else
                                 IB_POLL(fv != ib_epoch, fv = ptx::ld_acq_sys(fp), "ff_eflag", t, ek);
+#endif
                             }
                         }
                         if constexpr (kFFTokCnt and kFFWait) {

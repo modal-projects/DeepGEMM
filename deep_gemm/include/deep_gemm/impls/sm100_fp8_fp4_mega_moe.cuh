@@ -600,7 +600,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // when all S are done. Same wire layout, receivers unchanged; without it the one-SM builder is staged at 16 / 40 us.
 #if defined(DG_MEGA_MOE_IB_SST_MSB) and DG_MEGA_MOE_IB_SST_MSB
     constexpr uint32_t kIBMSB = DG_MEGA_MOE_IB_SST_MSB;
-    DG_STATIC_ASSERT(kIBMSB <= 8 and not kIBSSTRPut, "SST_MSB: at most 8 SMs (flag slots 184.. / 192..), no SST_RPUT");
+    DG_STATIC_ASSERT(kIBMSB <= 8, "SST_MSB: at most 8 SMs (flag slots 184.. / 192..)");
 #else
     constexpr uint32_t kIBMSB = 0;
 #endif
@@ -3558,6 +3558,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         if (kIBHeavy and kIBSST and not kIBSSTNB and ib_sst and not (kCGDrop & 2)) {
             DG_IB_OUTLINE_BEGIN
+            DG_STATIC_ASSERT(not (kIBMSB > 0 and kIBSSTRPut), "SST_MSB excludes SST_RPUT");
             const uint32_t msb_s = kIBMSB > 0 ? kNumSMs - (kNumRanks - ib_lsa) - 5 - kIBMSO - sm_idx
                                               : (sm_idx + 1 + (kNumRanks - ib_lsa) == kNumSMs ? 0u : 0xffffffffu);
             if (msb_s < (kIBMSB > 0 ? kIBMSB : 1u)) {

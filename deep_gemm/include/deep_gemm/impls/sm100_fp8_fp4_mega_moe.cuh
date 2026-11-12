@@ -2365,35 +2365,54 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(27, thread_idx == 0);  // pull end, slowest SM
         if constexpr (kIBFused and kFFSig == 5) {
-            if (warp_idx == kNumDispatchWarps - 1) {
-                // FF_SIG=5 releaser: publish this SM's finished L2 tasks to the proxies' token counters
-                uint32_t tl = 0;
-                bool ff_end = false;
+            // DG_MEGA_MOE_IB_FF_REL_GROUP=G: only every G-th SM runs a releaser warp, which serves the rings of G consecutive SMs (the
+            // head's release / acquire is GPU scope, so any SM of the GPU may consume it); the other SMs keep all dispatch warps
+            // on the forward-combine and issue no system-scope fence at all
+#ifndef DG_MEGA_MOE_IB_FF_REL_GROUP
+#define DG_MEGA_MOE_IB_FF_REL_GROUP 1
+#endif
+            constexpr uint32_t kFFG = DG_MEGA_MOE_IB_FF_REL_GROUP;
+            DG_STATIC_ASSERT(kFFG >= 1 and kFFG <= 32, "FF_REL_GROUP");
+            if (warp_idx == kNumDispatchWarps - 1 and sm_idx % kFFG == 0) {
+                // FF_SIG=5 releaser: publish the finished L2 tasks of SMs [sm_idx, sm_idx + G) to the proxies' token counters
+                uint32_t tl[kFFG];
+                #pragma unroll
+                for (uint32_t g = 0; g < kFFG; ++ g)
+                    tl[g] = 0;
+                uint32_t ff_live = 0;  // bit g: ring of SM sm_idx + g has not delivered its end marker yet
+                #pragma unroll
+                for (uint32_t g = 0; g < kFFG; ++ g)
+                    if (sm_idx + g < kNumSMs) ff_live |= 1u << g;
                 const long long ff_t0 = clock64();
-                while (not ff_end) {
-                    // every lane acquires; the warp then works on the smallest value any lane saw, so its control flow stays uniform
-                    const uint32_t h = __reduce_min_sync(0xffffffffu, ptx::ld_acq(ff_head(sm_idx)));
-                    if (h == tl) {
-                        if (clock64() - ff_t0 > (1ll << 36)) {
-                            if (lane_idx == 0) printf("OPUS_HANG ff_releaser rank=%u sm=%u tail=%u epoch=%llu\n", sym_buffer.rank_idx, sm_idx, tl, (unsigned long long) ib_epoch);
-                            asm volatile("trap;");
+                while (ff_live != 0) {
+                    bool ff_any = false;
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kFFG; ++ g) {
+                        if (((ff_live >> g) & 1u) == 0) continue;
+                        const uint32_t s2 = sm_idx + g;
+                        // every lane acquires; the warp then works on the smallest value any lane saw, so its control flow stays uniform
+                        const uint32_t h = __reduce_min_sync(0xffffffffu, ptx::ld_acq(ff_head(s2)));
+                        if (h == tl[g]) continue;
+                        ff_any = true;
+                        asm volatile("fence.release.sys;" ::: "memory");
+                        for (; tl[g] != h; ++ tl[g]) {
+                            const uint32_t e = ptx::ld_volatile(ff_ring(s2) + (tl[g] & 255));
+                            if (e == 0xffffffffu) { ff_live &= ~(1u << g); break; }
+                            const uint32_t pm = e >> 8, vm = e & 0xffu;
+                            for (uint32_t m = lane_idx; m < vm; m += 32) {
+                                const auto md = *workspace.get_token_src_metadata_ptr(pm + m);
+                                if (is_remote(md.rank_idx))
+                                    asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(sym_buffer.map(
+                                        ff_cnt(md.rank_idx / ib_lsa) + md.token_idx, ib_cp(md.rank_idx, ib_my_node))) : "memory");
+                            }
                         }
-                        continue;
+                        __syncwarp();
+                        if (lane_idx == 0) ff_head(s2)[1] = tl[g];
                     }
-                    asm volatile("fence.release.sys;" ::: "memory");
-                    for (; tl != h and not ff_end; ++ tl) {
-                        const uint32_t e = ptx::ld_volatile(ff_ring(sm_idx) + (tl & 255));
-                        if (e == 0xffffffffu) { ff_end = true; break; }
-                        const uint32_t pm = e >> 8, vm = e & 0xffu;
-                        for (uint32_t m = lane_idx; m < vm; m += 32) {
-                            const auto md = *workspace.get_token_src_metadata_ptr(pm + m);
-                            if (is_remote(md.rank_idx))
-                                asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(sym_buffer.map(
-                                    ff_cnt(md.rank_idx / ib_lsa) + md.token_idx, ib_cp(md.rank_idx, ib_my_node))) : "memory");
-                        }
+                    if (not ff_any and clock64() - ff_t0 > (1ll << 36)) {
+                        if (lane_idx == 0) printf("OPUS_HANG ff_releaser rank=%u sm=%u live=%x epoch=%llu\n", sym_buffer.rank_idx, sm_idx, ff_live, (unsigned long long) ib_epoch);
+                        asm volatile("trap;");
                     }
-                    __syncwarp();
-                    if (lane_idx == 0) ff_head(sm_idx)[1] = tl;
                 }
             } else {
                 ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0,

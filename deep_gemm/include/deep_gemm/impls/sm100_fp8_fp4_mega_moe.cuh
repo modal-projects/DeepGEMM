@@ -916,6 +916,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     constexpr uint32_t kFFData = DG_MEGA_MOE_IB_FF_DATA, kFFSig = DG_MEGA_MOE_IB_FF_SIG, kFFRead = DG_MEGA_MOE_IB_FF_READ;
     constexpr bool kFFWait = DG_MEGA_MOE_IB_FF_WAIT != 0;
+// code-generation bisect only (not runnable): 1 = no releaser call, 2 = no ring appends in the epilogue, 4 = no flag wait
+#ifndef DG_MEGA_MOE_IB_FF_BISECT
+#define DG_MEGA_MOE_IB_FF_BISECT 0
+#endif
     // DG_MEGA_MOE_IB_FWD_OUTLINE=1 (code generation; works on any build): the forward-combine is called through a non-inlined lambda at
     // each of its call sites, so its (large) body no longer takes part in the register allocation of the kernel function's hot
     // loops (start side, 2026-11-12: code merely carried in the kernel function cost +22..+28 us at 1024 through spill reloads next
@@ -980,13 +984,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // release for another thread, PTX ISA 8.7; with FF_REL_GROUP > 1 the reader is another SM and did read stale entries)
     const auto ff_st = [](uint32_t* p, const uint32_t& v) { asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" : : "l"(p), "r"(v) : "memory"); };
     const auto ff_marker = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT; };
-    if constexpr (kIBFused) {
-        if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2 + (kIBFusedSrc ? 1u : 0u)) {
-            if (blockIdx.x == 0 and threadIdx.x == 0)
-                printf("DeepGEMM IB: FUSED_FIN needs <= 5 nodes and top-k >= nodes + 2 (nodes=%u, top-k=%u)\n", ib_num_nodes, kNumTopk);
-            __trap();
-        }
-    }
     // DG_MEGA_MOE_IB_FWD_PREFETCH=1 (tail): shorter dependency chain per forward-combine item: the next item is claimed and
     // its token looked up while the current one runs, and the item's x / SF sentinel loads are issued together with its
     // top-k load instead of after the on-node ballot (the tables are acquired via ib_o_order_ready, so plain L2 loads)
@@ -1543,7 +1540,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // FUSED_FIN: the node's L2 epilogues added this token's rows into one running sum; wait for the counter, then
                     // read this item's part of the sum and zero it for the next launch
                     if (m != 0 and ff_rt) {
-                        if constexpr (kFFSig == 6 and kFFWait) {
+                        if constexpr (kFFSig == 6 and kFFWait and not (DG_MEGA_MOE_IB_FF_BISECT & 4)) {
                             // every lane acquires the flag of every on-node pick (rank, expert) of the token
                             uint32_t mm = m;
                             while (mm) {
@@ -1841,6 +1838,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
         if constexpr (kIBFused) {
+            // layout guard (trap only: a printf call at the top of the kernel function made every value live across it stack-resident)
+            if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2 + (kIBFusedSrc ? 1u : 0u) or ib_lsa > 8)
+                asm volatile("trap;");
             // FUSED_FIN state check (before the dispatch grid sync, so before any node peer's L2): a launch that leaves the counters /
             // sums zero stamps the marker at its end; anything else (fresh 0xFF-filled buffer, a timing-only variant) is cleaned here
             const uint32_t ff_gtid = sm_idx * kNumDispatchThreads + thread_idx;
@@ -2499,8 +2499,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_FF_REL_GROUP
 #define DG_MEGA_MOE_IB_FF_REL_GROUP 1
 #endif
-            if (ff_rt and warp_idx == kNumDispatchWarps - 1 and sm_idx % DG_MEGA_MOE_IB_FF_REL_GROUP == 0) {
-                if (ib_lsa > 8) asm volatile("trap;");
+            if (not (DG_MEGA_MOE_IB_FF_BISECT & 1) and ff_rt and warp_idx == kNumDispatchWarps - 1 and sm_idx % DG_MEGA_MOE_IB_FF_REL_GROUP == 0) {
                 const uint32_t ff_r0 = ib_my_node * ib_lsa;
                 const auto ff_off = [&](const uint32_t& i) { return i < ib_lsa ? sym_buffer.offsets[ff_r0 + i] : static_cast<int64_t>(0); };
                 ff_expert_releaser<DG_MEGA_MOE_IB_FF_REL_GROUP, kNumSMs, BLOCK_M, kFFNBlocks>(
@@ -4357,12 +4356,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                if constexpr (kIBFused and kFFSig == 6) {
+                if constexpr (kIBFused and kFFSig == 6 and not (DG_MEGA_MOE_IB_FF_BISECT & 2)) {
                     if (ff_rt and epilogue_thread_idx == 0 and not task_info.is_shared()) {
                         const uint32_t ff_e = task_info.local_expert_idx, ff_h0 = ff_h ++;
                         IB_OUTLINE_BEGIN
-                        if (ff_h0 >= 256)
-                            IB_POLL(ff_h0 - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring6", ff_h0, 0);
+                        if (ff_h0 >= 255) asm volatile("trap;");  // ring capacity (~40 routed L2 tasks per SM per launch); no printf in the epilogue
                         ff_st(ff_ring(sm_idx) + (ff_h0 & 255), ff_e);
                         asm volatile("red.release.gpu.global.add.u32 [%0], 1;" : : "l"(ff_head(sm_idx)) : "memory");
                         IB_OUTLINE_END
@@ -4399,12 +4397,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        if constexpr (kIBFused and (kFFSig == 5 or kFFSig == 6)) {
+        if constexpr (kIBFused and (kFFSig == 5 or kFFSig == 6) and not (DG_MEGA_MOE_IB_FF_BISECT & 2)) {
             if (ff_rt and epilogue_thread_idx == 0) {  // end marker: this SM issues no more L2 rows
                 const uint32_t ff_h0 = ff_h;
                 IB_OUTLINE_BEGIN
-                if (ff_h0 >= 256)
-                    IB_POLL(ff_h0 - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring_end", ff_h0, 0);
+                if constexpr (kFFSig == 5) {
+                    if (ff_h0 >= 256)
+                        IB_POLL(ff_h0 - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring_end", ff_h0, 0);
+                } else {
+                    if (ff_h0 >= 256) asm volatile("trap;");
+                }
                 ff_st(ff_ring(sm_idx) + (ff_h0 & 255), 0xffffffffu);
                 asm volatile("red.release.gpu.global.add.u32 [%0], 1;" : : "l"(ff_head(sm_idx)) : "memory");
                 IB_OUTLINE_END

@@ -502,6 +502,24 @@ __device__ __noinline__ bool ib_fwd_tok_fn(
 }
 #endif
 
+// DG_MEGA_MOE_IB_OUTLINE=1 (2026-11-12, coordinator's function-size experiment): ONE out-of-line copy of the forward-combine item
+// loop for every caller (dispatch warps after the pull, epilogue warps after the L2 sync / JOIN_EARLY): the inlined lambda
+// `ib_forward_combine` is then not instantiated at all. It is FWD_DRAIN=2 with one item per claim on both sides, no adaptive
+// claims, and the slot loads issued one slot at a time as in the inlined loop (=2: next slot's loads in flight, FWD_DRAIN_LA).
+#if defined(DG_MEGA_MOE_IB_OUTLINE) and DG_MEGA_MOE_IB_OUTLINE
+#if defined(DG_MEGA_MOE_IB_FWD_DRAIN) or defined(DG_MEGA_MOE_IB_FWD_DRAIN_N) or defined(DG_MEGA_MOE_IB_FWD_DRAIN_ND) or defined(DG_MEGA_MOE_IB_FWD_DRAIN_ADAPT) or defined(DG_MEGA_MOE_IB_FWD_DRAIN_LA)
+#error "DG_MEGA_MOE_IB_OUTLINE sets the FWD_DRAIN knobs itself"
+#endif
+#define DG_MEGA_MOE_IB_FWD_DRAIN 2
+#define DG_MEGA_MOE_IB_FWD_DRAIN_N 1
+#define DG_MEGA_MOE_IB_FWD_DRAIN_ND 1
+#define DG_MEGA_MOE_IB_FWD_DRAIN_ADAPT 0
+#if DG_MEGA_MOE_IB_OUTLINE >= 2
+#define DG_MEGA_MOE_IB_FWD_DRAIN_LA 1
+#else
+#define DG_MEGA_MOE_IB_FWD_DRAIN_LA 0
+#endif
+#endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_FWD_DRAIN) and DG_MEGA_MOE_IB_FWD_DRAIN
 #if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
 #define DRN_POLL(cond, reload, tag, a, b) do { while (cond) { reload; } } while (0)
@@ -3391,6 +3409,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 tok_tt, tok_tr32, workspace.signals->ib_trace,
                 from_epilogue ? nullptr : reinterpret_cast<uint8_t*>(shared_storage.dispatch_send_buffer[warp_idx % kNumDispatchWarps]));
         }
+#endif
+#if defined(DG_MEGA_MOE_IB_NOUNROLL) and DG_MEGA_MOE_IB_NOUNROLL
+        // DG_MEGA_MOE_IB_NOUNROLL=1 (function-size experiment): the compiler unrolls this node loop (62 copies of the item loop in the
+        // kernel at EP32, counted in the PTX); one copy per call site instead
+        #pragma unroll 1
 #endif
         for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
             uint32_t nr = fi_on ? fi_g % fi_R : nr_it + rot0;

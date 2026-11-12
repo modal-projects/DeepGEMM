@@ -925,7 +925,25 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
             }
             bool miss = false;
             while (m) {
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
                 ptx::mbarrier_wait_and_flip_phase(mbar, phase);
+#else
+                {   // the same wait with a 2 s limit (a transaction-count or phase mistake would otherwise spin silently)
+                    const uint64_t w0 = now();
+                    while (true) {
+                        uint32_t ok;
+                        asm volatile("{\n\t.reg .pred P1;\n\tmbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\tselp.u32 %0, 1, 0, P1;\n\t}"
+                                     : "=r"(ok) : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar))), "r"(phase) : "memory");
+                        if (ok) break;
+                        if (now() - w0 > 2000000000ull) {
+                            printf("OPUS_HANG blk_mbar rank=%u sm=%u thread=%u a=%u b=%u epoch=%llu\n", rank_idx, ptx::get_sm_idx(), threadIdx.x, t, phase,
+                                   (unsigned long long) epoch);
+                            asm volatile("trap;");
+                        }
+                    }
+                    phase ^= 1;
+                }
+#endif
                 #pragma unroll
                 for (uint32_t j = 0; j < kSlots; ++ j) {
                     if (m == 0) break;

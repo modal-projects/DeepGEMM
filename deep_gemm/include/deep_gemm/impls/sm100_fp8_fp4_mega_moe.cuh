@@ -579,10 +579,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     // Runtime gate of every SST path (both paths are compiled): DG_MEGA_MOE_IB_SST_DEAD=1 is the CODEGEN CONTROL arm: the SST /
     // ORD code is compiled in but the kernel runs the legacy path (the condition is a memory load the compiler cannot fold)
+#if defined(DG_MEGA_MOE_IB_SST_RELOAD) and DG_MEGA_MOE_IB_SST_RELOAD
+    // DG_MEGA_MOE_IB_SST_RELOAD=1: the runtime flag is re-read from memory at each use (no kernel-wide live register)
+#if defined(DG_MEGA_MOE_IB_SST_DEAD) and DG_MEGA_MOE_IB_SST_DEAD
+#define ib_sst (kIBSST and not (DG_MEGA_MOE_IB_CG_DROP & 16384) and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) == ~0ull)
+#else
+#define ib_sst (kIBSST and not (DG_MEGA_MOE_IB_CG_DROP & 16384) and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) != ~0ull)
+#endif
+#else
 #if defined(DG_MEGA_MOE_IB_SST_DEAD) and DG_MEGA_MOE_IB_SST_DEAD
     const bool ib_sst = kIBSST and not (DG_MEGA_MOE_IB_CG_DROP & 16384) and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) == ~0ull;
 #else
     const bool ib_sst = kIBSST and not (DG_MEGA_MOE_IB_CG_DROP & 16384) and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) != ~0ull;
+#endif
 #endif
     DG_STATIC_ASSERT(not kIBSST or (kIBFront and kIBHdrCtx and not kIBThreadCtx and not kIBEarlyPublish and not kIBCountsEarly),
                      "DG_MEGA_MOE_IB_SST needs FRONT + HDR_CTX, shared contexts, and no COUNTS_IN_META / SPLIT_SCAN / COUNTS_EARLY");

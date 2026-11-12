@@ -4374,8 +4374,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t orig = 2 * ib_R + nr % ib_xnctx();
                 const auto gin_x = make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase);
                 constexpr uint32_t kPC = (kIBOrd > 0 ? kIBOrd : kIBWSPost) / kIBChunk;  // chunks per put
-                for (uint32_t c0 = 0; c0 < num_x_chunks; c0 += kPC) {
-                    const uint32_t c1 = cute::min(c0 + kPC, num_x_chunks);
+                // DG_MEGA_MOE_IB_ORD_HEAD=h (chunks, < kPC): ramp: the first put of every node carries only the first h chunks (h x 32
+                // rows), the second the rest of the first group, then full groups: the head is on the receivers after ~h/4 of the
+                // first piece's wire time (3 nodes x 128 rows = 2 MB = ~20 us before ANY first row was complete)
+#ifndef DG_MEGA_MOE_IB_ORD_HEAD
+#define DG_MEGA_MOE_IB_ORD_HEAD 0
+#endif
+                constexpr uint32_t kHead = DG_MEGA_MOE_IB_ORD_HEAD < kPC ? DG_MEGA_MOE_IB_ORD_HEAD : 0u;
+                for (uint32_t c0 = 0, c_next = 0; c0 < num_x_chunks; c0 = c_next) {
+                    c_next = (kHead > 0 and c0 == 0) ? kHead : (kHead > 0 and c0 == kHead) ? kPC : c0 + kPC;
+                    const uint32_t c1 = cute::min(c_next, num_x_chunks);
                     for (uint32_t c = c0; c < c1; ++ c) {
                         const uint32_t q = nr * num_pieces + 1 + c;
                         if (q < 256)

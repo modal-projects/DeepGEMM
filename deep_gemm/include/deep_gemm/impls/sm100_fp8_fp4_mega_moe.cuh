@@ -2685,9 +2685,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t sst_ne = num_tokens * kNumTopk;
                 const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;  // our own node's slot: unused locally
                 constexpr uint32_t kSSTB = 8;  // loads in flight per thread
+                SL_TR(0, 33, epilogue_thread_idx == 0);  // SST build entered
                 for (uint32_t w = epilogue_thread_idx; w < kSSTWords; w += kNumEpilogueThreads)
                     c16[w] = 0;
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 34, epilogue_thread_idx == 0);  // counters zeroed
                 for (uint32_t i0 = 0; i0 < sst_ne; i0 += kNumEpilogueThreads * kSSTB) {
                     unsigned long long v[kSSTB];
                     #pragma unroll
@@ -2704,6 +2706,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 35, epilogue_thread_idx == 0);  // count pass done
                 // Exclusive prefix over the experts in global order (our own node's count 0). Each thread owns kSSTPer
                 // consecutive experts = whole counter words
                 constexpr uint32_t kSSTPer = 2 * math::constexpr_ceil_div(kNumExperts, 2 * kNumEpilogueThreads);
@@ -2739,6 +2742,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     sst_nstart[epilogue_thread_idx] = g < kNumExperts ? (c16[g / 2] >> (16 * (g & 1u))) & 0xffffu : total;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 36, epilogue_thread_idx == 0);  // prefix + node starts done
                 // Staging per remote node slot nr: [counts of the node's experts][its entries], contiguous for one put:
                 // counts at stg + nr * cb + 4 * start(node), entry with global position p at stg + (nr + 1) * cb + 4 * p
                 const uint32_t sst_cb = sst_node_experts * 4;
@@ -2769,6 +2773,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
                 }
+                SL_TR(0, 37, epilogue_thread_idx == 0);  // scatter pass done (before the fence)
                 __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 29, epilogue_thread_idx == 0);  // SST staged
@@ -4593,8 +4598,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             if constexpr (kIBSST) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
-                printf("OPUS_SST rank=%u epoch=%llu | sender: staged=%.1f put_issued=%.1f | receiver (slowest source): counts_landed=%.1f counts_published=%.1f tables_done=%.1f\n",
-                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(29), mu(30), mu(31), us(26), us(32));
+                printf("OPUS_SST rank=%u epoch=%llu | sender: staged=%.1f put_issued=%.1f | receiver (slowest source): counts_landed=%.1f counts_published=%.1f tables_done=%.1f | build: enter=%.1f zeroed=%.1f counted=%.1f prefix=%.1f scattered=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(29), mu(30), mu(31), us(26), us(32), mu(33), mu(34), mu(35), mu(36), mu(37));
             }
             if constexpr (kIBScanSlices > 1) {
                 const auto su = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };

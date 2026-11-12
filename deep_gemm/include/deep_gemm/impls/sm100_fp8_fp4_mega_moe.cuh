@@ -680,7 +680,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 // DG_MEGA_MOE_IB_NO_DIAG=1: poll loops without the timeout diagnostics (no clock64, no printf argument set-up, no trap path):
 // ~40 sites, several inside hot loops (codegen budget; the diagnostics stay the default)
-#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG == 3
+// NO_DIAG=3 (debug of a NO_DIAG-only hang): the bare spin plus an iteration-count timeout that names the site
+#define IB_POLL(cond, reload, tag, a, b) do { uint32_t n_ = 0; while (cond) { reload; \
+        if (++ n_ == (1u << 23)) { printf("OPUS_HANG3 %s rank=%u sm=%u warp=%u lane=%u a=%u b=%u epoch=%llu\n", tag, \
+            sym_buffer.rank_idx, sm_idx, warp_idx, lane_idx, (unsigned) (a), (unsigned) (b), (unsigned long long) ib_epoch); asm volatile("trap;"); } } } while (0)
+#elif defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
 #define IB_POLL(cond, reload, tag, a, b) do { uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; } } while (0)
 #else
 #define IB_POLL(cond, reload, tag, a, b) do { const long long t0_ = clock64(); uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; \
@@ -1257,6 +1262,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kIBMetaDirect = true;
 #else
     constexpr bool kIBMetaDirect = false;
+#endif
+    // DG_MEGA_MOE_IB_SB=mask (small-batch start path, sender only; receivers are the legacy ones, so the choice is per rank):
+    // the meta leaves FIRST: idx rows, weight rows (< nt) and the header go out at kernel start straight from the input
+    // region (the META_DIRECT puts: no staging, 19 KB + 10 KB + 8 B per node at 128 tokens instead of the staged idx put +
+    // the 146 KB weight region issued at ~14 us behind 2 MB of x), and the x / SF pieces are issued only after those puts
+    // returned (GPU-scope flags), so the meta is on the NIC ahead of the bulk (a small put is served after the bulk queued
+    // before it, even on its own QP). 1: on; 2: the x / SF poster threads issue a dummy 8-byte put while they wait (the
+    // first put a thread issues costs 7-8.5 us, later ones 2.5); 4: the SF piece is issued before its SM's STREAM_COMBINE sort.
+    // DG_MEGA_MOE_IB_SB_MAX: token gate (this rank's count). DG_MEGA_MOE_IB_SB_DEAD=1: codegen control (compiled in, never on)
+#ifndef DG_MEGA_MOE_IB_SB
+#define DG_MEGA_MOE_IB_SB 0
+#endif
+#ifndef DG_MEGA_MOE_IB_SB_MAX
+#define DG_MEGA_MOE_IB_SB_MAX 0x7fffffff
+#endif
+    constexpr uint32_t kIBSB = DG_MEGA_MOE_IB_SB;
+    DG_STATIC_ASSERT(kIBSB == 0 or (kIBFront and kIBHdrCtx and not kIBCountsInMeta and not kIBSenderTables and not kIBCountsEarly and not kIBSST and not kIBThreadCtx),
+                     "DG_MEGA_MOE_IB_SB needs FRONT + HDR_CTX, shared contexts, and no COUNTS_IN_META / SENDER_TABLES / COUNTS_EARLY / SST");
+#if defined(DG_MEGA_MOE_IB_SB_DEAD) and DG_MEGA_MOE_IB_SB_DEAD
+    const bool ib_sb = kIBSB > 0 and num_tokens <= DG_MEGA_MOE_IB_SB_MAX and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) == ~0ull;
+#else
+    const bool ib_sb = kIBSB > 0 and num_tokens <= DG_MEGA_MOE_IB_SB_MAX and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) != ~0ull;
 #endif
     // Runtime size gate (per source: the sender uses its token count, the receivers / proxy the source's header count,
     // so both sides always agree): below DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS the old order is used
@@ -2732,6 +2759,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const int64_t meta_rows = static_cast<int64_t>(nt);
             for (int64_t u = gtid; u < meta_rows * kNumTopk * 8 / 16; u += kGThreads)
                 reinterpret_cast<uint4*>(mir + kIBOffIdx)[u] = idx_sentinel;
+            // Odd nt * K (odd top-k and an odd token count): the 16-byte units above stop one 8-byte entry short. That last
+            // entry kept the previous same-parity launch's value, so a reader that got to it before the NIC wrote the new
+            // one took a stale expert index (rule A broken: c2_pcomb hang at the proxy or wrong output; B300 EP16 MegaSeek,
+            // 7 tokens: ~1 launch in 1500 with fresh inputs every launch)
+#if not (defined(DG_MEGA_MOE_IB_NO_ODD_FIX) and DG_MEGA_MOE_IB_NO_ODD_FIX)  // NO_ODD_FIX=1: the old behaviour (A/B of the fix only)
+            if (gtid == 0 and ((meta_rows * kNumTopk) & 1))
+#else
+            if (false)
+#endif
+                reinterpret_cast<uint64_t*>(mir + kIBOffIdx)[meta_rows * kNumTopk - 1] = kIBIdxSentinel;
             for (int64_t u = gtid; u < meta_rows * kNumTopk; u += kGThreads)
                 reinterpret_cast<uint32_t*>(mir + kIBOffW)[u] = 0xffffffffu;
             if (gtid == 0)
@@ -3776,7 +3813,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (epilogue_thread_idx == 0)
                 { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_o_meta_posted_t = t_; }
                 ptx::st_rel(&workspace.signals->ib_o_meta_posted, ib_epoch);  // GPU scope: only this GPU's x posters read it (sys scope cost ~10 us)
-        } else if (kIBMetaDirect and sm_idx == kIBMetaSM) {
+        } else if ((kIBMetaDirect or ib_sb) and sm_idx == kIBMetaSM) {
             DG_STATIC_ASSERT(not kIBMetaDirect or (kIBFront and kIBHdrCtx and not kIBCountsInMeta and not kIBSenderTables and not kIBCountsEarly),
                              "META_DIRECT needs FRONT + HDR_CTX and no COUNTS_IN_META / SENDER_TABLES / COUNTS_EARLY");
             // Three puts from three warps, issued concurrently, straight from the input region (rows < num_tokens only, so no
@@ -3784,6 +3821,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // weight rows (both on the header context). Receivers poll every idx / weight unit (rule A) and learn nt from
             // the header, so the three may land in any order.
             IB_TRACE(24, epilogue_thread_idx == 0);
+            const bool sb_hdr_last = (kIBSB & 8) != 0 and ib_sb;
+            // SB & 16: the x / SF posters are released when the meta puts START (they then queue behind them in the
+            // put-issue serialization instead of waiting ~8 us for them to return)
+            if ((kIBSB & 16) != 0 and ib_sb and epilogue_warp_idx <= 2 and lane_idx == 0)
+                ptx::st_rel(ib_xo_flag + 232 + epilogue_warp_idx, ib_epoch);
             if (epilogue_warp_idx <= 2 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
@@ -3795,15 +3837,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             static_cast<uint64_t>(num_tokens) * kNumTopk * 8, cp);
                     SL_TR(0, 25, true);
                 } else if (epilogue_warp_idx == 1) {
+                    if (not sb_hdr_last)
                     make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase).put_value(
                         reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
-                    SL_TR(0, 26, true);
+                    SL_TR(0, 26, not sb_hdr_last);
                 } else if (num_tokens > 0) {
+                    if (sb_hdr_last)  // same QP as the idx rows: the header issued after both lands after both
+                        make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put(dst + kIBOffW, ib_input_base + kIBOffW,
+                            static_cast<uint64_t>(num_tokens) * kNumTopk * 4, cp);
+                    else
                     make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase).put(dst + kIBOffW, ib_input_base + kIBOffW,
                         static_cast<uint64_t>(num_tokens) * kNumTopk * 4, cp);
                 }
             }
             __syncwarp();
+            if (sb_hdr_last) {
+                // SB & 8: the header lands LAST (issued on the idx / weight context after both puts returned), so no
+                // receiver polls rows the NIC is still writing (header first: the NVLink-remote scans ran 16-26 us longer)
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+                    const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
+                    make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put_value(
+                        reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr), (ib_epoch << 32) | num_tokens, ib_cp(sym_buffer.rank_idx, n));
+                    SL_TR(0, 26, true);
+                }
+                __syncwarp();
+            }
+            if (ib_sb and epilogue_warp_idx <= 2 and lane_idx == 0) {  // SB: this warp's meta puts are issued (x / SF posters wait)
+                if ((kIBSB & 16) == 0)
+                    ptx::st_rel(ib_xo_flag + 232 + epilogue_warp_idx, ib_epoch);
+                SL_TR(0, 30, true);  // SB: meta puts issued (slowest warp)
+            }
         } else if (sm_idx == kIBMetaSM) {
             const auto stg = ib_mirror(ib_parity, ib_my_node);
             const auto in_idx = reinterpret_cast<const uint64_t*>(ib_input_base + kIBOffIdx);
@@ -4113,7 +4177,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         ib_tab[kIBTabPos2 + q_nr * kIBTabT + t] = pos;
                     });
                 };
-                if (not kIBSFFirst and ib_sc_on(num_tokens) and q_piece == 0 and num_tokens > 0)
+                if (ib_sb and epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
+                    if constexpr ((kIBSB & 2) != 0)
+                        make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put_value(
+                            reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, q_n));
+                    SL_TR(0, 29, true);  // SB: poster warm (slowest)
+                    for (uint32_t w = 0; w < 3; ++ w)
+                        while (ptx::ld_acq_gpu(ib_xo_flag + 232 + w) != ib_epoch);
+                    SL_TR(0, 41, true);  // SB: meta flags seen (slowest poster)
+                }
+                __syncwarp();
+                const bool sb_sf_first = (kIBSB & 4) != 0 and ib_sb;
+                if (not kIBSFFirst and not sb_sf_first and ib_sc_on(num_tokens) and q_piece == 0 and num_tokens > 0)
                     sc_sort();
                 if (epilogue_warp_idx == 0 and lane_idx == 0 and num_tokens > 0) {
                     // Meta first (x / SF posted only after the meta put): opt-in only; on GB200 it turns into ms-scale
@@ -4183,7 +4258,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
                 }
                 __syncwarp();
-                if (kIBSFFirst and ib_sc_on(num_tokens) and q_piece == 0 and num_tokens > 0)
+                if ((kIBSFFirst or sb_sf_first) and ib_sc_on(num_tokens) and q_piece == 0 and num_tokens > 0)
                     sc_sort();
             }
         }
@@ -4224,6 +4299,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
             DG_IB_OUTLINE_END
         }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and defined(DG_MEGA_MOE_IB_LANDP) and DG_MEGA_MOE_IB_LANDP
+        // DG_MEGA_MOE_IB_LANDP=1 (trace builds only): landing probe. On one idle SM, 8 threads per remote node watch the
+        // mirror of our own counterpart source there (local memory): header, first / last idx unit, first / last weight,
+        // first / last x unit, last SF unit; each records when it first sees landed data (slowest node, ib_sl_tr[48..55]).
+        // Assumes the source has our token count (true in the dev-server runs).
+        if (sm_idx == 40 and epilogue_warp_idx == 0 and lane_idx < 8 * cute::min(ib_R, 3u) and num_tokens > 0) {
+            const uint32_t lp_n = ib_node_of_slot(lane_idx / 8), lp_w = lane_idx % 8;
+            const auto lp_mir = ib_mirror(ib_parity, lp_n);
+            const uint32_t lp_e = num_tokens * kNumTopk;
+            uint64_t lp_t0; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(lp_t0));
+            while (true) {
+                bool seen = false;
+                if (lp_w == 0) seen = (ptx::ld_volatile(reinterpret_cast<const uint64_t*>(lp_mir + kIBOffHdr)) >> 32) == (ib_epoch & 0xffffffffull);
+                else if (lp_w == 1) seen = ptx::ld_volatile(reinterpret_cast<const uint64_t*>(lp_mir + kIBOffIdx)) != kIBIdxSentinel;
+                else if (lp_w == 2) seen = ptx::ld_volatile(reinterpret_cast<const uint64_t*>(lp_mir + kIBOffIdx) + lp_e - 1) != kIBIdxSentinel;
+                else if (lp_w == 3) seen = ptx::ld_volatile(reinterpret_cast<const uint32_t*>(lp_mir + kIBOffW)) != 0xffffffffu;
+                else if (lp_w == 4) seen = ptx::ld_volatile(reinterpret_cast<const uint32_t*>(lp_mir + kIBOffW) + lp_e - 1) != 0xffffffffu;
+                else if (lp_w == 5) seen = not ib_is_sentinel4(ib_ldv4(lp_mir));
+                else if (lp_w == 6) seen = not ib_is_sentinel4(ib_ldv4(lp_mir + static_cast<int64_t>(num_tokens) * kIBTokBytes - 16));
+                else seen = not ib_is_sentinel4(ib_ldv4(lp_mir + kIBOffSF + static_cast<int64_t>(num_tokens) * kIBSFBytes - 16));
+                uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
+                if (seen or t_ > lp_t0 + 1000000ull) break;
+            }
+            SL_TR(0, 48 + lp_w, true);
+        }
+        __syncwarp();
+#endif
         IB_TRACE(0, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
         // D1 (host scan; v1 had the proxy do this and push tables over NVLink, measured ~20 us slower): every GPU scans,
         // for each remote source r, r's mirror on r's counterpart in this node (over NVLink, or locally when that is
@@ -5497,6 +5599,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 if (qv[j] == ~0ull) qv[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase, rec_pos, col)));
                                 if (sv[j] == 0xffffffffu) sv[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase, rec_pos, col)));
                             }
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG == 3
+                            if (clock64() - rp_t0 > (1ll << 33) and (lane_idx % 8) == 0) {  // debug dump: which pieces, which record position
+                                uint32_t mq = 0, ms = 0;
+                                #pragma unroll
+                                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j)
+                                    mq |= (qv[j] == ~0ull ? 1u : 0u) << j, ms |= (sv[j] == 0xffffffffu ? 1u : 0u) << j;
+                                printf("OPUS_C3DUMP rank=%u sm=%u warp=%u lane=%u n=%u token=%u rec_pos=%u hit=%d nt=%u cbo=%u missq=%x misss=%x q0=%llx s0=%x pos2=%u,%u,%u,%u,%u,%u,%u,%u epoch=%llu\n",
+                                       sym_buffer.rank_idx, sm_idx, warp_idx, lane_idx, n, token_idx, rec_pos, (int) hit, num_tokens, (unsigned) chunk_byte_offset, mq, ms,
+                                       (unsigned long long) qv[0], sv[0],
+                                       ib_tab[kIBTabPos2 + nr * kIBTabT + 0], ib_tab[kIBTabPos2 + nr * kIBTabT + 1], ib_tab[kIBTabPos2 + nr * kIBTabT + 2], ib_tab[kIBTabPos2 + nr * kIBTabT + 3],
+                                       ib_tab[kIBTabPos2 + nr * kIBTabT + 4], ib_tab[kIBTabPos2 + nr * kIBTabT + 5], ib_tab[kIBTabPos2 + nr * kIBTabT + 6], ib_tab[kIBTabPos2 + nr * kIBTabT + 7],
+                                       (unsigned long long) ib_epoch);
+                                asm volatile("trap;");
+                            }
+#endif
                             if (clock64() - rp_t0 > (1ll << 34)) {
                                 printf("OPUS_HANG c3_repoll rank=%u sm=%u warp=%u n=%u token=%u epoch=%llu\n", sym_buffer.rank_idx, sm_idx, warp_idx, n, token_idx, (unsigned long long) ib_epoch);
                                 asm volatile("trap;");
@@ -5655,6 +5772,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
                 printf("OPUS_TRACEW rank=%u epoch=%llu | ws_post: first_piece_issued=%.1f last_chunk_staged=%.1f last_piece_issued=%.1f order_published=%.1f w_put=%.1f\n",
                        sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(38), mu(39), mu(28), mu(40), mu(42));
+            }
+#if defined(DG_MEGA_MOE_IB_LANDP) and DG_MEGA_MOE_IB_LANDP
+            {
+                const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_TRACELP rank=%u epoch=%llu | land: hdr=%.1f idx0=%.1f idxN=%.1f w0=%.1f wN=%.1f x0=%.1f xN=%.1f sfN=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(48), mu(49), mu(50), mu(51), mu(52), mu(53), mu(54), mu(55));
+            }
+#endif
+            if constexpr (kIBSB > 0) {
+                const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_TRACESB rank=%u epoch=%llu | sb: meta_issued=%.1f poster_warm=%.1f flags_seen=%.1f on=%d\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(30), mu(29), mu(41), (int) ib_sb);
             }
             if constexpr (kIBSST) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };

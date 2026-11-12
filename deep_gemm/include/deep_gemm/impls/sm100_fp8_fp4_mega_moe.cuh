@@ -4368,8 +4368,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Debug proof knob: rank 0 issues its LAST ordered x put to remote node slot 0 DBG_XLATE ns late (a put
                     // whose source bytes must stay stable until it is issued and read: the C3_SPLIT scratch alias case)
                     if (sym_buffer.rank_idx == 0 and nr == 0 and c1 == num_x_chunks) {
-                        uint64_t t0_, t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0_));
-                        do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); } while (t_ < t0_ + DG_MEGA_MOE_IB_DBG_XLATE);
+                        // (a spin here holds this SM out of the grid syncs, so the combine cannot start under it: the put is
+                        // handed to the source combine instead, which issues it after its pass 0; see c3 below)
+                        continue;
                     }
 #endif
                     const uint32_t t0 = c0 * kIBChunk, t1 = cute::min(c1 * kIBChunk, num_tokens);
@@ -5548,6 +5549,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (not kC3Split) c3_gate_wait();
         for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < 2; ++ c3_pass)
         for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + (c3_poller ? num_tokens * kNumChunks : c3_gw); token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += c3_nw) {
+#if defined(DG_MEGA_MOE_IB_DBG_XLATE) and DG_MEGA_MOE_IB_DBG_XLATE
+            // Debug proof knob, second half: the first lane to get here in pass 1 on rank 0 waits DBG_XLATE ns (every SM has
+            // parked its pass-0 sums by then) and only then issues the withheld last ordered x put to node slot 0
+            if (c3_pass == 1 and lane_idx == 0 and sym_buffer.rank_idx == 0 and ib_ord_on(num_tokens) and num_tokens > 0 and
+                atomicExch(reinterpret_cast<unsigned long long*>(ib_xo_flag + 235), static_cast<unsigned long long>(ib_epoch)) != ib_epoch) {
+                uint64_t t0_, t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0_));
+                do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); } while (t_ < t0_ + DG_MEGA_MOE_IB_DBG_XLATE);
+                const uint32_t d_chunks = (num_tokens + kIBChunk - 1) / kIBChunk, d_pc = kIBOrd / kIBChunk;
+                const uint32_t d_t0 = ((d_chunks - 1) / d_pc) * d_pc * kIBChunk;
+                const uint32_t d_orig = 2 * ib_R;
+                const auto d_stage = ib_pcomb(ib_my_node);
+                make_gin_site(4, ctx_piece(0, d_orig), d_orig, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(d_t0) * kIBTokBytes,
+                    d_stage + static_cast<int64_t>(d_t0) * kIBTokBytes, static_cast<uint64_t>(num_tokens - d_t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(0)));
+            }
+            __syncwarp();
+#endif
             TT_CLOCK(tt_c0);
             const bool c3_local = not kC3Split or c3_pass == 0;
             const uint32_t token_idx = token_chunk_idx / kNumChunks;

@@ -3902,7 +3902,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t cp = ib_cp(sym_buffer.rank_idx, n);
                 if (epilogue_warp_idx == 0) {
                     SL_TR(0, 24, true);
-                    if (num_tokens > 0)
+                    if (num_tokens > 0 and (kIBSB & 64) != 0 and sb_same_qp) {
+                        // SB & 64: the idx rows in THREAD mode on the (otherwise unused) header context R + nr: one issuer
+                        auto gin_t = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ib_R + nr, 2);
+                        gin_t.active = ib_gin_active;
+                        gin_t.put(dst + kIBOffIdx, ib_input_base + kIBOffIdx, static_cast<uint64_t>(num_tokens) * kNumTopk * 8, cp);
+                    } else if (num_tokens > 0)
                         make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put(dst + kIBOffIdx, ib_input_base + kIBOffIdx,
                             static_cast<uint64_t>(num_tokens) * kNumTopk * 8, cp);
                     SL_TR(0, 25, true);

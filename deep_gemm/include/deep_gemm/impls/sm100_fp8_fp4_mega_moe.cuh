@@ -75,6 +75,360 @@ __device__ __noinline__ void ib_sst_receive_fn(
         ptx::st_rel_sys(tab_ready, epoch);
 }
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_FWD_TOK) and DG_MEGA_MOE_IB_FWD_TOK
+#ifndef DG_MEGA_MOE_IB_FWD_TOK_MAX
+#define DG_MEGA_MOE_IB_FWD_TOK_MAX 256
+#endif
+#ifndef DG_MEGA_MOE_IB_FWD_TOK_UNIT
+#define DG_MEGA_MOE_IB_FWD_TOK_UNIT 8
+#endif
+#ifndef DG_MEGA_MOE_IB_FWD_TOK_WARM
+#define DG_MEGA_MOE_IB_FWD_TOK_WARM 1
+#endif
+#ifndef DG_MEGA_MOE_IB_FWD_TOK_PARK
+#define DG_MEGA_MOE_IB_FWD_TOK_PARK 1
+#endif
+#ifndef DG_MEGA_MOE_IB_FWD_TOK_EPI
+#define DG_MEGA_MOE_IB_FWD_TOK_EPI 0  // 1: the epilogue warps (FWD_JOIN, after their L2) take token items too
+#endif
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
+#define TOK_POLL(cond, reload, tag, a, b) do { while (cond) { reload; } } while (0)
+#else
+#define TOK_POLL(cond, reload, tag, a, b) do { uint32_t n_ = 0; while (cond) { reload; \
+        if (++ n_ == (1u << 25)) { printf("OPUS_HANG %s rank=%u sm=%u thread=%u a=%u b=%u epoch=%llu\n", tag, rank_idx, ptx::get_sm_idx(), threadIdx.x, \
+            (unsigned) (a), (unsigned) (b), (unsigned long long) epoch); asm volatile("trap;"); } } } while (0)
+#endif
+// DG_MEGA_MOE_IB_FWD_TOK=P (P = 1, 2 or 4 items per token): the proxy's forward-combine with per-token items, for launches in
+// which every remote source of this GPU has at most FWD_TOK_MAX tokens. Returns true when it handled (or, for a caller with
+// work = false, will be handled by the dispatch warps) every remote node's records.
+//  (1) An item is a token (or half / quarter of its hidden dim), claimed from ONE counter round-robin over the remote nodes
+//      in wave order: one claim, one order lookup, one top-k row load, one x / SF poll, one fence + one counter atomic per item.
+//  (2) kPark (<= 256 tokens: completion-bound; ~75-80% of the records complete inside the L2-only burst of the last ~10-20 us):
+//      the warp folds the token's node-local slots in ascending local-expert order (= arrival order: every GPU runs its experts
+//      in index order) into an fp32 sum parked in our own node's unused proxy-combine region, so when the last partial lands
+//      only that slot is left (per quarter one load round of slot pieces + parked sum, quantize, store).
+//      not kPark (>= 512: backlog-bound): per quarter the slots are summed in registers, the loads of the next (quarter, slot)
+//      in flight while the current one is consumed.
+//      Either way the fp32 sum order is ascending local-expert order, not top-k order (rounding-level difference).
+//  (3) Completion is counted per kTU records; one dedicated dispatch warp per remote node (poster >= 0; warm: it issues an 8-byte
+//      put when it starts) puts every run of completed units as ONE put, in order, on one context.
+// Local to the proxy: record format, positions and readiness are unchanged (the source polls every record byte).
+template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kTP, uint32_t kTU, uint32_t kTMax, bool kPark, bool kRetHdr, bool kWarm>
+__device__ __noinline__ bool ib_fwd_tok_fn(
+    const uint32_t* o_nt, uint32_t* fitem, uint32_t* fchunk, uint32_t* fdone, const uint64_t* order_ready, const uint64_t epoch, const uint32_t* tab,
+    uint8_t* mir0, const int64_t node_stride, const int64_t off_idx, const int64_t off_sf, uint8_t* pc0, const int64_t pc_stride, uint8_t* fst0,
+    uint8_t* ret_dst, const int64_t ret_hdr, uint8_t* scr0, const int64_t scr_bytes,
+    const uint32_t my_node, const uint32_t lsa, const uint32_t num_r, const uint32_t rank_idx,
+    const uint32_t sc_min, const uint32_t ws_min, const bool need_order, uint32_t* rot_mask0, uint32_t* rot_ntp, const int poster, const bool work, const bool from_epilogue,
+    const ncclDevComm_t* dev_comm, ncclWindow_t window, const int64_t gin_base, const bool gin_active, uint64_t* warm_ptr,
+    uint64_t* tt, uint32_t* tr32, const uint64_t* trace) {
+    constexpr uint32_t kTQ = 4 / kTP;                        // hidden quarters per item
+    constexpr uint32_t kMaxUnits = layout::MegaMoESignals::kIBOMaxChunks;
+    constexpr int64_t kRec = kHidden + kHidden / 128 * 4;
+    constexpr uint32_t kTPieces = kHidden * 2 / (32 * 16), kTPPI = kTPieces / 4;
+    constexpr uint32_t kTXU = kHidden / 16 / 4;
+    DG_STATIC_ASSERT(kTP == 1 or kTP == 2 or kTP == 4, "FWD_TOK: 1, 2 or 4 items per token");
+    DG_STATIC_ASSERT(kPark or kTP == 1, "FWD_TOK_PARK=0 needs FWD_TOK=1 (whole-token items)");
+    DG_STATIC_ASSERT(kTU >= 1 and (kTMax + kTU - 1) / kTU <= kMaxUnits, "FWD_TOK units");
+    DG_STATIC_ASSERT(kTPPI * 4 * 32 * 16 == kHidden * 2 and kTXU * 16 * 4 == kHidden, "FWD_TOK pieces");
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const bool tok_rot = rot_mask0 != nullptr;
+    const auto node_of = [&](const uint32_t& nr) { return nr < my_node ? nr : nr + 1; };
+    const auto ldv4 = [](const void* ptr) {
+        uint4 v;
+        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr) : "memory");
+        return v;
+    };
+    const auto sent4 = [](const uint4& v) { return (v.x & v.y & v.z & v.w) == 0xffffffffu; };
+    const auto add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
+        uint32_t old;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(v) : "memory");
+        return old;
+    };
+    const auto now = []() { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); return t_; };
+    const auto quantize_store = [&](float2 (&acc)[kTPPI][4], const uint32_t& q, uint8_t* rec) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kTPPI; ++ i) {
+            // 8 columns per lane, 16 lanes per 128-column block: amax over the half-warp
+            float amax = 0.f;
+            #pragma unroll
+            for (uint32_t l = 0; l < 4; ++ l)
+                amax = fmaxf(amax, fmaxf(fabsf(acc[i][l].x), fabsf(acc[i][l].y)));
+            #pragma unroll
+            for (uint32_t d = 1; d < 16; d <<= 1)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
+            const float scale = amax > 0.f ? amax / 448.f : 1.f;
+            const float inv = 1.f / scale;
+            uint2 qv;
+            auto qs = reinterpret_cast<__nv_fp8x2_storage_t*>(&qv);
+            #pragma unroll
+            for (uint32_t l = 0; l < 4; ++ l)
+                qs[l] = __nv_cvt_float2_to_fp8x2(make_float2(acc[i][l].x * inv, acc[i][l].y * inv), __NV_SATFINITE, __NV_E4M3);
+            const uint32_t col = ((q * kTPPI + i) * 32 + lane_idx) * 8;
+            *reinterpret_cast<uint2*>(rec + col) = qv;
+            if (lane_idx % 16 == 0)
+                *reinterpret_cast<float*>(rec + kHidden + col / 128 * 4) = scale;
+        }
+    };
+
+    bool tok_all = num_r >= 1 and num_r <= 16;
+    uint32_t tok_maxnt = 0;
+    for (uint32_t q = 0; q < num_r; ++ q) {
+        const uint32_t qnt = ptx::ld_volatile(o_nt + node_of(q));
+        tok_all = tok_all and qnt <= kTMax;
+        tok_maxnt = cute::max(tok_maxnt, qnt);
+    }
+    // parked sums: our own node's proxy-combine region, after the C3_SPLIT scratch / ordered-x staging
+    tok_all = tok_all and tok_maxnt > 0 and (not kPark or static_cast<int64_t>(num_r) * kTMax * kHidden * 4 <= scr_bytes);
+    if (not tok_all or not work)
+        return tok_all;
+
+    if (poster >= 0) {
+        // Poster of node slot pnr
+        const uint32_t pnr = static_cast<uint32_t>(poster), n = node_of(pnr);
+        const uint32_t nt = ptx::ld_volatile(o_nt + n);
+        if (nt > 0) {
+            const uint32_t s = n * lsa + rank_idx % lsa;
+            const auto fst = fst0 + static_cast<int64_t>(n) * node_stride;
+            const uint32_t nunits = (nt + kTU - 1) / kTU;
+            if (kWarm and lane_idx == 0 and gin_active)
+                comm::gin_put_value_fn(dev_comm, window, gin_base, pnr, warm_ptr, epoch, s);
+            __syncwarp();
+            uint32_t next = 0, tt_put = 0;
+            while (next < nunits) {
+                const uint32_t u = next + lane_idx;
+                bool dn = false;
+                if (u < nunits)
+                    dn = ptx::ld_acq(fchunk + n * kMaxUnits + u) == cute::min(kTU, nt - u * kTU) * kTP;
+                const uint32_t dmask = __ballot_sync(0xffffffffu, dn);
+                const uint32_t run = dmask == 0xffffffffu ? 32u : static_cast<uint32_t>(__ffs(~dmask) - 1);
+                if (run == 0)
+                    continue;
+                if (lane_idx == 0) {
+                    const uint32_t r0 = next * kTU, r1 = cute::min(nt, (next + run) * kTU);
+                    const int64_t off = static_cast<int64_t>(r0) * kRec;
+                    const uint64_t t_pre = tt ? now() : 0ull;
+                    if (gin_active)
+                        comm::gin_put_fn(dev_comm, window, gin_base, pnr, ret_dst + off, fst + off, static_cast<uint64_t>(r1 - r0) * kRec, s);
+                    if (tt) {
+                        const uint64_t t_ = now();
+                        atomicMax(reinterpret_cast<unsigned long long*>(tt + 4), static_cast<unsigned long long>(t_pre));
+                        atomicMax(reinterpret_cast<unsigned long long*>(tt + 5), static_cast<unsigned long long>(t_));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(tt + 23), 1ull);
+                        if (trace[5] > trace[16]) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 26), 1ull);
+                        atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 14), static_cast<unsigned long long>(t_));
+                        atomicMin(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 44), static_cast<unsigned long long>(t_));
+                        atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 45), static_cast<unsigned long long>(t_));
+                        if (pnr == 0 and tt_put < 21) {  // per put of node slot 0: before / after issue (0.1 us), records sent so far
+                            tr32[256 + 3 * tt_put] = static_cast<uint32_t>((t_pre - trace[16]) / 100);
+                            tr32[256 + 3 * tt_put + 1] = static_cast<uint32_t>((t_ - trace[16]) / 100);
+                            tr32[256 + 3 * tt_put + 2] = r1;
+                        }
+                        ++ tt_put;
+                    }
+                }
+                __syncwarp();
+                next += run;
+            }
+            if (lane_idx == 0) {
+                if (kRetHdr and gin_active)
+                    comm::gin_put_value_fn(dev_comm, window, gin_base, pnr, reinterpret_cast<uint64_t*>(ret_dst + ret_hdr), epoch, s);
+                // every token of this node is reduced (every x / SF row polled: rule A): the mirror re-arm may run
+                add_acq_rel(fdone + n, (nt + 31) / 32);
+            }
+            __syncwarp();
+        }
+    }
+    // Workers: the order tables of every source, then items in wave order, round-robin over the nodes
+    if (need_order) {
+        for (uint32_t q = 0; q < num_r; ++ q) {
+            const uint32_t qn = node_of(q);
+            if (ptx::ld_volatile(o_nt + qn) > 0) {
+                const uint32_t qk = q * lsa + rank_idx % lsa;
+                TOK_POLL(ptx::ld_acq_sys(order_ready + qk) != epoch, (void) 0, "tok_order_ready", qk, 0);
+            }
+        }
+    }
+    const auto tclaim = [&]() {
+        uint32_t v = 0;
+        if (lane_idx == 0) v = atomicAdd(fitem, 1u);
+        return __shfl_sync(0xffffffffu, v, 0);
+    };
+    const uint32_t g_max = num_r * tok_maxnt * kTP;
+    for (uint32_t g = tclaim(); g < g_max; g = tclaim()) {
+        const uint32_t nr = g % num_r, p_rec = g / num_r / kTP, part = g / num_r % kTP;
+        const uint32_t n = node_of(nr);
+        const uint32_t nt = ptx::ld_volatile(o_nt + n);
+        if (p_rec >= nt)
+            continue;
+        const uint32_t k_s = nr * lsa + rank_idx % lsa;
+        const auto mir = mir0 + static_cast<int64_t>(n) * node_stride;
+        const auto rec = fst0 + static_cast<int64_t>(n) * node_stride + static_cast<int64_t>(p_rec) * kRec;
+        const auto pc = pc0 + static_cast<int64_t>(n) * pc_stride;
+        const uint32_t t = nt >= sc_min ? ptx::ld_volatile(tab + 64 * kT + nr * kT + p_rec) : p_rec;
+        const int e = lane_idx < kNumTopk ? static_cast<int>(static_cast<int64_t>(
+            ptx::ld_volatile(reinterpret_cast<const uint64_t*>(mir + off_idx) + t * kNumTopk + lane_idx))) : -1;
+        const bool on = e >= 0 and static_cast<uint32_t>(e) / kEPR / lsa == my_node;
+        const uint32_t on_mask = __ballot_sync(0xffffffffu, on);
+        const uint32_t n_on = __popc(on_mask);
+        const uint32_t key0 = on ? (static_cast<uint32_t>(e) % kEPR) * 32u + lane_idx : 0xffffffffu;
+        if (tok_rot and part == 0 and lane_idx == 0) {  // PCOMB_ROT: the rows a later launch re-arms
+            rot_ntp[nr] = nt;
+            rot_mask0[static_cast<int64_t>(nr) * kT + t] = on_mask;
+        }
+        const uint64_t tt_item0 = tt ? now() : 0ull;
+        // Rule A: this item's part of the token's x row (and, for part 0, its SF row) has landed
+        {
+            const uint32_t xslot = nt >= ws_min ? ptx::ld_volatile(tab + k_s * kT + t) : t;
+            constexpr uint32_t kTXA = (kTQ * kTXU + 31) / 32;
+            const auto xrow = mir + static_cast<int64_t>(xslot) * kHidden + static_cast<int64_t>(part * kTQ) * kTXU * 16;
+            uint4 xv[kTXA];
+            #pragma unroll
+            for (uint32_t u = 0; u < kTXA; ++ u)
+                xv[u] = u * 32 + lane_idx < kTQ * kTXU ? ldv4(xrow + (u * 32 + lane_idx) * 16) : uint4{0, 0, 0, 0};
+            #pragma unroll
+            for (uint32_t u = 0; u < kTXA; ++ u)
+                TOK_POLL(sent4(xv[u]), xv[u] = ldv4(xrow + (u * 32 + lane_idx) * 16), "tok_x", n, t);
+            if (part == 0 and lane_idx < kHidden / 32 / 16) {
+                const auto sfp = mir + off_sf + static_cast<int64_t>(t) * (kHidden / 32) + lane_idx * 16;
+                TOK_POLL(sent4(ldv4(sfp)), (void) 0, "tok_sf", n, t);
+            }
+            __syncwarp();
+        }
+        if constexpr (not kPark) {
+            // rank of this lane's slot in ascending local-expert order
+            uint32_t rank = 0;
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumTopk; ++ i)
+                rank += __shfl_sync(0xffffffffu, key0, i) < key0 ? 1u : 0u;
+            const uint32_t n_d = cute::max(n_on, 1u), n_f = n_d * 4;
+            const auto unit_row = [&](const uint32_t& f) {
+                const uint32_t k = n_on ? static_cast<uint32_t>(__ffs(__ballot_sync(0xffffffffu, on and rank == f % n_d)) - 1) : 0u;
+                return pc + (static_cast<int64_t>(k) * kT + t) * kHidden * 2 + static_cast<int64_t>(f / n_d) * kTPPI * 32 * 16;
+            };
+            uint4 vn[kTPPI];
+            float2 acc[kTPPI][4];
+            auto rown = unit_row(0);
+            if (n_on) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kTPPI; ++ i)
+                    vn[i] = ldv4(rown + (i * 32 + lane_idx) * 16);
+            }
+            for (uint32_t f = 0; f < n_f; ++ f) {
+                const uint32_t q = f / n_d, j = f % n_d;
+                uint4 v[kTPPI];
+                const auto row = rown;
+                #pragma unroll
+                for (uint32_t i = 0; i < kTPPI; ++ i)
+                    v[i] = vn[i];
+                if (n_on and f + 1 < n_f) {  // the next (quarter, slot) is in flight while this one is consumed
+                    rown = unit_row(f + 1);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kTPPI; ++ i)
+                        vn[i] = ldv4(rown + (i * 32 + lane_idx) * 16);
+                }
+                if (j == 0) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kTPPI; ++ i)
+                        #pragma unroll
+                        for (uint32_t l = 0; l < 4; ++ l)
+                            acc[i][l] = {0.f, 0.f};
+                }
+                if (n_on) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kTPPI; ++ i) {
+                        const auto ptr = row + (i * 32 + lane_idx) * 16;
+                        TOK_POLL(sent4(v[i]), v[i] = ldv4(ptr), "tok_pcomb", t, j);
+                        if (not tok_rot)
+                            *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                        const auto bb = reinterpret_cast<const nv_bfloat162*>(&v[i]);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < 4; ++ l)
+                            ptx::accumulate(acc[i][l], bb[l]);
+                    }
+                }
+                if (j + 1 >= n_d)
+                    quantize_store(acc, q, rec);
+                __syncwarp();
+            }
+        } else {
+            uint32_t key = key0;
+            const auto scr = scr0 + (static_cast<int64_t>(nr) * kTMax + p_rec) * kHidden * 4;
+            for (uint32_t j = 0; j == 0 or j < n_on; ++ j) {
+                // the pending slot with the lowest local-expert index
+                uint32_t k = 0;
+                if (n_on) {
+                    k = __reduce_min_sync(0xffffffffu, key) & 31u;
+                    if (lane_idx == k) key = 0xffffffffu;
+                }
+                const bool last = j + 1 >= n_on;
+                const auto row = pc + (static_cast<int64_t>(k) * kT + t) * kHidden * 2;
+                #pragma unroll 1
+                for (uint32_t qq = 0; qq < kTQ; ++ qq) {
+                    const uint32_t q = part * kTQ + qq;
+                    uint4 v[kTPPI];
+                    float2 acc[kTPPI][4];
+                    if (n_on) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kTPPI; ++ i)
+                            v[i] = ldv4(row + ((q * kTPPI + i) * 32 + lane_idx) * 16);
+                    }
+                    const auto sp = reinterpret_cast<float4*>(scr + static_cast<int64_t>(q) * kHidden) + lane_idx * 2;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kTPPI; ++ i) {
+                        float4 a = {0.f, 0.f, 0.f, 0.f}, b = {0.f, 0.f, 0.f, 0.f};
+                        if (j > 0) a = sp[i * 64], b = sp[i * 64 + 1];
+                        acc[i][0] = {a.x, a.y}; acc[i][1] = {a.z, a.w}; acc[i][2] = {b.x, b.y}; acc[i][3] = {b.z, b.w};
+                    }
+                    if (n_on) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kTPPI; ++ i) {
+                            const auto ptr = row + ((q * kTPPI + i) * 32 + lane_idx) * 16;
+                            TOK_POLL(sent4(v[i]), v[i] = ldv4(ptr), "tok_pcomb", t, k);
+                            if (not tok_rot)
+                                *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                            const auto bb = reinterpret_cast<const nv_bfloat162*>(&v[i]);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < 4; ++ l)
+                                ptx::accumulate(acc[i][l], bb[l]);
+                        }
+                    }
+                    if (not last) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kTPPI; ++ i) {
+                            sp[i * 64] = make_float4(acc[i][0].x, acc[i][0].y, acc[i][1].x, acc[i][1].y);
+                            sp[i * 64 + 1] = make_float4(acc[i][2].x, acc[i][2].y, acc[i][3].x, acc[i][3].y);
+                        }
+                    } else {
+                        quantize_store(acc, q, rec);
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+        if (tt and lane_idx == 0) {
+            const uint64_t t_ = now();
+            atomicMax(reinterpret_cast<unsigned long long*>(tt + 2), static_cast<unsigned long long>(t_));
+            if (nr == 0 and part == 0 and p_rec < 128) {
+                tr32[p_rec] = static_cast<uint32_t>((t_ - trace[16]) / 100);
+                tr32[128 + p_rec] = static_cast<uint32_t>((tt_item0 - trace[16]) / 100);
+            }
+        }
+        if (lane_idx == 0) {
+            __threadfence();
+            add_acq_rel(fchunk + n * kMaxUnits + p_rec / kTU, 1u);
+        }
+        __syncwarp();
+        if (tt and lane_idx == 0) {
+            atomicMax(reinterpret_cast<unsigned long long*>(tt + 3), static_cast<unsigned long long>(now()));
+            atomicAdd(reinterpret_cast<unsigned long long*>(tt + 16), 1ull);
+            if (from_epilogue) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 24), 1ull);
+        }
+    }
+    return true;
+}
+#endif
+
 #if defined(DG_MEGA_MOE_IB_SPLIT) and DG_MEGA_MOE_IB_SPLIT
 // DG_MEGA_MOE_IB_SPLIT=1: the kernel body is instantiated twice; the few SMs that run the heavy SST / ORD blocks (builders,
 // poster, receivers) take the copy that contains them, every other SM runs a copy without them, so their register
@@ -1669,6 +2023,68 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         // FWD_ROTATE: start slot, computed once (local decision, any value is correct); only from DG_MEGA_MOE_IB_FWD_ROTATE_MIN tokens on
         const uint32_t rot0 = (kIBFwdRotate and num_tokens >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN) ? global_warp % fi_R : 0u;
+        // DG_MEGA_MOE_IB_FWD_TOK=P (small-batch tail; P = 1, 2 or 4 items per token): the forward-combine for sources of at most
+        // DG_MEGA_MOE_IB_FWD_TOK_MAX tokens. Why: at <= 256 tokens every expert has one block and the last ~30% of the routed L2
+        // tasks run in an L2-only burst, so ~75-80% of the records complete inside the last ~10-20 us of L2 (traced: EP16 128,
+        // record 32 of 128 in wave order completes 12 us before the last one). Today's items (token quarter, slots in top-k
+        // order, ~9 us of serial HBM round trips each) are then throughput-bound: EP32 128 has 1152 items for 592 warps in that
+        // window, and the 32-record chunks of all nodes are put within ~4 us of each other, which queues them on the source NIC.
+        //  (1) An item is a token (or half / quarter), claimed from ONE counter round-robin over the remote nodes in wave order,
+        //      so the late records of every node have a warp waiting on them long before their partials land.
+        //  (2) The warp folds the token's node-local slots in ascending local-expert order (= arrival order: every GPU runs its
+        //      experts in index order) into an fp32 sum parked in our own node's unused proxy-combine region; when the last
+        //      partial lands only that one slot is left: per hidden quarter one load round (slot pieces + parked sum), quantize,
+        //      store. The fp32 sum order is therefore local-expert order, not top-k order (rounding-level difference).
+        //  (3) Completion is counted per FWD_TOK_UNIT records; ONE dedicated dispatch warp per remote node (warm: it issues an
+        //      8-byte put when it starts) puts every run of completed units as one put, in order, on one context, so records
+        //      leave as they complete instead of in 32-record chunks issued by cold threads.
+        // Local to the proxy: record format, positions and readiness are unchanged (the source polls every record byte).
+        // Dead control: DG_MEGA_MOE_IB_FWD_TOK_MAX=1 (compiled in, never taken for >= 2 tokens).
+        bool tok_skip = false;
+#if defined(DG_MEGA_MOE_IB_FWD_TOK) and DG_MEGA_MOE_IB_FWD_TOK
+        {
+            // Out of line on purpose: compiled into the kernel body this block cost +147 us at EP16 128 WITHOUT running (dead control,
+            // csc2 tok_cg: the body's register allocation); as a real function with by-value arguments it has its own allocation
+            DG_STATIC_ASSERT(kIBFwdDyn and kIBReduceOnArrival and kIBFp8Combine and kIBRetGroups == 0 and kIBRetGroup == 1 and
+                             not kIBFwdInterleave and not kIBDeferRearm, "FWD_TOK needs FWD_JOIN + fp8 records, no RET_GROUP / INTERLEAVE / DEFER_REARM");
+            DG_STATIC_ASSERT(kIBTabSlot == 0 and kIBTabPerm2 == 64 * kIBTabT and kIBTabT == kIBT and kIBTokBytes == kHidden and kIBSFBytes == kHidden / 32 and
+                             kIBRecBytes == kHidden + kHidden / 128 * 4 and kIBChunk == 32, "FWD_TOK layout mirror");
+            DG_STATIC_ASSERT(kNumDispatchWarps >= 2 and kNumSMs > 8 + 16, "FWD_TOK posters");
+            constexpr int64_t kTScrOff = 2 * kIBT * static_cast<int64_t>(kHidden) * 2;
+            const bool tok_rot = kIBRot and rot_rt;
+            const bool tok_work = DG_MEGA_MOE_IB_FWD_TOK_EPI or not from_epilogue;
+            const int tok_poster = (not from_epilogue and warp_idx == 1 and sm_idx >= 8 and sm_idx < 8 + fi_R) ? static_cast<int>(sm_idx - 8) : -1;
+            uint8_t* tok_pc0 = ib_pcomb(0);
+            int64_t tok_pc_stride = kIBNodeStride;
+            uint32_t* tok_rot_mask = nullptr;
+            uint32_t* tok_rot_nt = nullptr;
+            if constexpr (kIBRot) {
+                if (tok_rot) {
+                    tok_pc0 = ib_pcomb_c(0, rot_b), tok_pc_stride = kIBPCombStride;
+                    tok_rot_mask = rot_mask(rot_b, 0), tok_rot_nt = rot_nt(rot_b);
+                }
+            }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+            uint64_t* const tok_tt = tl_ttrace;
+            uint32_t* const tok_tr32 = reinterpret_cast<uint32_t*>(tl_tseen + 128);
+#else
+            uint64_t* const tok_tt = nullptr;
+            uint32_t* const tok_tr32 = nullptr;
+#endif
+            tok_skip = ib_fwd_tok_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), DG_MEGA_MOE_IB_FWD_TOK, DG_MEGA_MOE_IB_FWD_TOK_UNIT,
+                                     DG_MEGA_MOE_IB_FWD_TOK_MAX, DG_MEGA_MOE_IB_FWD_TOK_PARK != 0, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_TOK_WARM != 0>(
+                workspace.signals->ib_o_nt, &workspace.signals->ib_o_fitem[ib_parity][ib_my_node], &workspace.signals->ib_o_fchunk[ib_parity][0][0],
+                &workspace.signals->ib_o_fdone[ib_parity][0], workspace.signals->ib_o_order_ready, ib_epoch, ib_tab,
+                ib_mirror(ib_parity, 0), kIBNodeStride, kIBOffIdx, kIBOffSF, tok_pc0, tok_pc_stride, ib_fstage(0), ib_ret(ib_parity, ib_my_node), kIBRetHdr,
+                ib_pcomb(ib_my_node) + kTScrOff, kIBPCombStride - kTScrOff,
+                ib_my_node, ib_lsa, fi_R, sym_buffer.rank_idx,
+                kIBStreamCombine ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
+                kIBWaveSort ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
+                (kIBWaveSort or kIBStreamCombine), tok_rot_mask, tok_rot_nt, tok_poster, tok_work, from_epilogue,
+                &ib_dev_comm, ib_window, sym_buffer.base, ib_gin_active, &workspace.signals->ib_o_scratch,
+                tok_tt, tok_tr32, workspace.signals->ib_trace);
+        }
+#endif
         for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
             uint32_t nr = fi_on ? fi_g % fi_R : nr_it + rot0;
             if (kIBFwdRotate and nr >= fi_R) nr -= fi_R;
@@ -1686,6 +2102,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (fi_on) fi_g = fi_claim();
                 continue;
             }
+            if (tok_skip)
+                continue;  // FWD_TOK reduced and returned this node's records above
             const auto mir = ib_mirror(ib_parity, n);
             const auto fst = ib_fstage(n);
             const auto pc = rot_pc(n);
@@ -1821,6 +2239,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 tt_miss = __any_sync(0xffffffffu, tt_miss);
                 TT_MAX(2, lane_idx == 0);  // fwd item: all its partials seen
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                // small-batch tail anatomy: per record position of node slot 0 (quarter 0): claim time and "all partials seen", 0.1 us
+                if (nr == 0 and qtr == 0 and p_rec < 128 and lane_idx == 0) {
+                    TT_NOW(t_);
+                    uint32_t* const pr32 = reinterpret_cast<uint32_t*>(tl_tseen + 128);
+                    const uint64_t t16_ = workspace.signals->ib_trace[16];
+                    pr32[p_rec] = static_cast<uint32_t>((t_ - t16_) / 100);
+                    pr32[128 + p_rec] = static_cast<uint32_t>((tt_item0 - t16_) / 100);
+                }
+#endif
                 const auto rec = fst + static_cast<int64_t>(p_rec) * kIBRecBytes;
                 #pragma unroll
                 for (uint32_t i = 0; i < kPPI; ++ i) {
@@ -1887,6 +2315,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t precs = kIBRetGroup == 1 ? size : cute::min(nt, g1 * kIBChunk) - g0 * kIBChunk;
                     const int64_t off = static_cast<int64_t>(pc0) * kIBChunk * kIBRecBytes;
                     TT_MAX(4, true);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                    if (nr == 0 and pc0 < 8 and nchunks <= 8) { TT_NOW(t_); tl_tchunk[24 + pc0] = t_; }
+#endif
                     TT_ADD(23, true, 1);
                     TT_ADD(26, workspace.signals->ib_trace[5] > workspace.signals->ib_trace[16], 1);  // put after our L2 grid sync
                     {
@@ -1903,6 +2334,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     TT_MAX(5, true);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     if (nr == 0 and pc0 < 64) { TT_NOW(t_); tl_tchunk[pc0] = t_; }
+                    if (nr > 0 and nr < 3 and pc0 < 8 and nchunks <= 8) { TT_NOW(t_); tl_tchunk[nr * 8 + pc0] = t_; }
 #endif
                     IB_TRACE_MAX(14, true);  // proxy: return record chunk put issued, last one
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -5636,6 +6068,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             __syncwarp();
                             if (lane_idx == 0) { TT_NOW(t_); atomicMax(reinterpret_cast<unsigned long long*>(tl_tseen + rec_pos / kIBChunk), static_cast<unsigned long long>(t_)); }
                         }
+                        if (tt_rmiss and nr > 0 and nr < 3 and num_tokens <= 256) {  // small batch: node slots 1, 2 at s8.. / s16..
+                            __syncwarp();
+                            if (lane_idx == 0) { TT_NOW(t_); atomicMax(reinterpret_cast<unsigned long long*>(tl_tseen + nr * 8 + rec_pos / kIBChunk), static_cast<unsigned long long>(t_)); }
+                        }
 #endif
                         IB_TRACE_MAX(21, lane_idx == 0 and j == 0);  // source: a return record seen, last one
                         uint32_t sbits = sv[j];
@@ -5810,6 +6246,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     buf[n ++] = b == 63 ? '\0' : ',';
                 }
                 printf("OPUS_HIST rank=%u epoch=%llu h=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h, buf);
+            }
+            if (num_tokens <= 256) {
+                // per record position (node slot 0, quarter 0), 0.1 us from kernel start: claim (a=1) and all partials seen (a=0)
+                const uint32_t* const pr32 = reinterpret_cast<const uint32_t*>(tl_tseen + 128);
+                for (uint32_t h = 0; h < 5; ++ h) {
+                    char buf[64 * 6 + 1]; uint32_t n = 0;
+                    for (uint32_t b = 0; b < 64; ++ b) {
+                        uint32_t v = ptx::ld_volatile(pr32 + h * 64 + b);
+                        if (h == 4) *const_cast<uint32_t*>(pr32 + h * 64 + b) = 0;  // a=2: FWD_TOK puts of node slot 0 (pre, post, records)
+                        if (v > 99999u) v = 99999u;
+                        char tmp[6]; uint32_t m = 0;
+                        do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < 5);
+                        while (m) buf[n ++] = tmp[-- m];
+                        buf[n ++] = b == 63 ? '\0' : ',';
+                    }
+                    printf("OPUS_REC rank=%u epoch=%llu a=%u p0=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h / 2, (h % 2) * 64, buf);
+                }
             }
             const auto* tt = tl_ttrace + 32;  // previous launch
             const auto pu = [&](const uint32_t& i) { return static_cast<double>(static_cast<int64_t>(tt[i])) / 1e3; };

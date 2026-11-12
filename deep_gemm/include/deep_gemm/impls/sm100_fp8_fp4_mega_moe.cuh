@@ -19,6 +19,62 @@
 
 namespace deep_gemm {
 
+// DG_MEGA_MOE_IB_RX_FN=1: the SST receive step as a real (non-inlined) function that takes scalars and pointers BY VALUE only
+// (no closure, nothing of the caller is address-taken), so its temporaries do not take part in the kernel's register
+// allocation. Same algorithm as the inline block in the D1 section (see there).
+template <uint32_t kE, uint32_t kThreads, uint32_t kBarrier>
+__device__ __noinline__ void ib_sst_receive_fn(
+    const uint32_t* cnt_all, const uint32_t* stab, uint32_t* s_cnt, const uint32_t sst_n, const uint32_t myj,
+    const uint32_t tid, const uint32_t lane,
+    uint64_t* recv_cnt0, const int64_t recv_cnt_stride, const uint64_t* recv_sum0, const int64_t recv_sum_stride,
+    uint32_t* tok0, const int64_t tok_stride, const uint64_t add_hi, const uint64_t* tab_ready, const uint64_t epoch,
+    unsigned long long* tr_landed, unsigned long long* tr_published) {
+    uint32_t* const s_off = s_cnt + kE + 1;
+    uint32_t* const s_base = s_off + kE;
+    if (tid == 0)
+        *s_base = 0;
+    ptx::sync_aligned(kThreads, kBarrier);
+    uint32_t below = 0;
+    for (uint32_t q = tid; q < sst_n; q += kThreads) {
+        uint32_t v = ptx::ld_volatile(cnt_all + q);
+        while (v == 0xffffffffu) v = ptx::ld_volatile(cnt_all + q);
+        if (q / kE == myj)
+            s_cnt[q % kE] = v;
+        else if (q / kE < myj)
+            below += v;
+    }
+    below = __reduce_add_sync(0xffffffff, below);
+    if (lane == 0 and below)
+        atomicAdd_block(s_base, below);
+    ptx::sync_aligned(kThreads, kBarrier);
+    if (tid == 0) {
+        if (tr_landed) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); atomicMax(tr_landed, static_cast<unsigned long long>(t_)); }
+        uint32_t o = 0;
+        for (uint32_t e = 0; e < kE; ++ e)
+            s_off[e] = o, o += s_cnt[e];
+    }
+    for (uint32_t i = tid; i < kE; i += kThreads) {
+        *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(recv_cnt0) + recv_cnt_stride * i) = static_cast<uint64_t>(s_cnt[i]);
+        __threadfence();
+        ptx::atomic_add(reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(recv_sum0) + recv_sum_stride * i), add_hi | static_cast<uint64_t>(s_cnt[i]));
+    }
+    ptx::sync_aligned(kThreads, kBarrier);
+    if (tid == 0 and tr_published) { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); atomicMax(tr_published, static_cast<unsigned long long>(t_)); }
+    const uint32_t* const st_tab = stab + *s_base;
+    const uint32_t m = s_off[kE - 1] + s_cnt[kE - 1];
+    for (uint32_t q = tid; q < m; q += kThreads) {
+        uint32_t lo = 0, hi = kE;
+        while (hi - lo > 1) { const uint32_t mid = (lo + hi) / 2; if (s_off[mid] <= q) lo = mid; else hi = mid; }
+        uint32_t v = ptx::ld_volatile(st_tab + q);
+        while (v == 0xffffffffu) v = ptx::ld_volatile(st_tab + q);
+        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(tok0) + tok_stride * lo + static_cast<int64_t>(q - s_off[lo]) * 4) = v;
+    }
+    __threadfence();
+    ptx::sync_aligned(kThreads, kBarrier);
+    if (tid == 0)
+        ptx::st_rel_sys(tab_ready, epoch);
+}
+
 #if defined(DG_MEGA_MOE_IB_SPLIT) and DG_MEGA_MOE_IB_SPLIT
 // DG_MEGA_MOE_IB_SPLIT=1: the kernel body is instantiated twice; the few SMs that run the heavy SST / ORD blocks (builders,
 // poster, receivers) take the copy that contains them, every other SM runs a copy without them, so their register
@@ -3953,7 +4009,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     __syncwarp();
                 }
 #endif
-                if (kIBHeavy and ib_sst and not (kCGDrop & 4)) {
+#if defined(DG_MEGA_MOE_IB_RX_FN) and DG_MEGA_MOE_IB_RX_FN
+                constexpr bool kIBRxFn = true;
+#else
+                constexpr bool kIBRxFn = false;
+#endif
+                if (kIBRxFn and kIBHeavy and ib_sst and not (kCGDrop & 4)) {
+                    const auto rc0 = workspace.get_expert_recv_count_ptr(r, 0);
+                    const auto rs0 = workspace.get_expert_recv_count_sum_ptr(0);
+                    const auto tk0 = workspace.get_src_token_topk_idx_ptr(0, r, 0);
+                    unsigned long long* tr_a = nullptr; unsigned long long* tr_b = nullptr;
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                    tr_a = reinterpret_cast<unsigned long long*>(ib_sl_tr + 31);
+                    tr_b = reinterpret_cast<unsigned long long*>(workspace.signals->ib_trace + 26);
+#endif
+                    ib_sst_receive_fn<kNumExpertsPerRank, kNumEpilogueThreads, kEpilogueFullBarrierIdx>(
+                        reinterpret_cast<const uint32_t*>(mir + kIBOffSTab) - ib_lsa * kNumExpertsPerRank, reinterpret_cast<const uint32_t*>(mir + kIBOffSTab),
+                        reinterpret_cast<uint32_t*>(&shared_storage.smem_d), ib_lsa * kNumExpertsPerRank, sym_buffer.rank_idx % ib_lsa,
+                        epilogue_thread_idx, lane_idx,
+                        rc0, reinterpret_cast<const uint8_t*>(workspace.get_expert_recv_count_ptr(r, 1)) - reinterpret_cast<const uint8_t*>(rc0),
+                        reinterpret_cast<const uint64_t*>(rs0), reinterpret_cast<const uint8_t*>(workspace.get_expert_recv_count_sum_ptr(1)) - reinterpret_cast<const uint8_t*>(rs0),
+                        tk0, reinterpret_cast<const uint8_t*>(workspace.get_src_token_topk_idx_ptr(1, r, 0)) - reinterpret_cast<const uint8_t*>(tk0),
+                        static_cast<uint64_t>(kNumSMs) << 32, &workspace.signals->ib_o_tab_ready[k], ib_epoch, tr_a, tr_b);
+                    IB_TRACE_MAX(32, epilogue_thread_idx == 0);  // tables done
+                }
+                if (not kIBRxFn and kIBHeavy and ib_sst and not (kCGDrop & 4)) {
                     DG_IB_OUTLINE_BEGIN
                     // SST: r's counts for this node ([node-local rank][local expert], ending at kIBOffSTab) and its entries
                     // (from kIBOffSTab) arrive in one early put. Publish our counts, copy our slice into the slot table

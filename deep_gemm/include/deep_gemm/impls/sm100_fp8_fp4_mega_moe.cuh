@@ -833,7 +833,8 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
         };
         // lane 0: the next (at most kSlots) node-local slots' quarter-rows, one transaction on the warp's mbarrier
         const auto issue = [&](uint32_t mm, const uint32_t& t_, const uint32_t& q_) {
-            if (lane_idx == 0) {
+            // (never with an empty mask: an arrive without bytes completes the phase at once and no lane waits for it)
+            if (lane_idx == 0 and mm != 0) {
                 ptx::mbarrier_arrive_and_set_tx(mbar, cute::min(static_cast<uint32_t>(__popc(mm)), kSlots) * kQB);
                 #pragma unroll
                 for (uint32_t j = 0; j < kSlots; ++ j) {

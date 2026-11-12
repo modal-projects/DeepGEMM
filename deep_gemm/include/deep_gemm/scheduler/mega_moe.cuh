@@ -499,7 +499,15 @@ struct MegaMoEScheduler {
 
         // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
         constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
+#if defined(DG_MEGA_MOE_SHARED_L2_EARLY) and DG_MEGA_MOE_SHARED_L2_EARLY
+        // DG_MEGA_MOE_SHARED_L2_EARLY=1 (2026-11-13): the shared L2 always goes before the routed tasks. Over IB the count wait leaves
+        // the GEMM warps idle for ~60 us (first routed L1 at 57-82 us at 1024) while shared L1 + L2 are ~3 waves (~25 us), so the
+        // one-wave rule below is too cautious there: at 1024 tokens (6 blocks x 20 clusters > 74 pairs) it put ~13 us of shared L2
+        // behind the last routed L2 (26 us with FWD_RETIRE, whose retired clusters skip that tail).
+        const bool is_shared_l2_early = true;
+#else
         const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
+#endif
 #if defined(DG_MEGA_MOE_ROUTED_FIRST) and DG_MEGA_MOE_ROUTED_FIRST
         // DG_MEGA_MOE_ROUTED_FIRST=1: routed tasks get priority over the shared expert. Shared L1 tasks fill the count wait
         // only; once every count is known the scheduler stops claiming them, runs the routed tasks, then claims the rest of

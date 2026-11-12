@@ -189,6 +189,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define PF_MARK_SPLIT(slot_rest, slot_part, part) do { if (lane_idx == 0) { TT_NOW(pft_); const uint64_t pfp_ = pf_row[31]; \
     pf_row[(slot_part)] += (part); pf_row[(slot_rest)] += pft_ - pfp_ - (part); pf_row[31] = pft_; } } while (0)
 #define PF_CLK(t_) TT_NOW(t_)
+// Register accumulators for hot loops (every lane runs them: no divergence, no memory): u32 ns per state, flushed to the row after the loop
+#define PF_LBEGIN(nm, n) uint32_t pf_acc_##nm[n] = {}; uint64_t pf_last_##nm; { TT_NOW(pft_); pf_last_##nm = pft_; }
+#define PF_L(nm, i) do { TT_NOW(pft_); pf_acc_##nm[i] += static_cast<uint32_t>(pft_ - pf_last_##nm); pf_last_##nm = pft_; } while (0)
+#define PF_L2(nm, c, i, j) do { TT_NOW(pft_); const uint32_t pfx_ = static_cast<uint32_t>(pft_ - pf_last_##nm); const bool pfc_ = (c); \
+    pf_acc_##nm[i] += pfc_ ? pfx_ : 0u; pf_acc_##nm[j] += pfc_ ? 0u : pfx_; pf_last_##nm = pft_; } while (0)
+#define PF_ADD3(nm, c1, c2, i, j, k, v) do { const uint32_t pfx_ = static_cast<uint32_t>(v); const bool pfc1_ = (c1), pfc2_ = (c2); \
+    pf_acc_##nm[i] += pfc1_ ? pfx_ : 0u; pf_acc_##nm[j] += (not pfc1_ and pfc2_) ? pfx_ : 0u; pf_acc_##nm[k] += (not pfc1_ and not pfc2_) ? pfx_ : 0u; } while (0)
+#define PF_L3(nm, c1, c2, i, j, k) do { TT_NOW(pft_); PF_ADD3(nm, c1, c2, i, j, k, pft_ - pf_last_##nm); pf_last_##nm = pft_; } while (0)
+#define PF_LFLUSH(nm, i, slot) do { if (lane_idx == 0) pf_row[(slot)] += pf_acc_##nm[i]; } while (0)
+#define PF_LEND(nm) do { if (lane_idx == 0) pf_row[31] = pf_last_##nm; } while (0)
 #define PF_ADDTO(var, t0_) do { TT_NOW(pfe_); (var) += pfe_ - (t0_); } while (0)
 #define PF_REL(d_) TT_NOW(pft_); const int64_t d_ = static_cast<int64_t>(pft_) - static_cast<int64_t>(ptx::ld_volatile(workspace.signals->ib_trace + 16))
 #define PF_HIST(h, cond) do { if (pf_rec and (cond)) { PF_REL(pfd_); \
@@ -205,6 +215,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define PF_MARK(slot) do {} while (0)
 #define PF_MARK_SPLIT(slot_rest, slot_part, part) do {} while (0)
 #define PF_CLK(t_) do {} while (0)
+#define PF_LBEGIN(nm, n) do {} while (0)
+#define PF_L(nm, i) do {} while (0)
+#define PF_L2(nm, c, i, j) do {} while (0)
+#define PF_ADD3(nm, c1, c2, i, j, k, v) do {} while (0)
+#define PF_L3(nm, c1, c2, i, j, k) do {} while (0)
+#define PF_LFLUSH(nm, i, slot) do {} while (0)
+#define PF_LEND(nm) do {} while (0)
 #define PF_ADDTO(var, t0_) do {} while (0)
 #define PF_HIST(h, cond) do {} while (0)
 #define PF_CMAX(h, c, cond) do {} while (0)
@@ -1346,6 +1363,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         auto batch_tag, const bool& from_epilogue) {
         if constexpr (kIBNoOvReturn)
             ib_noov_wait(kIBNoOvL2Slot);
+        // forward-combine states (registers): 0 claim / idx, 1 x poll, 2 x not landed, 3 partials, 4 partial wait, 5 quantize, 6 put issue
+        PF_MARK(15);
+        PF_LBEGIN(f, 7);
         constexpr uint32_t kBatch = static_cast<uint32_t>(decltype(batch_tag)::value);
         DG_STATIC_ASSERT(kBatch >= 1 and kBatch <= 8, "IB forward batch");
         const auto fwd_grid_idx = ptx::get_grid_idx() + 1;
@@ -1437,9 +1457,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 TT_CLOCK(tt_item0);
                 bool tt_miss = false;
-                PF_MARK(15);  // item claimed, its top-k row loaded
-                PF_HIST(19, lane_idx == 0);
-                PF_CMIN(20, p_rec / kIBChunk, nr == 0 and lane_idx == 0);
+                PF_L(f, 0);  // item claimed, its top-k row loaded
                 // Rule A: this item's part of the token's x row (and, for quarter 0, its SF row) has landed
                 if (not (kIBSkipXPoll and not pf_on and on_mask != 0)) {
                     constexpr uint32_t kU = (kXUnitsPerItem + 31) / 32;
@@ -1471,7 +1489,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         else IB_POLL(ib_is_sentinel4(ib_ldv4(sfp)), (void) 0, "c2_sf", s, t);
                     }
 #if DG_PF
-                    PF_MARK(pf_xm ? 17 : 16);  // rule-A poll of the x / SF row: 17 = it had not landed
+                    PF_L2(f, pf_xm, 2, 1);  // rule-A poll of the x / SF row: 2 = it had not landed
 #endif
                 }
                 // Reduce node-local slots in top-k order (fp32): per slot, the item's pieces are loaded together
@@ -1525,7 +1543,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 tt_miss = __any_sync(0xffffffffu, tt_miss);
                 TT_MAX(2, lane_idx == 0);  // fwd item: all its partials seen
-                PF_MARK(tt_miss ? 19 : 18);  // partial loads + re-arm + sum: 19 = a partial had not arrived (waited for a node peer's L2)
+                PF_L2(f, tt_miss, 4, 3);  // partial loads + re-arm + sum: 4 = a partial had not arrived (waited for a node peer's L2)
                 PF_HIST(12, tt_miss and lane_idx == 0);
                 PF_CMAX(21, p_rec / kIBChunk, nr == 0 and tt_miss and lane_idx == 0);
                 PF_CADD(22, p_rec / kIBChunk, nr == 0 and tt_miss and lane_idx == 0);
@@ -1583,7 +1601,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 state = __shfl_sync(0xffffffffu, state, 0);
                 TT_MAX(3, lane_idx == 0);  // fwd item done
-                PF_MARK(20);  // quantize + record store + chunk counters
+                PF_L(f, 5);  // quantize + record store + chunk counters
                 PF_HIST(from_epilogue ? 11 : 10, lane_idx == 0);
                 PF_CMAX(23, p_rec / kIBChunk, nr == 0 and lane_idx == 0);
                 TT_ADD(16, lane_idx == 0, 1);
@@ -1616,7 +1634,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (nr == 0 and pc0 < 64) { TT_NOW(t_); tl_tchunk[pc0] = t_; }
 #endif
                     IB_TRACE_MAX(14, true);  // proxy: return record chunk put issued, last one
-                    PF_MARK(21);  // return put issue (this lane only)
+                    PF_L(f, 6);  // return put issue (this lane only)
                     PF_HIST(16, true);
                     PF_CMAX(24, pc0, nr == 0);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -1647,6 +1665,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (fi_on)
                 fi_g = fi_claim();
         }
+        PF_L(f, 0);
+        PF_LFLUSH(f, 0, 15); PF_LFLUSH(f, 1, 16); PF_LFLUSH(f, 2, 17); PF_LFLUSH(f, 3, 18); PF_LFLUSH(f, 4, 19); PF_LFLUSH(f, 5, 20);
+        PF_LFLUSH(f, 6, 21); PF_LEND(f);
     };
 #endif
 
@@ -1898,6 +1919,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         PF_MARK(6);
         PF_HIST(18, lane_idx == 0);
 #endif
+        // pull states (registers): 0 peel + table-ready wait, 1 entry / ring / order / weight, 2 remote row round trip, 3 local row
+        // round trip, 4 row not landed, 5 stores, 6 SF not landed, 7 SF + metadata + block count
+        PF_LBEGIN(p, 8);
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         constexpr bool kSkipLastPullWarp = kIBCombineWarp;
@@ -2059,7 +2083,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
 #endif
-            PF_MARK(27);  // expert advance + min-peeling + table-ready waits (tab_ready / sl_tflag)
+            PF_L(p, 0);  // expert advance + min-peeling + table-ready waits (tab_ready / sl_tflag)
             // Read source token-topk index (written by remote dispatch via NVLink)
             const uint32_t src_token_topk_raw = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
@@ -2101,7 +2125,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             }
 
-            PF_MARK(28);  // entry (source token-topk index) load + L1 ring-slot wait
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // D2: a source on another node is pulled from its counterpart's mirror over NVLink; the load is the poll
@@ -2155,7 +2178,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
             constexpr bool kMetaEarly = false;
 #endif
-            PF_MARK(29);  // order_ready / watermark waits, SF pre-load issue; slot 7 after this = weight load + weight poll (SST: IB wait) + local SF
             float ib_w_pre = 0.f;
             if constexpr (kMetaEarly) {
                 ib_w_pre = ib_rem ?
@@ -2186,7 +2208,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr bool kIBLocalReg = false;
 #endif
             const bool ib_reg = ib_rem or kIBLocalReg;
-            PF_MARK(7);
+            PF_L(p, 1);
             if (ib_reg) {
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
@@ -2239,7 +2261,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t b = 0; b < kBatch; ++ b)
                         if (u0 + b < kUnits) pf_m |= ib_is_sentinel4(v[b]);
                     const bool pf_miss = ib_rem and __any_sync(0xffffffffu, pf_m);
-                    PF_MARK(ib_rem ? 8 : 9);  // the row's loads are back (one NVLink / HBM round trip)
+                    PF_L2(p, ib_rem, 2, 3);  // the row's loads are back (one NVLink / HBM round trip)
 #endif
                     #pragma unroll
                     for (uint32_t b = 0; b < kBatch; ++ b) {
@@ -2250,7 +2272,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
 #if DG_PF
-                    PF_MARK(pf_miss ? 10 : 11);  // 10: the row had not landed (polled until it did), 11: stores only
+                    PF_L2(p, pf_miss, 4, 5);  // 4: the row had not landed (polled until it did), 5: stores only
 #endif
                 }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -2348,7 +2370,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 #if DG_PF
             const bool pf_sfa = __any_sync(0xffffffffu, pf_sfm);  // every lane votes (never inside PF_MARK: lane 0 only)
-            PF_MARK(pf_sfa ? 14 : 12);  // 14: the row's SF had not landed (polled until it did)
+            PF_L2(p, pf_sfa, 6, 7);  // 6: the row's SF had not landed (polled until it did)
 #endif
 
             // Store weights and metadata
@@ -2372,9 +2394,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 #if DG_PF
             PF_HIST(ib_rem ? 8 : 9, lane_idx == 0);
-            PF_MARK(12);
+            PF_L(p, 7);
 #endif
         }
+        PF_L(p, 0);
+        PF_LFLUSH(p, 0, 27); PF_LFLUSH(p, 1, 7); PF_LFLUSH(p, 2, 8); PF_LFLUSH(p, 3, 9); PF_LFLUSH(p, 4, 10); PF_LFLUSH(p, 5, 11);
+        PF_LFLUSH(p, 6, 14); PF_LFLUSH(p, 7, 12); PF_LEND(p);
         PF_MARK(13);
         PF_HIST(17, lane_idx == 0);
 
@@ -2603,6 +2628,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // GEMM TMA load warp for tokens with SFA
         task_info_t task_info;
+        // states (registers): 0 task wait, 1 L1 rows wait, 2 L1 K loop, 3 L2 K loop (incl. 6), 4 shared K loop, 5 other wait, 6 L2 waiting for its L1
+        PF_MARK(0);
+        PF_LBEGIN(a, 7);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         bool ib_noov_published = false, ib_noov_ready = false;
 #endif
@@ -2618,9 +2646,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 #if DG_PF
             const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);  // 1 L1, 2 L2, 3 shared L1, 4 shared L2
-            uint64_t pf_dep = 0;
-            PF_MARK(1);  // waited for a task (scheduler: counts / L1-before-L2 order / task slot)
-            PF_HIST(15, pf_ph == 1 and lane_idx == 0);
+            PF_L(a, 0);  // waited for a task (scheduler: counts / L1-before-L2 order / task slot)
 #endif
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts :
@@ -2657,7 +2683,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 #if DG_PF
-            PF_MARK(pf_ph == 1 ? 2 : 6);  // 2: routed L1 block waited for its rows (pull); 6: shared L2 waited for shared L1
+            PF_L2(a, pf_ph == 1, 1, 5);  // 1: routed L1 block waited for its rows (pull); 5: shared L2 waited for shared L1
             PF_HIST(pf_ph == 1 ? 0 : (pf_ph == 3 ? 4 : 6), pf_ph != 2 and lane_idx == 0);
 #endif
 
@@ -2666,7 +2692,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (task_info.block_phase == sched::BlockPhase::Linear2) {
                     PF_CLK(pf_d0);
                     l2_k_block_dependency.wait(k_block_idx);
-                    PF_ADDTO(pf_dep, pf_d0);
+                    PF_ADDTO(pf_acc_a[6], pf_d0);
                     PF_HIST(2, k_block_idx == 0 and lane_idx == 0);
                 }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -2703,10 +2729,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
 #if DG_PF
-            // k loop (TMA issue, paced by the MMA through the stage barriers); slot 4 = L2 waited for its L1 N blocks
-            PF_MARK_SPLIT(pf_ph == 1 ? 3 : (pf_ph == 2 ? 5 : 7), 4, pf_dep);
+            PF_L3(a, pf_ph == 1, pf_ph == 2, 2, 3, 4);  // K loop (TMA issue, paced by the MMA through the stage barriers)
 #endif
         }
+        PF_L(a, 0);
+        PF_LFLUSH(a, 0, 1); PF_LFLUSH(a, 1, 2); PF_LFLUSH(a, 2, 3); PF_LFLUSH(a, 3, 5); PF_LFLUSH(a, 4, 7); PF_LFLUSH(a, 5, 6); PF_LFLUSH(a, 6, 4);
+        PF_LEND(a);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if constexpr (kIBNoOvDispatch) {
             if (sm_idx == 0 and not ib_noov_published)  // no routed task here: still publish, the node's L1 loaders wait for it
@@ -2745,10 +2773,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
         task_info_t task_info;
+        PF_MARK(0);
+        PF_LBEGIN(b, 4);  // 0 task wait, 1 L1 K loop, 2 L2 K loop, 3 shared K loop
         while (scheduler.get_next_task(task_info)) {
 #if DG_PF
             const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);
-            PF_MARK(1);
+            PF_L(b, 0);
 #endif
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights :
@@ -2806,9 +2836,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
 #if DG_PF
-            PF_MARK(pf_ph == 1 ? 3 : (pf_ph == 2 ? 5 : 7));
+            PF_L3(b, pf_ph == 1, pf_ph == 2, 1, 2, 3);
 #endif
         }
+        PF_L(b, 0);
+        PF_LFLUSH(b, 0, 1); PF_LFLUSH(b, 1, 3); PF_LFLUSH(b, 2, 5); PF_LFLUSH(b, 3, 7); PF_LEND(b);
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -2845,12 +2877,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Persistently schedule over blocks
             uint32_t current_iter_idx = 0;
             task_info_t task_info;
+            // states (registers): 0 task wait, 1 accumulator wait, 2 / 3 / 4 L1 / L2 / shared K loop (incl. 5 / 6 / 7), 5 / 6 / 7 waited for TMA data
+            PF_MARK(0);
+            PF_LBEGIN(m, 8);
             while (scheduler.get_next_task(task_info)) {
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
 #if DG_PF
                 const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);
-                uint64_t pf_full = 0;
-                PF_MARK(1);  // waited for a task
+                uint32_t pf_full = 0;
+                PF_L(m, 0);  // waited for a task
 #endif
 
                 // Dynamic update of UMMA N based on effective M
@@ -2862,7 +2897,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
                 shared_storage.tmem_empty_barriers[accum_stage_idx].wait(accum_phase ^ 1);
                 ptx::tcgen05_after_thread_sync();
-                PF_MARK(2);  // waited for the epilogue to release the accumulator stage
+                PF_L(m, 1);  // waited for the epilogue to release the accumulator stage
 
                 // Empty barrier arrival
                 auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
@@ -2930,10 +2965,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
                 }
 #if DG_PF
-                // 3 / 5 / 7: MMA issue + commit (L1 / L2 / shared); 8 / 9 / 10: waited for the TMA loads of a K block (weights / acts from HBM)
-                PF_MARK_SPLIT(pf_ph == 1 ? 3 : (pf_ph == 2 ? 5 : 7), pf_ph == 1 ? 8 : (pf_ph == 2 ? 9 : 10), pf_full);
+                PF_L3(m, pf_ph == 1, pf_ph == 2, 2, 3, 4);
+                PF_ADD3(m, pf_ph == 1, pf_ph == 2, 5, 6, 7, pf_full);
 #endif
             }
+            PF_L(m, 0);
+            PF_LFLUSH(m, 0, 1); PF_LFLUSH(m, 1, 2); PF_LFLUSH(m, 2, 3); PF_LFLUSH(m, 3, 5); PF_LFLUSH(m, 4, 7); PF_LFLUSH(m, 5, 8); PF_LFLUSH(m, 6, 9);
+            PF_LFLUSH(m, 7, 10); PF_LEND(m);
 
             // To safely deconstruct barriers, we need another round of waits
             if (current_iter_idx > 0) {
@@ -4360,6 +4398,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
         PF_MARK(5);
+        PF_LBEGIN(e, 4);  // 0 task wait (scheduler + MMA), 1 L1 epilogue, 2 L2 epilogue, 3 shared epilogue
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
@@ -4370,7 +4409,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
             shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
-            PF_MARK(6);  // waited for a task's accumulator (scheduler + MMA)
+            PF_L(e, 0);  // waited for a task's accumulator (scheduler + MMA)
 
             // Now we can release the task
             scheduler.release_task_info();
@@ -4637,7 +4676,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
-                PF_MARK(task_info.is_shared() ? 9 : 7);
+                PF_L2(e, task_info.is_shared(), 3, 1);
                 PF_HIST(task_info.is_shared() ? 5 : 1, epilogue_thread_idx == 0);
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
@@ -4753,11 +4792,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 TT_MAX(task_info.is_shared() ? 1 : 0, epilogue_thread_idx == 0);
-                PF_MARK(task_info.is_shared() ? 9 : 8);
+                PF_L2(e, task_info.is_shared(), 3, 2);
                 PF_HIST(task_info.is_shared() ? 7 : 3, epilogue_thread_idx == 0);
             }
         }
 
+        PF_L(e, 0);
+        PF_LFLUSH(e, 0, 6); PF_LFLUSH(e, 1, 7); PF_LFLUSH(e, 2, 8); PF_LFLUSH(e, 3, 9); PF_LEND(e);
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
         if (epilogue_warp_idx == 0)
@@ -4875,6 +4916,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         IB_TRACE_MAX(15, epilogue_thread_idx == 0);  // source: final combine loop starts, slowest SM
         PF_MARK(22);  // CTA barrier with the dispatch warps (their forward-combine + return puts)
+        PF_LBEGIN(c, 3);  // source combine: 0 local pass, 1 token-chunk with a record not landed, 2 token-chunk with its records present
         TT_MIN(8, epilogue_thread_idx == 0);
         const auto grid_idx = ptx::get_grid_idx() + 1;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -5068,7 +5110,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     dst[0] = make_float4(reduced[j * 4 + 0].x, reduced[j * 4 + 0].y, reduced[j * 4 + 1].x, reduced[j * 4 + 1].y);
                     dst[1] = make_float4(reduced[j * 4 + 2].x, reduced[j * 4 + 2].y, reduced[j * 4 + 3].x, reduced[j * 4 + 3].y);
                 }
-                PF_MARK(11);  // C3 pass 0: one token-chunk's node-local slots (peer-ready wait + loads)
+                PF_L(c, 0);  // C3 pass 0: one token-chunk's node-local slots (peer-ready wait + loads)
                 continue;
             }
             } else {
@@ -5237,10 +5279,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 TT_ADD(25, lane_idx == 0, tt_c1 - tt_c_loc);  // sum: local part done -> token-chunk stored
             }
 #if DG_PF
-            PF_MARK(pf_rm ? 12 : 13);  // C3 pass 1 token-chunk: 12 = a return record had not landed at the first load
+            PF_L2(c, pf_rm, 1, 2);  // C3 pass 1 token-chunk: 1 = a return record had not landed at the first load
             PF_HIST(13, lane_idx == 0);
 #endif
         }
+        PF_L(c, 2);
+        PF_LFLUSH(c, 0, 11); PF_LFLUSH(c, 1, 12); PF_LFLUSH(c, 2, 13); PF_LEND(c);
         TT_MAX(9, epilogue_thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // Rule H: the return header of every proxy is awaited (even with zero tokens), then re-armed

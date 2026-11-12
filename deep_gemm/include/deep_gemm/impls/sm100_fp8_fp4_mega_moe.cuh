@@ -441,6 +441,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kIBSST or (kIBFront and kIBHdrCtx and not kIBThreadCtx and not kIBEarlyPublish and not kIBCountsEarly),
                      "DG_MEGA_MOE_IB_SST needs FRONT + HDR_CTX, shared contexts, and no COUNTS_IN_META / SPLIT_SCAN / COUNTS_EARLY");
     DG_STATIC_ASSERT(not kIBSST or static_cast<int64_t>(kNumMaxTokensPerRank) * kNumTopk < 65536, "SST cursors are 16-bit");
+    // DG_MEGA_MOE_IB_SST_W=1 (with SST + META_SPLIT): with SST the pulls can start before the meta lands, and each remote row's
+    // pull polls its top-k weight in the mirror. The weight rows < num_tokens go out at kernel start, straight from the input
+    // region (no staging), from the idle SM below the SST builder, on the meta context; the meta SM then sends only the
+    // header value instead of the whole kIBT-row weight region (146 KB MegaSeek, of which 136 KB are sentinels at 128
+    // tokens). Mirror weight rows >= num_tokens are never written (they stay sentinels), rows < nt are re-armed as before.
+#if defined(DG_MEGA_MOE_IB_SST_W) and DG_MEGA_MOE_IB_SST_W
+    constexpr bool kIBSSTW = kIBSST;
+#else
+    constexpr bool kIBSSTW = false;
+#endif
     DG_STATIC_ASSERT(2 * kNumExpertsPerRank + 2 <= 256, "D1 counters live in the first 1 KB of smem_d");
     const auto hdr_orig = [&](const uint32_t& nr) { return kIBHdrCtx ? ib_R + nr : nr + 2; };
     const auto ib_xnctx = [&]() { return cute::max(1u, cute::min(static_cast<uint32_t>(DG_MEGA_MOE_IB_X_NCTX), static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - 2 * ib_R)); };
@@ -2656,6 +2666,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
         IB_TRACE(23, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
+        if constexpr (kIBSSTW) {
+            if (sm_idx + 2 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and num_tokens > 0) {
+                const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
+                make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + kIBOffW, ib_input_base + kIBOffW,
+                    static_cast<uint64_t>(num_tokens) * kNumTopk * 4, ib_cp(sym_buffer.rank_idx, n));
+            }
+            __syncwarp();
+        }
         if constexpr (kIBSST) {
             if (sm_idx + 1 + (kNumRanks - ib_lsa) == kNumSMs) {
                 // SST build (see the knob). Counters: 16 bits per global expert, two per word (counts <= kIBT, cursors < 65536)
@@ -2931,6 +2949,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
             constexpr bool kMetaSplit = false;
 #endif
+            DG_STATIC_ASSERT(not kIBSSTW or (kMetaSplit and meta_lean), "SST_W needs META_SPLIT + STAGE_NT on a lean-meta kernel (top-k >= LEAN_MIN_TOPK)");
             if (kMetaSplit and meta_lean and epilogue_warp_idx <= 1 and lane_idx + 1 < ib_num_nodes) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const auto dst = ib_mirror(ib_parity, ib_my_node);
@@ -2943,10 +2962,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     SL_TR(0, 25, true);
                 } else {
                     const auto gin_h = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
+                    if constexpr (kIBSSTW) {  // the weight rows went out at kernel start: header only
+                        gin_h.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
+                    } else {
                     gin_h.put(dst + kIBOffW, stg + kIBOffW, static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffW), cp);
 #if not (defined(DG_MEGA_MOE_IB_NO_META_DOORBELL) and DG_MEGA_MOE_IB_NO_META_DOORBELL)
                     gin_h.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
 #endif
+                    }
                     SL_TR(0, 26, true);
                 }
             }

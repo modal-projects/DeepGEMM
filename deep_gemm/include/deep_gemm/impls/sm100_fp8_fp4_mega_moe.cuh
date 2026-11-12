@@ -1107,8 +1107,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Staging per node: [counts][entries] in the x region of our own node's mirror slot (after the ORD tables).
 #if defined(DG_MEGA_MOE_IB_SST_NB) and DG_MEGA_MOE_IB_SST_NB
     constexpr bool kIBSSTNB = kIBSST;
+    // SST_NB=2: counters in global memory (red / atomics with their results in flight) instead of shared-memory atomics
+    // (which retry under contention: the one-SM passes measured ~10x slower than their load latency, start_o2t), and two
+    // tokens per round
+    constexpr bool kNBG = DG_MEGA_MOE_IB_SST_NB >= 2;
 #else
     constexpr bool kIBSSTNB = false;
+    constexpr bool kNBG = false;
+#endif
+    // DG_MEGA_MOE_IB_ORD_GFENCE=1: the ORD chunk stagers fence at GPU scope (like the meta staging) instead of system scope
+#if defined(DG_MEGA_MOE_IB_ORD_GFENCE) and DG_MEGA_MOE_IB_ORD_GFENCE
+    constexpr bool kIBOrdGFence = true;
+#else
+    constexpr bool kIBOrdGFence = false;
+#endif
+    // DG_MEGA_MOE_IB_NB_XHOLD=1 (with SST_NB + SST_RPUT): x chunks posted in token order (below ORD_MIN) are issued only after
+    // the node's start message is staged, so its (warm, 2.5 us) put reaches the NIC before any (cold, 7 us) x put
+#if defined(DG_MEGA_MOE_IB_NB_XHOLD) and DG_MEGA_MOE_IB_NB_XHOLD
+    constexpr bool kIBNBXHold = kIBSSTNB and kIBSSTRPut;
+#else
+    constexpr bool kIBNBXHold = false;
 #endif
     // DG_MEGA_MOE_IB_WMARK=1 (with SST_NB): landing watermark. With early counts ~576 pull warps per GPU would spin on mirror
     // rows the NIC is still writing (NVLink loads of NIC-written lines). Instead ONE thread per mirror on the proxy (a
@@ -1130,6 +1148,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kIBSSTNB or kNumExpertsPerRank < 255, "SST_NB keys");
     constexpr int64_t kNBStgStride = static_cast<int64_t>(kNumExperts) * 4 + kIBT * kNumTopk * 4;
     DG_STATIC_ASSERT(not kIBSSTNB or 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride <= kIBT * kIBTokBytes, "SST_NB staging fits in the x region");
+    DG_STATIC_ASSERT(not kIBSSTNB or kNBKeys <= 64, "SST_NB key prefix in one warp");
+    const auto ib_nb_g = [&](const uint32_t& nr) {
+        return reinterpret_cast<uint32_t*>(ib_mirror(ib_parity, ib_my_node) + 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride) + static_cast<int64_t>(nr) * (kNBCap + 64); };
     const auto ib_nb_stg = [&](const uint32_t& nr) { return ib_mirror(ib_parity, ib_my_node) + 64 * kIBT * 4 + static_cast<int64_t>(nr) * kNBStgStride; };
     DG_STATIC_ASSERT(kNumEpilogueWarps + 9 <= 28, "SENDER_TABLES scratch in the staging header slot");
     const auto ib_sort_smem = reinterpret_cast<uint8_t*>(&shared_storage.smem_d);
@@ -2911,52 +2932,72 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t node_experts = kNumExpertsPerRank * ib_lsa, e_lo = n * node_experts;
                 constexpr uint32_t kOT = math::constexpr_ceil_div(static_cast<uint32_t>(kIBT), kNumEpilogueThreads);
                 constexpr uint32_t kPerN = math::constexpr_ceil_div(kNBCap, kNumEpilogueThreads);
-                auto* const cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
-                auto* const nb_wsum = cnt + kNBCap;
+                auto* const nb_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+                auto* const cnt = kNBG ? ib_nb_g(nr) : nb_smem;
+                auto* const nb_wsum = nb_smem + kNBCap;
                 auto* const nb_tot = nb_wsum + kNumEpilogueWarps;
-                auto* const oh = nb_tot + 1;
+                auto* const oh = kNBG ? ib_nb_g(nr) + kNBCap : nb_tot + 1;
                 const auto in_idx = reinterpret_cast<const long long*>(ib_input_base + kIBOffIdx);
                 const bool ord = ib_ord_on(num_tokens);
                 auto* const stg_cnt = reinterpret_cast<uint32_t*>(ib_nb_stg(nr) + kNBHdr);
                 if (kIBWmark and epilogue_thread_idx == 0)
                     *reinterpret_cast<uint64_t*>(ib_nb_stg(nr)) = (ib_epoch << 32) | (ord ? 0x80000000ull : 0ull) | num_tokens;
                 auto* const stg_ent = stg_cnt + node_experts;
+                const auto nb_add = [&](uint32_t* const ptr) { if (kNBG) ptx::red_add(ptr, 1u); else atomicAdd_block(ptr, 1u); };
+                const auto nb_take = [&](uint32_t* const ptr) { return kNBG ? ptx::atomic_add(ptr, 1u) : atomicAdd_block(ptr, 1u); };
                 SL_TR(0, 33, epilogue_thread_idx == 0);
                 for (uint32_t i = epilogue_thread_idx; i < kNBCap + kNumEpilogueWarps + 1 + kNBKeys; i += kNumEpilogueThreads)
-                    cnt[i] = 0;
+                    nb_smem[i] = 0;
+                if constexpr (kNBG) {
+                    for (uint32_t i = epilogue_thread_idx; i < kNBCap + 64; i += kNumEpilogueThreads)
+                        cnt[i] = 0;
+                    __threadfence();
+                }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 34, epilogue_thread_idx == 0);
-                // Pass 1: counts per expert of the node, first-need key per token (in registers) and its histogram
-                uint32_t kk[kOT];
-                for (uint32_t j = 0; j < kOT; ++ j) {
-                    const uint32_t t = j * kNumEpilogueThreads + epilogue_thread_idx;
-                    uint32_t key = kNumExpertsPerRank;
-                    if (t < num_tokens) {
-                        long long v[kNumTopk];
+                // Pass 1 (two tokens per round): counts per expert of the node, first-need key per token (registers) + histogram
+                uint32_t kk[kOT + 1];
+                for (uint32_t j = 0; j < kOT; j += 2) {
+                    long long v[2][kNumTopk];
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h) {
+                        const uint32_t t = (j + h) * kNumEpilogueThreads + epilogue_thread_idx;
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k)
-                            v[k] = __ldcg(in_idx + t * kNumTopk + k);
+                            v[h][k] = t < num_tokens ? __ldcg(in_idx + t * kNumTopk + k) : -1ll;
+                    }
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h) {
+                        const uint32_t t = (j + h) * kNumEpilogueThreads + epilogue_thread_idx;
+                        uint32_t key = kNumExpertsPerRank;
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k) {
-                            const int e = static_cast<int>(v[k]);
+                            const int e = static_cast<int>(v[h][k]);
                             if (e >= 0 and static_cast<uint32_t>(e) / node_experts == n) {
-                                atomicAdd_block(cnt + (static_cast<uint32_t>(e) - e_lo), 1u);
+                                nb_add(cnt + (static_cast<uint32_t>(e) - e_lo));
                                 key = cute::min(key, static_cast<uint32_t>(e) % kNumExpertsPerRank);
                             }
                         }
-                        atomicAdd_block(oh + key, 1u);
+                        if (t < num_tokens)
+                            nb_add(oh + key);
+                        kk[j + h] = key;
                     }
-                    kk[j] = key;
                 }
+                if constexpr (kNBG)
+                    __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 35, epilogue_thread_idx == 0);
-                // Exclusive prefix over the node's experts (cursors) + counts to the staging; bucket starts of the keys
+                // Exclusive prefix over the node's experts (cursors) + counts to the staging; bucket starts of the keys (warp 0)
                 uint32_t nb_c[kPerN];
                 uint32_t mine = 0;
                 #pragma unroll
                 for (uint32_t u = 0; u < kPerN; ++ u) {
                     const uint32_t g = epilogue_thread_idx * kPerN + u;
                     nb_c[u] = g < node_experts ? cnt[g] : 0u;
+                }
+                #pragma unroll
+                for (uint32_t u = 0; u < kPerN; ++ u) {
+                    const uint32_t g = epilogue_thread_idx * kPerN + u;
                     mine += nb_c[u];
                     if (g < node_experts)
                         stg_cnt[g] = nb_c[u];
@@ -2964,13 +3005,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t inc = math::warp_inclusive_sum(mine, lane_idx);
                 if (lane_idx == 31)
                     nb_wsum[epilogue_warp_idx] = inc;
-                if (epilogue_thread_idx == 0) {
-                    uint32_t run = 0;
-                    for (uint32_t key = 0; key < kNBKeys; ++ key) {
-                        const uint32_t c = oh[key];
-                        oh[key] = run;
-                        run += c;
-                    }
+                if (epilogue_warp_idx == 0) {
+                    const uint32_t k0 = lane_idx, k1 = lane_idx + 32;
+                    const uint32_t v0 = k0 < kNBKeys ? oh[k0] : 0u, v1 = k1 < kNBKeys ? oh[k1] : 0u;
+                    const uint32_t i0 = math::warp_inclusive_sum(v0, lane_idx);
+                    const uint32_t t0 = __shfl_sync(0xffffffffu, i0, 31);
+                    const uint32_t i1 = math::warp_inclusive_sum(v1, lane_idx);
+                    if (k0 < kNBKeys) oh[k0] = i0 - v0;
+                    if (k1 < kNBKeys) oh[k1] = t0 + i1 - v1;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 uint32_t run = inc - mine;
@@ -2985,29 +3027,46 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 if (epilogue_thread_idx == kNumEpilogueThreads - 1)
                     *nb_tot = run;  // the last thread's running sum = every entry of the node
+                if constexpr (kNBG)
+                    __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 36, epilogue_thread_idx == 0);
-                // Pass 2: the token's row (bucket order), then its entries for the node, expert-major
-                for (uint32_t j = 0; j < kOT; ++ j) {
-                    const uint32_t t = j * kNumEpilogueThreads + epilogue_thread_idx;
-                    if (t < num_tokens) {
-                        long long v[kNumTopk];
+                // Pass 2 (two tokens per round): the token's row (bucket order), then its entries for the node, expert-major
+                for (uint32_t j = 0; j < kOT; j += 2) {
+                    long long v[2][kNumTopk];
+                    uint32_t row[2], sl[2][kNumTopk];
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h) {
+                        const uint32_t t = (j + h) * kNumEpilogueThreads + epilogue_thread_idx;
+                        row[h] = t;
+                        if (ord and t < num_tokens)
+                            row[h] = nb_take(oh + kk[j + h]);
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k)
-                            v[k] = __ldcg(in_idx + t * kNumTopk + k);
-                        uint32_t row = t;
-                        if (ord) {
-                            row = atomicAdd_block(oh + kk[j], 1u);
-                            ib_ord_pos(nr)[t] = row;
-                            ib_ord_inv(nr)[row] = t;
+                            v[h][k] = t < num_tokens ? __ldcg(in_idx + t * kNumTopk + k) : -1ll;
+                    }
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h) {
+                        #pragma unroll
+                        for (uint32_t k = 0; k < kNumTopk; ++ k) {
+                            const int e = static_cast<int>(v[h][k]);
+                            sl[h][k] = 0;
+                            if (e >= 0 and static_cast<uint32_t>(e) / node_experts == n)
+                                sl[h][k] = nb_take(cnt + (static_cast<uint32_t>(e) - e_lo));
+                        }
+                    }
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h) {
+                        const uint32_t t = (j + h) * kNumEpilogueThreads + epilogue_thread_idx;
+                        if (ord and t < num_tokens) {
+                            ib_ord_pos(nr)[t] = row[h];
+                            ib_ord_inv(nr)[row[h]] = t;
                         }
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k) {
-                            const int e = static_cast<int>(v[k]);
-                            if (e >= 0 and static_cast<uint32_t>(e) / node_experts == n) {
-                                const uint32_t slot = atomicAdd_block(cnt + (static_cast<uint32_t>(e) - e_lo), 1u);
-                                stg_ent[slot] = kIBPacked ? ((t * kNumTopk + k) | (row << 16)) : (t * kNumTopk + k);
-                            }
+                            const int e = static_cast<int>(v[h][k]);
+                            if (e >= 0 and static_cast<uint32_t>(e) / node_experts == n)
+                                stg_ent[sl[h][k]] = kIBPacked ? ((t * kNumTopk + k) | (row[h] << 16)) : (t * kNumTopk + k);
                         }
                     }
                 }
@@ -3543,7 +3602,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 reinterpret_cast<uint4*>(x_stage + static_cast<int64_t>(c0 + u / kRowUnits) * kIBTokBytes)[u % kRowUnits] = v[b];
                         }
                     }
-                    __threadfence_system();
+                    if (kIBOrdGFence and ord_stage) __threadfence();
+                    else __threadfence_system();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
                 // STREAM_COMBINE: the SM posting node n's SF piece also computes our records' return order from n
@@ -3569,6 +3629,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if constexpr (kIBSST)
                         IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + 255) != ib_epoch, (void) 0, "sst_xhold", q, 0);
 #endif
+                    if constexpr (kIBNBXHold) {
+                        if (q_piece > 0 and not ib_ord_on(num_tokens))
+                            IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + 244 + q_nr) != ib_epoch, (void) 0, "nb_xhold", q, 0);
+                    }
 #if defined(DG_MEGA_MOE_IB_XDELAY_NS) and DG_MEGA_MOE_IB_XDELAY_NS
                     // DG_MEGA_MOE_IB_XDELAY_NS=N (with META_FIRST_ALL): x / SF pieces wait N ns after the meta was posted, so the
                     // meta is not interleaved with megabytes of x on the NIC (hypothesis test: counts @1024 land ~50 us late)

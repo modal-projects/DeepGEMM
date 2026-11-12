@@ -198,6 +198,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     pf_acc_##nm[i] += pfc1_ ? pfx_ : 0u; pf_acc_##nm[j] += (not pfc1_ and pfc2_) ? pfx_ : 0u; pf_acc_##nm[k] += (not pfc1_ and not pfc2_) ? pfx_ : 0u; } while (0)
 #define PF_L3(nm, c1, c2, i, j, k) do { TT_NOW(pft_); PF_ADD3(nm, c1, c2, i, j, k, pft_ - pf_last_##nm); pf_last_##nm = pft_; } while (0)
 #define PF_LFLUSH(nm, i, slot) do { if (lane_idx == 0) pf_row[(slot)] += pf_acc_##nm[i]; } while (0)
+#define PF_PEEK(nm, var) TT_NOW(pfq_); const uint32_t var = static_cast<uint32_t>(pfq_ - pf_last_##nm)
 #define PF_LEND(nm) do { if (lane_idx == 0) pf_row[31] = pf_last_##nm; } while (0)
 #define PF_ADDTO(var, t0_) do { TT_NOW(pfe_); (var) += pfe_ - (t0_); } while (0)
 #define PF_REL(d_) TT_NOW(pft_); const int64_t d_ = static_cast<int64_t>(pft_) - static_cast<int64_t>(ptx::ld_volatile(workspace.signals->ib_trace + 16))
@@ -2882,7 +2883,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             task_info_t task_info;
             // states (registers): 0 task wait, 1 accumulator wait, 2 / 3 / 4 L1 / L2 / shared K loop (incl. 5 / 6 / 7), 5 / 6 / 7 waited for TMA data
             PF_MARK(0);
-            PF_LBEGIN(m, 8);
+            PF_LBEGIN(m, 26);
             while (scheduler.get_next_task(task_info)) {
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
 #if DG_PF
@@ -2972,13 +2973,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
                 }
 #if DG_PF
+#if DG_MEGA_MOE_IB_PROF >= 2
+                {
+                    // Weight-cache probe: routed K-loop time / TMA-data wait by the block's index within its expert (0, 1, >= 2).
+                    // Block 1 loads exactly the weight tiles block 0 of the same expert loaded a few tasks earlier.
+                    PF_PEEK(m, pf_kd);
+                    const uint32_t pf_b = task_info.m_block_idx;
+                    PF_ADD3(m, pf_b == 0, pf_b == 1, 8, 9, 10, pf_ph == 1 ? pf_kd : 0u);
+                    PF_ADD3(m, pf_b == 0, pf_b == 1, 11, 12, 13, pf_ph == 1 ? pf_full : 0u);
+                    PF_ADD3(m, pf_b == 0, pf_b == 1, 14, 15, 16, pf_ph == 2 ? pf_kd : 0u);
+                    PF_ADD3(m, pf_b == 0, pf_b == 1, 17, 18, 19, pf_ph == 2 ? pf_full : 0u);
+                    // tasks and rows per block index (x128: the totals are printed >> 7)
+                    PF_ADD3(m, pf_b == 0, pf_b == 1, 20, 21, 22, pf_ph == 1 ? 128u : 0u);
+                    PF_ADD3(m, pf_b == 0, pf_b == 1, 23, 24, 25, pf_ph == 1 ? task_info.valid_m * 128u : 0u);
+                }
+#endif
                 PF_L3(m, pf_ph == 1, pf_ph == 2, 2, 3, 4);
                 PF_ADD3(m, pf_ph == 1, pf_ph == 2, 5, 6, 7, pf_full);
 #endif
             }
             PF_L(m, 0);
             PF_LFLUSH(m, 0, 1); PF_LFLUSH(m, 1, 2); PF_LFLUSH(m, 2, 3); PF_LFLUSH(m, 3, 5); PF_LFLUSH(m, 4, 7); PF_LFLUSH(m, 5, 8); PF_LFLUSH(m, 6, 9);
-            PF_LFLUSH(m, 7, 10); PF_LEND(m);
+            PF_LFLUSH(m, 7, 10);
+#if DG_PF and DG_MEGA_MOE_IB_PROF >= 2
+            for (uint32_t pf_i = 8; pf_i < 23; ++ pf_i)
+                PF_LFLUSH(m, pf_i, pf_i + 3);  // row slots 11-25
+            PF_LFLUSH(m, 23, 27); PF_LFLUSH(m, 24, 28); PF_LFLUSH(m, 25, 29);
+#endif
+            PF_LEND(m);
 
             // To safely deconstruct barriers, we need another round of waits
             if (current_iter_idx > 0) {

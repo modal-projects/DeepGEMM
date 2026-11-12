@@ -809,6 +809,52 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBFwdRotate = false;
 #endif
+    // DG_MEGA_MOE_IB_FUSED_FIN=1 (end, EP > 16; PRIOR_ART_2 G2-A "add as you go"): the L2 epilogue adds every remote-source output row
+    // straight into a bf16 running sum per (source node, token) on the proxy (vector atomic add over NVLink, system scope), so the
+    // proxy's read-back of the K partial rows and their sentinel re-arm disappear. Completion signal without a fence in the epilogue
+    // pipeline: after the task's CTA-wide barrier (which every writer thread passes), one thread per row issues
+    // red.release.sys.add on the token's counter; the proxy acquires the counter (ld.acquire.sys) and, once it reads
+    // picks-on-node x N-blocks, loads the sum, quantises the fp8 record and zeroes the sum. PTX memory model (ISA 9.5, section 8): the
+    // barrier puts every writer's data add before the release in base causality order (8.9.4/8.9.5), the counter RMWs chain in
+    // observation order (8.9.2), so the acquire that sees the final count synchronizes with every release (8.8), and the
+    // system-scope loads of the sum that follow must see every add.
+    // State: own-node pcomb slots (the proxy never uses them; slots 0-1 hold the C3_SPLIT scratch / x staging):
+    // sums = slots [2, 2 + R), counters = slot 2 + R ([R][T] u32, then two marker words). Timing-only sub-knobs:
+    // DG_MEGA_MOE_IB_FF_DATA (1 = vector red, 0 = plain racing store, 2 = value-returning vector atom),
+    // DG_MEGA_MOE_IB_FF_SIG (1 = release counter, 2 = relaxed counter, 0 = none: the proxy does not wait),
+    // DG_MEGA_MOE_IB_FF_READ (1 = read + zero the sum, 0 = stage a zero record without reading). Only 1 / 1 / 1 is correct.
+#ifndef DG_MEGA_MOE_IB_FF_DATA
+#define DG_MEGA_MOE_IB_FF_DATA 1
+#endif
+#ifndef DG_MEGA_MOE_IB_FF_SIG
+#define DG_MEGA_MOE_IB_FF_SIG 1
+#endif
+#ifndef DG_MEGA_MOE_IB_FF_READ
+#define DG_MEGA_MOE_IB_FF_READ 1
+#endif
+#if defined(DG_MEGA_MOE_IB_FUSED_FIN) and DG_MEGA_MOE_IB_FUSED_FIN
+    constexpr bool kIBFused = kIBReduceOnArrival and kNumRanks > 16;
+#else
+    constexpr bool kIBFused = false;
+#endif
+    constexpr uint32_t kFFData = DG_MEGA_MOE_IB_FF_DATA, kFFSig = DG_MEGA_MOE_IB_FF_SIG, kFFRead = DG_MEGA_MOE_IB_FF_READ;
+    constexpr bool kFFClean = kFFData != 0 and kFFSig != 0 and kFFRead != 0;  // the sums are zero again at the end of a launch
+    constexpr int64_t kFFSlot = kIBT * kHidden * 2;
+    constexpr uint32_t kFFNBlocks = L2_SHAPE_N / BLOCK_N;  // counter increments per (row, launch): one per L2 N-block task
+    constexpr uint32_t kFFMagic = 0x46464e31u;
+    DG_STATIC_ASSERT(not kIBFused or kIBFp8Combine, "FUSED_FIN stages fp8 records");
+    // sum row of token t from source node n (same address on the writer and the proxy: both are on this node)
+    const auto ff_acc = [&](const uint32_t& n) { return ib_pcomb(ib_my_node) + (2 + (n < ib_my_node ? n : n - 1)) * kFFSlot; };
+    const auto ff_cnt = [&](const uint32_t& n) {
+        return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + (n < ib_my_node ? n : n - 1) * kIBT; };
+    const auto ff_marker = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT; };
+    if constexpr (kIBFused) {
+        if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2) {
+            if (blockIdx.x == 0 and threadIdx.x == 0)
+                printf("DeepGEMM IB: FUSED_FIN needs <= 5 nodes and top-k >= nodes + 2 (nodes=%u, top-k=%u)\n", ib_num_nodes, kNumTopk);
+            __trap();
+        }
+    }
     // DG_MEGA_MOE_IB_FWD_PREFETCH=1 (tail): shorter dependency chain per forward-combine item: the next item is claimed and
     // its token looked up while the current one runs, and the item's x / SF sentinel loads are issued together with its
     // top-k load instead of after the on-node ballot (the tables are acquired via ib_o_order_ready, so plain L2 loads)
@@ -1269,6 +1315,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t l = 0; l < 4; ++ l)
                         acc[i][l] = {0.f, 0.f};
                 uint32_t m = on_mask;
+                if constexpr (kIBFused) {
+                    // FUSED_FIN: the node's L2 epilogues added this token's rows into one running sum; wait for the counter, then
+                    // read this item's part of the sum and zero it for the next launch
+                    if (m != 0) {
+                        if constexpr (kFFSig != 0) {
+                            const uint32_t expected = static_cast<uint32_t>(__popc(m)) * kFFNBlocks;
+                            const auto cp = ff_cnt(n) + t;
+                            uint32_t cv = ptx::ld_acq_sys(cp);
+                            tt_miss |= cv != expected;
+                            IB_POLL(cv != expected, cv = ptx::ld_acq_sys(cp), "ff_cnt", t, cv);
+                        }
+                        if constexpr (kFFRead != 0) {
+                            const auto row = ff_acc(n) + static_cast<int64_t>(t) * kHidden * 2;
+                            uint4 v[kPPI];
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kPPI; ++ i)
+                                v[i] = ib_ldv4(row + ((qtr * kPPI + i) * 32 + lane_idx) * 16);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kPPI; ++ i) {
+                                *reinterpret_cast<uint4*>(row + ((qtr * kPPI + i) * 32 + lane_idx) * 16) = uint4{0u, 0u, 0u, 0u};
+                                const auto b = reinterpret_cast<const nv_bfloat162*>(&v[i]);
+                                #pragma unroll
+                                for (uint32_t l = 0; l < 4; ++ l)
+                                    ptx::accumulate(acc[i][l], b[l]);
+                            }
+                        }
+                    }
+                    m = 0;
+                }
                 while (m) {
                     // kBatch slots at a time (top-k order kept): all their loads first, then the checks / accumulation
                     uint32_t ks[kBatch];
@@ -1485,6 +1560,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 #endif
+        if constexpr (kIBFused) {
+            // FUSED_FIN state check (before the dispatch grid sync, so before any node peer's L2): a launch that leaves the counters /
+            // sums zero stamps the marker at its end; anything else (fresh 0xFF-filled buffer, a timing-only variant) is cleaned here
+            const uint32_t ff_gtid = sm_idx * kNumDispatchThreads + thread_idx;
+            constexpr uint32_t kFFG = kNumSMs * kNumDispatchThreads;
+            const uint32_t ff_R = ib_num_nodes - 1;
+            const auto mk = ff_marker();
+            if (kFFSig != 0 and ptx::ld_volatile(mk) != kFFMagic) {
+                const auto cb = reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + ff_R) * kFFSlot);
+                for (uint32_t u = ff_gtid; u < ff_R * static_cast<uint32_t>(kIBT); u += kFFG)
+                    cb[u] = 0;
+            }
+            if (kFFClean and ptx::ld_volatile(mk + 1) != kFFMagic) {
+                const auto ab = reinterpret_cast<uint4*>(ib_pcomb(ib_my_node) + 2 * kFFSlot);
+                for (int64_t u = ff_gtid; u < ff_R * kFFSlot / 16; u += kFFG)
+                    ab[u] = uint4{0u, 0u, 0u, 0u};
+            }
+        }
         IB_STAGE(6, thread_idx == 0);  // dispatch warps started
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -2127,6 +2220,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kGThreads = kNumSMs * kNumDispatchThreads;
             const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
             const uint4 idx_sentinel = {0u, 0x80000000u, 0u, 0x80000000u};
+            if constexpr (kIBFused and kFFSig != 0) {
+                // FUSED_FIN: every forward item of node n is done (fdone above), so its token counters go back to zero
+                const auto cb = ff_cnt(n);
+                for (uint32_t u = gtid; u < nt; u += kGThreads)
+                    cb[u] = 0;
+            }
             if (kIBOracle) continue;
             for (int64_t u = gtid; u < static_cast<int64_t>(nt) * kIBTokBytes / 16; u += kGThreads)
                 reinterpret_cast<uint4*>(mir)[u] = ones;
@@ -2267,6 +2366,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and thread_idx == 0)
             workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
 #endif
+        if constexpr (kIBFused) {
+            if (sm_idx == 0 and thread_idx == 0) {
+                if (kFFSig != 0) ff_marker()[0] = kFFMagic;
+                ff_marker()[1] = kFFClean ? kFFMagic : 0u;
+            }
+        }
         if (sm_idx == 0 and thread_idx == 0)
             *workspace.get_ib_epoch_ptr() = ib_epoch;
 #else
@@ -3758,6 +3863,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                         // C1: rows of sources on other nodes go to the proxy's combine buffer (same layout), over NVLink
                         if (is_remote(dst_rank_idx)) {
+                            if constexpr (kIBFused) {
+                                // FUSED_FIN: add this 16-byte unit into the token's running sum on the proxy
+                                const auto ap = sym_buffer.map(
+                                    ff_acc(dst_rank_idx / ib_lsa) + static_cast<int64_t>(dst_token_idx) * (kHidden * 2) +
+                                    n_idx * 2 + (lane_idx % 16) * 16, ib_cp(dst_rank_idx, ib_my_node));
+                                const auto pk = reinterpret_cast<const uint4*>(&packed);
+                                if constexpr (kFFData == 0) {
+                                    *reinterpret_cast<float4*>(ap) = packed;
+                                } else if constexpr (kFFData == 2) {
+                                    uint32_t o0, o1, o2, o3;
+                                    asm volatile("atom.relaxed.sys.global.add.noftz.v4.bf16x2 {%0, %1, %2, %3}, [%4], {%5, %6, %7, %8};"
+                                                 : "=r"(o0), "=r"(o1), "=r"(o2), "=r"(o3) : "l"(ap), "r"(pk->x), "r"(pk->y), "r"(pk->z), "r"(pk->w) : "memory");
+                                } else {
+                                    asm volatile("red.relaxed.sys.global.add.noftz.v4.bf16x2 [%0], {%1, %2, %3, %4};"
+                                                 : : "l"(ap), "r"(pk->x), "r"(pk->y), "r"(pk->z), "r"(pk->w) : "memory");
+                                }
+                                continue;
+                            }
                             const auto off = reinterpret_cast<const uint8_t*>(dst_ptr) -
                                 reinterpret_cast<const uint8_t*>(buffer.combine_token_buffer.get_base_ptr());
                             *sym_buffer.map(reinterpret_cast<float4*>(ib_pcomb(dst_rank_idx / ib_lsa) + off),
@@ -3771,6 +3894,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if constexpr (kIBFused and kFFSig != 0) {
+                    // FUSED_FIN completion signal: every thread of this CTA that added a part of these rows has passed the barrier
+                    // above, so a release here covers all of them (base causality order through the barrier). One increment per
+                    // (row, N-block task) on the source token's counter at the proxy.
+                    if (not task_info.is_shared()) {
+                        for (uint32_t m = epilogue_thread_idx; m < valid_m; m += kNumEpilogueThreads) {
+                            const auto md = *workspace.get_token_src_metadata_ptr(pool_m_idx + m);
+                            if (is_remote(md.rank_idx)) {
+                                const auto cp = sym_buffer.map(ff_cnt(md.rank_idx / ib_lsa) + md.token_idx, ib_cp(md.rank_idx, ib_my_node));
+                                if constexpr (kFFSig == 1)
+                                    asm volatile("red.release.sys.global.add.u32 [%0], 1;" : : "l"(cp) : "memory");
+                                else
+                                    asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(cp) : "memory");
+                            }
+                        }
+                    }
+                }
+#endif
                 TT_MAX(task_info.is_shared() ? 1 : 0, epilogue_thread_idx == 0);
             }
         }

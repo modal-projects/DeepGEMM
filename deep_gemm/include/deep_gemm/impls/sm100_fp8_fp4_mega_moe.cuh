@@ -1326,7 +1326,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kIBSSTNB or kNumExpertsPerRank < 255, "SST_NB keys");
     constexpr int64_t kNBStgStride = static_cast<int64_t>(kNumExperts) * 4 + kIBT * kNumTopk * 4;
     DG_STATIC_ASSERT(not kIBSSTNB or 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride <= kIBT * kIBTokBytes, "SST_NB staging fits in the x region");
-    DG_STATIC_ASSERT(not kIBSSTNB or kNBKeys <= 64, "SST_NB key prefix in one warp");
     const auto ib_nb_g = [&](const uint32_t& nr) {
         return reinterpret_cast<uint32_t*>(ib_mirror(ib_parity, ib_my_node) + 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride) + static_cast<int64_t>(nr) * (kNBCap + 64); };
     const auto ib_nb_stg = [&](const uint32_t& nr) { return ib_mirror(ib_parity, ib_my_node) + 64 * kIBT * 4 + static_cast<int64_t>(nr) * kNBStgStride; };
@@ -3225,23 +3224,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t inc = math::warp_inclusive_sum(mine, lane_idx);
                 if (lane_idx == 31)
                     nb_wsum[epilogue_warp_idx] = inc;
-                if (epilogue_warp_idx == 0) {
-                    const uint32_t k0 = lane_idx, k1 = lane_idx + 32;
-                    uint32_t v0 = k0 < kNBKeys ? oh[k0] : 0u, v1 = k1 < kNBKeys ? oh[k1] : 0u;
-                    if constexpr (kNBW) {  // per-warp counts -> per-warp exclusive bases, totals per key
-                        auto* const wh0 = nb_tot + 1 + kNBKeys;
-                        v0 = 0, v1 = 0;
-                        #pragma unroll
-                        for (uint32_t w = 0; w < kNumEpilogueWarps; ++ w) {
-                            if (k0 < kNBKeys) { const uint32_t c = wh0[w * kNBKeys + k0]; wh0[w * kNBKeys + k0] = v0; v0 += c; }
-                            if (k1 < kNBKeys) { const uint32_t c = wh0[w * kNBKeys + k1]; wh0[w * kNBKeys + k1] = v1; v1 += c; }
+                if (epilogue_warp_idx == 0) {  // exclusive prefix of the key buckets, 32 keys per step
+                    auto* const wh0 = nb_tot + 1 + kNBKeys;
+                    uint32_t carry = 0;
+                    #pragma unroll
+                    for (uint32_t c = 0; c < (kNBKeys + 31) / 32; ++ c) {
+                        const uint32_t kq = lane_idx + 32 * c;
+                        uint32_t v = kq < kNBKeys ? oh[kq] : 0u;
+                        if constexpr (kNBW) {  // per-warp counts -> per-warp exclusive bases, total per key
+                            v = 0;
+                            #pragma unroll
+                            for (uint32_t w = 0; w < kNumEpilogueWarps; ++ w) {
+                                if (kq < kNBKeys) { const uint32_t cw = wh0[w * kNBKeys + kq]; wh0[w * kNBKeys + kq] = v; v += cw; }
+                            }
                         }
+                        const uint32_t incl = math::warp_inclusive_sum(v, lane_idx);
+                        if (kq < kNBKeys) oh[kq] = carry + incl - v;
+                        carry += __shfl_sync(0xffffffffu, incl, 31);
                     }
-                    const uint32_t i0 = math::warp_inclusive_sum(v0, lane_idx);
-                    const uint32_t t0 = __shfl_sync(0xffffffffu, i0, 31);
-                    const uint32_t i1 = math::warp_inclusive_sum(v1, lane_idx);
-                    if (k0 < kNBKeys) oh[k0] = i0 - v0;
-                    if (k1 < kNBKeys) oh[k1] = t0 + i1 - v1;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 uint32_t run = inc - mine;

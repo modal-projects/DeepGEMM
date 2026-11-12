@@ -561,6 +561,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSST = false;
 #endif
+    // DG_MEGA_MOE_IB_SST_FAST=1: sender passes by ROUNDS (a round of global loads costs 2-5 us at kernel start, and 64-bit
+    // values in flight are limited by registers): the SST builder reads only the low 32 bits of each top-k index, 16 in
+    // flight (half the rounds of 8 x 64-bit); the ORD order pass does the same with 19 x 32-bit per token and keeps the key
+    // buckets per warp (match_any) instead of atomics on <= 39 hot shared-memory words
+#if defined(DG_MEGA_MOE_IB_SST_FAST) and DG_MEGA_MOE_IB_SST_FAST
+    constexpr bool kIBSSTFast = true;
+#else
+    constexpr bool kIBSSTFast = false;
+#endif
     // DG_MEGA_MOE_IB_PUT_FN=1: the SST / ORD blocks issue their puts through ONE shared non-inlined function (comm::gin_put_fn,
     // scalars and pointers by value) instead of inlining the Gin put at each site
 #if defined(DG_MEGA_MOE_IB_PUT_FN) and DG_MEGA_MOE_IB_PUT_FN
@@ -3077,10 +3086,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr uint32_t kOK = kNumExpertsPerRank + 1;  // buckets per node (the last: no pick on the node)
                 constexpr uint32_t kOT = math::constexpr_ceil_div(static_cast<uint32_t>(kIBT), kNumEpilogueThreads);
                 auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+                constexpr uint32_t kOWStride = 3 * kOK;  // FAST: per-warp buckets [warp][<= 3 remote nodes][key] after oh
+                DG_STATIC_ASSERT(not kIBSSTFast or (kNumEpilogueWarps + 2) * kOWStride * 2 + 4 <= sizeof(SharedStorage::smem_d), "ORD per-warp buckets in smem_d");
+                auto* const o_wh_all = reinterpret_cast<uint16_t*>(oh + kOWStride);  // 16-bit: counts <= kIBT
+                auto* const o_wh = o_wh_all + epilogue_warp_idx * kOWStride;
                 const auto in_idx = reinterpret_cast<const long long*>(ib_input_base + kIBOffIdx);
                 const uint32_t node_experts = kNumExpertsPerRank * ib_lsa;
-                if (ib_R > 4) __trap();  // keys are packed 8 bits per remote node
-                for (uint32_t i = epilogue_thread_idx; i < ib_R * kOK; i += kNumEpilogueThreads)
+                if (ib_R > (kIBSSTFast ? 3u : 4u)) __trap();  // keys are packed 8 bits per remote node
+                for (uint32_t i = epilogue_thread_idx; i < (kIBSSTFast ? kOWStride + (kNumEpilogueWarps * kOWStride + 1) / 2 : ib_R * kOK); i += kNumEpilogueThreads)
                     oh[i] = 0;
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 uint32_t kk[kOT];
@@ -3088,10 +3101,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t t = j * kNumEpilogueThreads + epilogue_thread_idx;
                     uint32_t packed = kNumExpertsPerRank * 0x01010101u;
                     if (t < num_tokens) {
-                        long long v[kNumTopk];
+                        uint32_t v[kNumTopk];
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k)
-                            v[k] = __ldcg(in_idx + t * kNumTopk + k);
+                            v[k] = kIBSSTFast ? __ldcg(reinterpret_cast<const uint32_t*>(in_idx) + 2 * (t * kNumTopk + k)) : static_cast<uint32_t>(__ldcg(in_idx + t * kNumTopk + k));
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k) {
                             const int e = static_cast<int>(v[k]);
@@ -3102,12 +3115,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     packed = (packed & ~(0xffu << sh)) | (le << sh);
                             }
                         }
-                        for (uint32_t nr = 0; nr < ib_R; ++ nr)
-                            atomicAdd_block(oh + nr * kOK + ((packed >> (8 * nr)) & 0xffu), 1u);
+                        if constexpr (not kIBSSTFast) {
+                            for (uint32_t nr = 0; nr < ib_R; ++ nr)
+                                atomicAdd_block(oh + nr * kOK + ((packed >> (8 * nr)) & 0xffu), 1u);
+                        }
+                    }
+                    if constexpr (kIBSSTFast) {  // per-warp buckets: equal keys inside the warp resolved with match_any, no atomics
+                        for (uint32_t nr = 0; nr < ib_R; ++ nr) {
+                            const uint32_t key = (packed >> (8 * nr)) & 0xffu;
+                            const uint32_t peers = __match_any_sync(0xffffffffu, t < num_tokens ? key : 0xffffffffu);
+                            if (t < num_tokens and (peers & ((1u << lane_idx) - 1u)) == 0)
+                                o_wh[nr * kOK + key] += __popc(peers);
+                            __syncwarp();
+                        }
                     }
                     kk[j] = packed;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if constexpr (kIBSSTFast) {  // per (node, key): per-warp counts -> per-warp bases, total into oh
+                    for (uint32_t q = epilogue_thread_idx; q < ib_R * kOK; q += kNumEpilogueThreads) {
+                        uint32_t tot = 0;
+                        #pragma unroll
+                        for (uint32_t w = 0; w < kNumEpilogueWarps; ++ w) {
+                            const uint32_t c = o_wh_all[w * kOWStride + q];
+                            o_wh_all[w * kOWStride + q] = static_cast<uint16_t>(tot);
+                            tot += c;
+                        }
+                        oh[q] = tot;
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
                 if (epilogue_thread_idx < ib_R) {  // exclusive prefix per node
                     uint32_t run = 0;
                     for (uint32_t key = 0; key < kOK; ++ key) {
@@ -3120,10 +3157,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t j = 0; j < kOT; ++ j) {
                     const uint32_t t = j * kNumEpilogueThreads + epilogue_thread_idx;
                     if (t < num_tokens) {
+                        if constexpr (not kIBSSTFast) {
                         for (uint32_t nr = 0; nr < ib_R; ++ nr) {
                             const uint32_t pos = atomicAdd_block(oh + nr * kOK + ((kk[j] >> (8 * nr)) & 0xffu), 1u);
                             ib_ord_pos(nr)[t] = pos;
                             ib_ord_inv(nr)[pos] = t;
+                        }
+                        }
+                    }
+                    if constexpr (kIBSSTFast) {
+                        for (uint32_t nr = 0; nr < ib_R; ++ nr) {
+                            const uint32_t key = (kk[j] >> (8 * nr)) & 0xffu;
+                            const uint32_t peers = __match_any_sync(0xffffffffu, t < num_tokens ? key : 0xffffffffu);
+                            const uint32_t rank = __popc(peers & ((1u << lane_idx) - 1u));
+                            const uint32_t pos = t < num_tokens ? oh[nr * kOK + key] + o_wh[nr * kOK + key] + rank : 0u;
+                            __syncwarp();
+                            if (t < num_tokens) {
+                                ib_ord_pos(nr)[t] = pos;
+                                ib_ord_inv(nr)[pos] = t;
+                                if (rank == 0) o_wh[nr * kOK + key] += __popc(peers);
+                            }
+                            __syncwarp();
                         }
                     }
                 }
@@ -3352,18 +3406,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t sst_node_experts = kNumExpertsPerRank * ib_lsa;
                 const uint32_t sst_ne = num_tokens * kNumTopk;
                 const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;  // our own node's slot: unused locally
-                constexpr uint32_t kSSTB = 8;  // loads in flight per thread
+                constexpr uint32_t kSSTB = kIBSSTFast ? 16 : 8;  // loads in flight per thread
+                const auto in_idx32 = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffIdx);  // low halves (little endian)
                 SL_TR(0, 33, epilogue_thread_idx == 0);  // SST build entered
                 for (uint32_t w = epilogue_thread_idx; w < kSSTWords; w += kNumEpilogueThreads)
                     c16[w] = 0;
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 34, epilogue_thread_idx == 0);  // counters zeroed
                 for (uint32_t i0 = 0; i0 < sst_ne; i0 += kNumEpilogueThreads * kSSTB) {
-                    unsigned long long v[kSSTB];
+                    uint32_t v[kSSTB];
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        v[u] = i < sst_ne ? __ldcg(in_idx + i) : ~0ull;
+                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFast ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
@@ -3431,12 +3486,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 41, epilogue_thread_idx == 0);  // wave order seen by the SST builder
                 for (uint32_t i0 = 0; i0 < sst_ne; i0 += kNumEpilogueThreads * kSSTB) {
-                    unsigned long long v[kSSTB];
+                    uint32_t v[kSSTB];
                     uint32_t xr[kSSTB];
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        v[u] = i < sst_ne ? __ldcg(in_idx + i) : ~0ull;
+                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFast ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {

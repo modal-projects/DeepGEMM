@@ -958,6 +958,31 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
 #if defined(DG_MEGA_MOE_IB_FWD_BULK_VERIFY) and DG_MEGA_MOE_IB_FWD_BULK_VERIFY
                     bool vbad = false;
 #endif
+#if defined(DG_MEGA_MOE_IB_FWD_BULK_RP) and DG_MEGA_MOE_IB_FWD_BULK_RP
+                    // FWD_BULK_RP=1: a slot that had not landed at the bulk copy: all its still-sentinel units are re-loaded together
+                    // per round (the per-unit poll below then passes at once; without it a waiting item pays one round trip per unit)
+                    {
+                        const uint64_t rp0 = now();
+                        while (true) {
+                            bool ms = false;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kPPI; ++ i)
+                                ms |= sent4(v[i]);
+                            if (not ms) break;
+                            miss = true;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kPPI; ++ i)
+                                if (sent4(v[i])) v[i] = ldv4(row + (i * 32 + lane_idx) * 16);
+#if not (defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG)
+                            if (now() - rp0 > 20000000000ull) {
+                                printf("OPUS_HANG blk_rp rank=%u sm=%u thread=%u a=%u b=%u epoch=%llu\n", rank_idx, ptx::get_sm_idx(), threadIdx.x, t, k,
+                                       (unsigned long long) epoch);
+                                asm volatile("trap;");
+                            }
+#endif
+                        }
+                    }
+#endif
                     #pragma unroll
                     for (uint32_t i = 0; i < kPPI; ++ i) {
                         const auto ptr = row + (i * 32 + lane_idx) * 16;

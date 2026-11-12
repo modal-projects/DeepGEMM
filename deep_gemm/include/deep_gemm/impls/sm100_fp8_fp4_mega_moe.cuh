@@ -2773,6 +2773,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 fi_g = fi_claim();
         }
     };
+#ifndef DG_MEGA_MOE_IB_FWD_PACE_MIN
+#define DG_MEGA_MOE_IB_FWD_PACE_MIN 0
+#endif
+#ifndef DG_MEGA_MOE_IB_FWD_PACE_NS
+#define DG_MEGA_MOE_IB_FWD_PACE_NS 1000
+#endif
 #if defined(DG_MEGA_MOE_IB_FWD_DRAIN) and DG_MEGA_MOE_IB_FWD_DRAIN
 #ifndef DG_MEGA_MOE_IB_FWD_DRAIN_N
 #define DG_MEGA_MOE_IB_FWD_DRAIN_N 4
@@ -3623,6 +3629,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE_MAX(27, thread_idx == 0);  // pull end, slowest SM
         if constexpr (kIBReduceOnArrival) {
             // The dispatch warps are idle until the cleanup: reduce forwarded tokens as their partials land
+#if defined(DG_MEGA_MOE_IB_FWD_PACE) and DG_MEGA_MOE_IB_FWD_PACE
+            // DG_MEGA_MOE_IB_FWD_PACE=k (inverse lever: the GEMMs are memory-load-bound and every more eager reduce made the layer
+            // slower): while this GPU's L2 runs only every k-th dispatch warp reduces; the others sleep until our own combine-ready
+            // flag (raised after the L2 grid sync) and then join. =1: control (the flag load compiled in, every warp reduces).
+            if ((warp_idx * kNumSMs + sm_idx) % DG_MEGA_MOE_IB_FWD_PACE != 0 and num_tokens >= DG_MEGA_MOE_IB_FWD_PACE_MIN) {
+                const auto pace_ptr = workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx);
+                const auto pace_idx = ptx::get_grid_idx() + 1;
+                if (lane_idx == 0)
+                    while (ptx::ld_acq_sys(pace_ptr) != pace_idx) __nanosleep(DG_MEGA_MOE_IB_FWD_PACE_NS);
+                __syncwarp();
+            }
+#endif
 #if defined(DG_MEGA_MOE_IB_FWD_DRAIN) and DG_MEGA_MOE_IB_FWD_DRAIN >= 2
             // FWD_DRAIN=2: the dispatch warps use the out-of-line loop too (the inlined one is not instantiated at all)
             if (sm_idx == 0 and thread_idx == 0 and ib_gin_active) {  // zero-token nodes: their return header, once

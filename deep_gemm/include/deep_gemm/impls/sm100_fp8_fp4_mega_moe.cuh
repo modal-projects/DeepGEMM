@@ -570,6 +570,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSSTFast = false;
 #endif
+    // DG_MEGA_MOE_IB_ORD_COAL=1: COALESCED order pass. The per-token order pass (one thread per token, its top-k loads in
+    // flight) spent 28 of its 37 us at 1024 in the key pass: each warp-level load touched 32 different cache lines (lanes
+    // 152 B apart). Here a warp reads ONE token per load (lane = top-k slot: 19 x 8 B contiguous), 8 tokens in flight,
+    // reduces the key with a warp min, and keeps its buckets in its own shared-memory row (sequential in the warp: no
+    // atomics, no match_any).
+#if defined(DG_MEGA_MOE_IB_ORD_COAL) and DG_MEGA_MOE_IB_ORD_COAL
+    constexpr bool kIBOrdCoal = true;
+    DG_STATIC_ASSERT(kNumTopk <= 32, "ORD_COAL: one lane per top-k slot");
+#else
+    constexpr bool kIBOrdCoal = false;
+#endif
     // DG_MEGA_MOE_IB_PUT_FN=1: the SST / ORD blocks issue their puts through ONE shared non-inlined function (comm::gin_put_fn,
     // scalars and pointers by value) instead of inlining the Gin put at each site
 #if defined(DG_MEGA_MOE_IB_PUT_FN) and DG_MEGA_MOE_IB_PUT_FN
@@ -3082,7 +3093,98 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 IB_PUTV(gin_p, orig, reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(nr)));
             }
             __syncwarp();
-            if (kIBHeavy and not kIBSSTNB and ib_ord_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) {
+            if (kIBOrdCoal and kIBHeavy and not kIBSSTNB and ib_ord_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) {
+                constexpr uint32_t kOK = kNumExpertsPerRank + 1;
+                constexpr uint32_t kOWStride = 3 * kOK;
+                constexpr uint32_t kTB = 8;  // tokens in flight per warp
+                DG_STATIC_ASSERT(not kIBOrdCoal or (kNumEpilogueWarps + 2) * kOWStride * 2 + 4 <= sizeof(SharedStorage::smem_d), "ORD_COAL buckets in smem_d");
+                auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+                auto* const o_wh_all = reinterpret_cast<uint16_t*>(oh + kOWStride);
+                auto* const o_wh = o_wh_all + epilogue_warp_idx * kOWStride;
+                const auto idx32 = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffIdx);  // low halves
+                const uint32_t node_experts = kNumExpertsPerRank * ib_lsa;
+                if (ib_R > 3) __trap();
+                SL_TR(0, 43, epilogue_thread_idx == 0);
+                for (uint32_t i = epilogue_thread_idx; i < kOWStride + (kNumEpilogueWarps * kOWStride + 1) / 2; i += kNumEpilogueThreads)
+                    oh[i] = 0;
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 44, epilogue_thread_idx == 0);
+                // key of token t for remote-node slot nr: warp min over the lanes (= top-k slots) of the local expert index
+                const auto ord_key = [&](const uint32_t& e, const uint32_t& nr) {
+                    const bool valid = lane_idx < kNumTopk and static_cast<int>(e) >= 0;
+                    const uint32_t n = ib_num_nodes <= 4 ? (e >= node_experts ? 1u : 0u) + (e >= 2 * node_experts ? 1u : 0u) + (e >= 3 * node_experts ? 1u : 0u) : e / node_experts;
+                    const uint32_t slot = n - (n > ib_my_node ? 1u : 0u);
+                    return __reduce_min_sync(0xffffffffu, (valid and n != ib_my_node and slot == nr) ? e % kNumExpertsPerRank : kNumExpertsPerRank);
+                };
+                for (uint32_t t0 = epilogue_warp_idx; t0 < num_tokens; t0 += kNumEpilogueWarps * kTB) {
+                    uint32_t v[kTB];
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kTB; ++ b) {
+                        const uint32_t t = t0 + b * kNumEpilogueWarps;
+                        v[b] = (t < num_tokens and lane_idx < kNumTopk) ? __ldcg(idx32 + 2 * (t * kNumTopk + lane_idx)) : 0xffffffffu;
+                    }
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kTB; ++ b) {
+                        const uint32_t t = t0 + b * kNumEpilogueWarps;
+                        for (uint32_t nr = 0; nr < ib_R; ++ nr) {
+                            const uint32_t key = ord_key(v[b], nr);
+                            if (t < num_tokens and lane_idx == 0)
+                                o_wh[nr * kOK + key] += 1;
+                        }
+                    }
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 45, epilogue_thread_idx == 0);
+                for (uint32_t q = epilogue_thread_idx; q < ib_R * kOK; q += kNumEpilogueThreads) {
+                    uint32_t tot = 0;
+                    #pragma unroll
+                    for (uint32_t w = 0; w < kNumEpilogueWarps; ++ w) {
+                        const uint32_t c = o_wh_all[w * kOWStride + q];
+                        o_wh_all[w * kOWStride + q] = static_cast<uint16_t>(tot);
+                        tot += c;
+                    }
+                    oh[q] = tot;
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (epilogue_thread_idx < ib_R) {
+                    uint32_t run = 0;
+                    for (uint32_t key = 0; key < kOK; ++ key) {
+                        const uint32_t c = oh[epilogue_thread_idx * kOK + key];
+                        oh[epilogue_thread_idx * kOK + key] = run;
+                        run += c;
+                    }
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                for (uint32_t t0 = epilogue_warp_idx; t0 < num_tokens; t0 += kNumEpilogueWarps * kTB) {
+                    uint32_t v[kTB];
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kTB; ++ b) {
+                        const uint32_t t = t0 + b * kNumEpilogueWarps;
+                        v[b] = (t < num_tokens and lane_idx < kNumTopk) ? __ldcg(idx32 + 2 * (t * kNumTopk + lane_idx)) : 0xffffffffu;
+                    }
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kTB; ++ b) {
+                        const uint32_t t = t0 + b * kNumEpilogueWarps;
+                        for (uint32_t nr = 0; nr < ib_R; ++ nr) {
+                            const uint32_t key = ord_key(v[b], nr);
+                            if (t < num_tokens and lane_idx == 0) {
+                                const uint32_t pos = oh[nr * kOK + key] + o_wh[nr * kOK + key];
+                                o_wh[nr * kOK + key] += 1;
+                                ib_ord_pos(nr)[t] = pos;
+                                ib_ord_inv(nr)[pos] = t;
+                            }
+                        }
+                    }
+                }
+                SL_TR(0, 46, epilogue_thread_idx == 0);
+                __threadfence();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 47, epilogue_thread_idx == 0);
+                if (epilogue_thread_idx < ib_R)
+                    ptx::st_rel(ib_xo_flag + 240 + epilogue_thread_idx, ib_epoch);
+                SL_TR(0, 40, epilogue_thread_idx == 0);  // order published
+            }
+            if (not kIBOrdCoal and kIBHeavy and not kIBSSTNB and ib_ord_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) {
                 constexpr uint32_t kOK = kNumExpertsPerRank + 1;  // buckets per node (the last: no pick on the node)
                 constexpr uint32_t kOT = math::constexpr_ceil_div(static_cast<uint32_t>(kIBT), kNumEpilogueThreads);
                 auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);

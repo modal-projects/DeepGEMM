@@ -3887,7 +3887,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // SB & 32: header on the idx / weight QP from its own thread, started DG_MEGA_MOE_IB_SB_HDR_NS after the data puts
             // (they have reserved their queue slots by then, so it lands behind them without waiting for them to return)
 #ifndef DG_MEGA_MOE_IB_SB_HDR_NS
-#define DG_MEGA_MOE_IB_SB_HDR_NS 3000
+#define DG_MEGA_MOE_IB_SB_HDR_NS 5000
 #endif
             const bool sb_hdr_timed = (kIBSB & 32) != 0 and ib_sb;
             const bool sb_hdr_last = (kIBSB & 8) != 0 and ib_sb and not sb_hdr_timed;

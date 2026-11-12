@@ -4369,6 +4369,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (q < 256)
                             IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + q) != ib_epoch, (void) 0, "ws_post", nr, c);
                     }
+                    SL_TR(0, 56, c0 == 0);  // poster: first group's chunks all staged (slowest node)
 #if defined(DG_MEGA_MOE_IB_DBG_XLATE) and DG_MEGA_MOE_IB_DBG_XLATE
                     // Debug proof knob: rank 0 issues its LAST ordered x put to remote node slot 0 DBG_XLATE ns late (a put
                     // whose source bytes must stay stable until it is issued and read: the C3_SPLIT scratch alias case)
@@ -5920,6 +5921,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                        sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(48), mu(49), mu(50), mu(51), mu(52), mu(53), mu(54), mu(55));
             }
 #endif
+            if constexpr (kIBOrd > 0) {
+                const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_TRACEO rank=%u epoch=%llu | ord: first_group_staged=%.1f\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(56));
+            }
             if constexpr (kIBSB > 0) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
                 printf("OPUS_TRACESB rank=%u epoch=%llu | sb: meta_issued=%.1f poster_warm=%.1f flags_seen=%.1f on=%d\n",

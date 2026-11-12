@@ -3108,8 +3108,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k) {
                             const int e = static_cast<int>(v[k]);
-                            if (e >= 0 and static_cast<uint32_t>(e) / node_experts != ib_my_node) {
-                                const uint32_t sh = 8 * ib_nr_of_node(static_cast<uint32_t>(e) / node_experts);
+                            const uint32_t eu = static_cast<uint32_t>(e);
+                            const bool o_cmp = kIBSSTFast and ib_num_nodes <= 4;
+                            const uint32_t o_n = o_cmp ? (eu >= node_experts ? 1u : 0u) + (eu >= 2 * node_experts ? 1u : 0u) + (eu >= 3 * node_experts ? 1u : 0u) : eu / node_experts;
+                            if (e >= 0 and o_n != ib_my_node) {
+                                const uint32_t sh = 8 * ib_nr_of_node(o_n);
                                 const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
                                 if (le < ((packed >> sh) & 0xffu))
                                     packed = (packed & ~(0xffu << sh)) | (le << sh);
@@ -3405,6 +3408,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto* const sst_nstart = sst_wsum + kNumEpilogueWarps;  // [node] first entry of the node's experts, [nodes] total
                 const uint32_t sst_node_experts = kNumExpertsPerRank * ib_lsa;
                 const uint32_t sst_ne = num_tokens * kNumTopk;
+                // No runtime divisions per entry (ib_lsa is not a constant): own-node range test, node slot by compares
+                const uint32_t sst_lo = ib_my_node * sst_node_experts, sst_hi = sst_lo + sst_node_experts;
+                const bool sst_cmp = kIBSSTFast and ib_num_nodes <= 4;
+                const auto sst_remote = [&](const uint32_t& e) { return sst_cmp ? (e < sst_lo or e >= sst_hi) : e / sst_node_experts != ib_my_node; };
+                const auto sst_nr_of = [&](const uint32_t& e) {
+                    if (not sst_cmp) return ib_nr_of_node(e / sst_node_experts);
+                    const uint32_t n = (e >= sst_node_experts ? 1u : 0u) + (e >= 2 * sst_node_experts ? 1u : 0u) + (e >= 3 * sst_node_experts ? 1u : 0u);
+                    return n - (n > ib_my_node ? 1u : 0u);
+                };
                 const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;  // our own node's slot: unused locally
                 constexpr uint32_t kSSTB = kIBSSTFast ? 16 : 8;  // loads in flight per thread
                 const auto in_idx32 = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffIdx);  // low halves (little endian)
@@ -3424,7 +3436,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                         const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                        if (i < sst_ne and e >= 0 and static_cast<uint32_t>(e) / sst_node_experts != ib_my_node)
+                        if (i < sst_ne and e >= 0 and sst_remote(static_cast<uint32_t>(e)))
                             atomicAdd_block(c16 + static_cast<uint32_t>(e) / 2, 1u << (16 * (static_cast<uint32_t>(e) & 1u)));
                     }
                 }
@@ -3497,19 +3509,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                         const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                        const bool ok = i < sst_ne and e >= 0 and static_cast<uint32_t>(e) / sst_node_experts != ib_my_node;
+                        const bool ok = i < sst_ne and e >= 0 and sst_remote(static_cast<uint32_t>(e));
                         xr[u] = i / kNumTopk;
                         if (sst_wave and ok)
-                            xr[u] = __ldcg(sst_pos_g + static_cast<int64_t>(ib_nr_of_node(static_cast<uint32_t>(e) / sst_node_experts)) * kIBT + i / kNumTopk);
+                            xr[u] = __ldcg(sst_pos_g + static_cast<int64_t>(sst_nr_of(static_cast<uint32_t>(e))) * kIBT + i / kNumTopk);
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                         const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                        if (i < sst_ne and e >= 0 and static_cast<uint32_t>(e) / sst_node_experts != ib_my_node) {
+                        if (i < sst_ne and e >= 0 and sst_remote(static_cast<uint32_t>(e))) {
                             const uint32_t sh = 16 * (static_cast<uint32_t>(e) & 1u);
                             const uint32_t pos = (atomicAdd_block(c16 + static_cast<uint32_t>(e) / 2, 1u << sh) >> sh) & 0xffffu;
-                            const uint32_t nr = ib_nr_of_node(static_cast<uint32_t>(e) / sst_node_experts);
+                            const uint32_t nr = sst_nr_of(static_cast<uint32_t>(e));
                             reinterpret_cast<uint32_t*>(stg + static_cast<int64_t>(nr + 1) * sst_cb)[pos] = kIBPacked ? (i | (xr[u] << 16)) : i;
                         }
                     }

@@ -1381,6 +1381,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_pcomb_c = [&](const uint32_t& n, const uint32_t& c) {
         return c == 0 ? ib_pcomb(n) : ib_tail + ib_num_nodes * kIBNodeStride + (static_cast<int64_t>(c - 1) * ib_num_nodes + n) * kIBPCombStride; };
     const auto ib_fstage = [&](const uint32_t& n) { return ib_pcomb(n) + kIBPCombStride; };
+    // Base of the C3_SPLIT scratch (see the source combine): last 2 slot regions of our own node's proxy-combine region
+#if defined(DG_MEGA_MOE_IB_C3_SCRATCH_OLD) and DG_MEGA_MOE_IB_C3_SCRATCH_OLD
+    const auto ib_c3_scratch_base = [&]() { return ib_pcomb(ib_my_node); };
+#else
+    DG_STATIC_ASSERT(static_cast<int64_t>(kNumRanks / 4) * kIBT * kIBTokBytes + kIBT * static_cast<int64_t>(kHidden) * 4 <= kIBPCombStride,
+                     "C3_SPLIT scratch (last 2 slot regions of the own-node proxy-combine region) must not reach the x staging at its start");
+    const auto ib_c3_scratch_base = [&]() { return ib_pcomb(ib_my_node) + kIBPCombStride - kIBT * static_cast<int64_t>(kHidden) * 4; };
+#endif
     const auto ib_ptab = [&](const uint32_t& n) { return reinterpret_cast<uint32_t*>(ib_fstage(n) + kIBFStageStride); };
     const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
     const auto ib_atom_add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
@@ -5406,6 +5414,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t t0 = c0 * kIBChunk, t1 = cute::min(c1 * kIBChunk, num_tokens);
                     IB_PUT(gin_x, orig, ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(t0) * kIBTokBytes, x_stage + static_cast<int64_t>(t0) * kIBTokBytes,
                               static_cast<uint64_t>(t1 - t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, n));
+#if defined(DG_MEGA_MOE_IB_C3_SCRATCH_POISON) and DG_MEGA_MOE_IB_C3_SCRATCH_POISON
+                    // DEBUG (deterministic form of the scratch / x-staging alias): right after the LAST ordered x put of node slot 0
+                    // was issued, write a finite pattern into the C3_SPLIT scratch where pass 0 of the source combine would later
+                    // park sums that share bytes with this put's rows. Old scratch place: the NIC has not read the rows yet, the
+                    // remote node gets the pattern -> the check fails on every launch. New place: nothing aliases -> PASS.
+                    if (nr == 0 and c1 == num_x_chunks) {
+                        const auto ps = reinterpret_cast<uint4*>(ib_c3_scratch_base() + static_cast<int64_t>(t0) * kIBTokBytes);
+                        for (int64_t u = 0; u < static_cast<int64_t>(t1 - t0) * kIBTokBytes / 16; ++ u)
+                            ps[u] = uint4{0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u};
+                    }
+#endif
                     SL_TR(0, 28, true);
                     SL_TR(0, 38, c0 == 0);  // first wave piece issued (slowest node)
                     IB_TRACE_MAX(7, true);
@@ -6524,13 +6543,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // x rows = finite wrong values on one counterpart pair, no hang, stats matching (gf_soak 2026-11-12: plain OMB @512, ranks 2 and
         // 10 = node 0 <-> node 1 = each other's node slot 0; about once per 1000+ launches). Only strings with ORD / WAVE_SORT stage x.
         // Fix: the scratch is the LAST 2 slot regions of the own-node region. DG_MEGA_MOE_IB_C3_SCRATCH_OLD=1: the old place (A/B only).
-#if defined(DG_MEGA_MOE_IB_C3_SCRATCH_OLD) and DG_MEGA_MOE_IB_C3_SCRATCH_OLD
-        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node));
-#else
-        DG_STATIC_ASSERT(static_cast<int64_t>(kNumRanks / 4) * kIBT * kIBTokBytes + kIBT * static_cast<int64_t>(kHidden) * 4 <= kIBPCombStride,
-                         "C3_SPLIT scratch (last 2 slot regions of the own-node proxy-combine region) must not reach the x staging at its start");
-        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node) + kIBPCombStride - kIBT * static_cast<int64_t>(kHidden) * 4);
-#endif
+        const auto c3_scratch = reinterpret_cast<float*>(ib_c3_scratch_base());
 #else
         constexpr bool kC3Split = false;
         float* const c3_scratch = nullptr;

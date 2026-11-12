@@ -1589,6 +1589,74 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         // FWD_ROTATE: start slot, computed once (local decision, any value is correct); only from DG_MEGA_MOE_IB_FWD_ROTATE_MIN tokens on
         const uint32_t rot0 = (kIBFwdRotate and num_tokens >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN) ? global_warp % fi_R : 0u;
+<<<<<<< HEAD
+=======
+        // DG_MEGA_MOE_IB_FWD_TOK=P (small-batch tail; P = 1, 2 or 4 items per token): the forward-combine for sources of at most
+        // DG_MEGA_MOE_IB_FWD_TOK_MAX tokens. Why: at <= 256 tokens every expert has one block and the last ~30% of the routed L2
+        // tasks run in an L2-only burst, so ~75-80% of the records complete inside the last ~10-20 us of L2 (traced: EP16 128,
+        // record 32 of 128 in wave order completes 12 us before the last one). Today's items (token quarter, slots in top-k
+        // order, ~9 us of serial HBM round trips each) are then throughput-bound: EP32 128 has 1152 items for 592 warps in that
+        // window, and the 32-record chunks of all nodes are put within ~4 us of each other, which queues them on the source NIC.
+        //  (1) An item is a token (or half / quarter), claimed from ONE counter round-robin over the remote nodes in wave order,
+        //      so the late records of every node have a warp waiting on them long before their partials land.
+        //  (2) The warp folds the token's node-local slots in ascending local-expert order (= arrival order: every GPU runs its
+        //      experts in index order) into an fp32 sum parked in our own node's unused proxy-combine region; when the last
+        //      partial lands only that one slot is left: per hidden quarter one load round (slot pieces + parked sum), quantize,
+        //      store. The fp32 sum order is therefore local-expert order, not top-k order (rounding-level difference).
+        //  (3) Completion is counted per FWD_TOK_UNIT records; ONE dedicated dispatch warp per remote node (warm: it issues an
+        //      8-byte put when it starts) puts every run of completed units as one put, in order, on one context, so records
+        //      leave as they complete instead of in 32-record chunks issued by cold threads.
+        // Local to the proxy: record format, positions and readiness are unchanged (the source polls every record byte).
+        // Dead control: DG_MEGA_MOE_IB_FWD_TOK_MAX=1 (compiled in, never taken for >= 2 tokens).
+        bool tok_skip = false;
+#if defined(DG_MEGA_MOE_IB_FWD_TOK) and DG_MEGA_MOE_IB_FWD_TOK
+        {
+            // Out of line on purpose: compiled into the kernel body this block cost +147 us at EP16 128 WITHOUT running (dead control,
+            // csc2 tok_cg: the body's register allocation); as a real function with by-value arguments it has its own allocation
+            DG_STATIC_ASSERT(kIBFwdDyn and kIBReduceOnArrival and kIBFp8Combine and kIBRetGroups == 0 and kIBRetGroup == 1 and
+                             not kIBFwdInterleave and not kIBDeferRearm, "FWD_TOK needs FWD_JOIN + fp8 records, no RET_GROUP / INTERLEAVE / DEFER_REARM");
+            DG_STATIC_ASSERT(kIBTabSlot == 0 and kIBTabPerm2 == 64 * kIBTabT and kIBTabT == kIBT and kIBTokBytes == kHidden and kIBSFBytes == kHidden / 32 and
+                             kIBRecBytes == kHidden + kHidden / 128 * 4 and kIBChunk == 32, "FWD_TOK layout mirror");
+            DG_STATIC_ASSERT(kNumDispatchWarps >= 2 and kNumSMs > 8 + 16, "FWD_TOK posters");
+            constexpr int64_t kTScrOff = 2 * kIBT * static_cast<int64_t>(kHidden) * 2;
+            const bool tok_rot = kIBRot and rot_rt;
+            const bool tok_work = DG_MEGA_MOE_IB_FWD_TOK_EPI or not from_epilogue;
+            DG_STATIC_ASSERT(DG_MEGA_MOE_IB_FWD_TOK_PARK != 2 or (not DG_MEGA_MOE_IB_FWD_TOK_EPI and kNumBytesPerPull >= kHidden),
+                             "FWD_TOK_PARK=2 parks one quarter's fp32 sum in the dispatch warp's pull buffer");
+            const int tok_poster = (not from_epilogue and warp_idx == 1 and sm_idx >= 8 and sm_idx < 8 + fi_R) ? static_cast<int>(sm_idx - 8) : -1;
+            uint8_t* tok_pc0 = ib_pcomb(0);
+            int64_t tok_pc_stride = kIBNodeStride;
+            uint32_t* tok_rot_mask = nullptr;
+            uint32_t* tok_rot_nt = nullptr;
+            if constexpr (kIBRot) {
+                if (tok_rot) {
+                    tok_pc0 = ib_pcomb_c(0, rot_b), tok_pc_stride = kIBPCombStride;
+                    tok_rot_mask = rot_mask(rot_b, 0), tok_rot_nt = rot_nt(rot_b);
+                }
+            }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+            uint64_t* const tok_tt = tl_ttrace;
+            uint32_t* const tok_tr32 = reinterpret_cast<uint32_t*>(tl_tseen + 128);
+#else
+            uint64_t* const tok_tt = nullptr;
+            uint32_t* const tok_tr32 = nullptr;
+#endif
+            tok_skip = ib_fwd_tok_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), DG_MEGA_MOE_IB_FWD_TOK, DG_MEGA_MOE_IB_FWD_TOK_UNIT,
+                                     DG_MEGA_MOE_IB_FWD_TOK_MAX, DG_MEGA_MOE_IB_FWD_TOK_PARK, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_TOK_WARM != 0>(
+                workspace.signals->ib_o_nt, &workspace.signals->ib_o_fitem[ib_parity][ib_my_node], &workspace.signals->ib_o_fchunk[ib_parity][0][0],
+                &workspace.signals->ib_o_fdone[ib_parity][0], workspace.signals->ib_o_order_ready, ib_epoch, ib_tab,
+                ib_mirror(ib_parity, 0), kIBNodeStride, kIBOffIdx, kIBOffSF, tok_pc0, tok_pc_stride, ib_fstage(0), ib_ret(ib_parity, ib_my_node), kIBRetHdr,
+                ib_pcomb(ib_my_node) + kTScrOff, kIBPCombStride - 2 * kTScrOff,  // between the x staging and the C3_SPLIT scratch
+                ib_my_node, ib_lsa, fi_R, sym_buffer.rank_idx,
+                kIBStreamCombine ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
+                kIBWaveSort ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
+                (kIBWaveSort or kIBStreamCombine), tok_rot_mask, tok_rot_nt, tok_poster, tok_work, from_epilogue,
+                &ib_dev_comm, ib_window, sym_buffer.base, ib_gin_active, &workspace.signals->ib_o_scratch,
+                tok_tt, tok_tr32, workspace.signals->ib_trace,
+                from_epilogue ? nullptr : reinterpret_cast<uint8_t*>(shared_storage.dispatch_send_buffer[warp_idx % kNumDispatchWarps]));
+        }
+#endif
+>>>>>>> 1086e13 (IB: C3_SPLIT scratch off the ordered-x staging area (silent wrong output with ORD / WAVE_SORT when an x put is still unsent at the source combine's pass 0))
         for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
             uint32_t nr = fi_on ? fi_g % fi_R : nr_it + rot0;
             if (kIBFwdRotate and nr >= fi_R) nr -= fi_R;
@@ -4364,6 +4432,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (q < 256)
                             IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + q) != ib_epoch, (void) 0, "ws_post", nr, c);
                     }
+#if defined(DG_MEGA_MOE_IB_DBG_XLATE) and DG_MEGA_MOE_IB_DBG_XLATE
+                    // Debug proof knob: rank 0 issues its LAST ordered x put to remote node slot 0 DBG_XLATE ns late (a put
+                    // whose source bytes must stay stable until it is issued and read: the C3_SPLIT scratch alias case)
+                    if (sym_buffer.rank_idx == 0 and nr == 0 and c1 == num_x_chunks) {
+                        uint64_t t0_, t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0_));
+                        do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); } while (t_ < t0_ + DG_MEGA_MOE_IB_DBG_XLATE);
+                    }
+#endif
                     const uint32_t t0 = c0 * kIBChunk, t1 = cute::min(c1 * kIBChunk, num_tokens);
                     IB_PUT(gin_x, orig, ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(t0) * kIBTokBytes, x_stage + static_cast<int64_t>(t0) * kIBTokBytes,
                               static_cast<uint64_t>(t1 - t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, n));
@@ -5451,7 +5527,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         constexpr bool kC3Split = kIBC3Split;
         DG_STATIC_ASSERT(not kIBC3Split or kNumTopk >= 2, "C3 split scratch");
-        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node));  // own node's slot: never used by the proxy
+        // C3_SPLIT scratch: our own node's proxy-combine region (never used by the proxy). It must NOT be the START of that region:
+        // the ordered / wave-sorted x sender stages its rows there (x_stage = ib_pcomb(ib_my_node) + nr * kIBT * kIBTokBytes) and the NIC
+        // reads them asynchronously after the put is issued. With the scratch at offset 0, pass 0 of the source combine (which only
+        // needs the NODE-LOCAL peers' L2) overwrote staged x rows of node slot 0 (and the first rows of slot 1) with fp32 sums; whenever
+        // an x put was still unsent at that time (a stalled / retransmitting QP: the > 1.5x launches), the remote node received garbage
+        // x rows = finite wrong values on one counterpart pair, no hang, stats matching (gf_soak 2026-11-12: plain OMB @512, ranks 2 and
+        // 10 = node 0 <-> node 1 = each other's node slot 0; about once per 1000+ launches). Only strings with ORD / WAVE_SORT stage x.
+        // Fix: the scratch is the LAST 2 slot regions of the own-node region. DG_MEGA_MOE_IB_C3_SCRATCH_OLD=1: the old place (A/B only).
+#if defined(DG_MEGA_MOE_IB_C3_SCRATCH_OLD) and DG_MEGA_MOE_IB_C3_SCRATCH_OLD
+        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node));
+#else
+        DG_STATIC_ASSERT(static_cast<int64_t>(kNumRanks / 4) * kIBT * kIBTokBytes + kIBT * static_cast<int64_t>(kHidden) * 4 <= kIBPCombStride,
+                         "C3_SPLIT scratch (last 2 slot regions of the own-node proxy-combine region) must not reach the x staging at its start");
+        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node) + kIBPCombStride - kIBT * static_cast<int64_t>(kHidden) * 4);
+#endif
 #else
         constexpr bool kC3Split = false;
         float* const c3_scratch = nullptr;

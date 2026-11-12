@@ -1100,15 +1100,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // sentinel, as after allocation; else the epoch of the launch whose rows it holds), nt[16], masks [R][T]. A launch that finds
     // the copy it is about to use still dirty (the launch in between was not a rotating one) re-arms it BEFORE the dispatch grid
     // sync, i.e. before the pre-pull barrier and any node peer's L2. An aborted launch traps and takes the buffer with it.
+    // PCOMB_ROT=2 (re-arm throughput): the deferred re-arm is a shared work queue (item = a quarter of one token's rows, claimed
+    // with one atomic) that the epilogue warps of every SM drain from kernel start, as soon as they have no D0 / D1 work left and
+    // before they wait for their first task; the dispatch warps take what is left at their count wait (which also guarantees
+    // the queue is empty before the kernel ends). With =1 only the dispatch warps re-arm (~0.9 TB/s: ~110 us for 97 MB at EP16),
+    // which overruns the count wait of the ordered start (EP32 MegaSeek: -18.6 on the legacy start, +8.8 on ordered supply).
+    // DG_MEGA_MOE_IB_PCOMB_ROT_DEAD=1: code-generation control: everything compiled in, a runtime condition keeps rotation off.
 #if defined(DG_MEGA_MOE_IB_PCOMB_ROT) and DG_MEGA_MOE_IB_PCOMB_ROT
     constexpr bool kIBRot = kIBReduceOnArrival;
+    constexpr uint32_t kIBRotMode = DG_MEGA_MOE_IB_PCOMB_ROT;
     DG_STATIC_ASSERT(kIBPCombCopies >= 3, "PCOMB_ROT needs DG_MEGA_MOE_IB_PCOMB_COPIES >= 3 (set when the buffer is allocated)");
     DG_STATIC_ASSERT(not kIBDeferRearm, "PCOMB_ROT excludes FWD_DEFER_REARM");
 #else
     constexpr bool kIBRot = false;
+    constexpr uint32_t kIBRotMode = 0;
+#endif
+#if defined(DG_MEGA_MOE_IB_PCOMB_ROT_DEAD) and DG_MEGA_MOE_IB_PCOMB_ROT_DEAD
+    const bool rot_rt = num_tokens > 0x7fffffffu;
+#else
+    constexpr bool rot_rt = true;
 #endif
     const uint32_t rot_b = 1 + ib_parity, rot_o = 2 - ib_parity;
-    const auto rot_pc = [&](const uint32_t& n) { return kIBRot ? ib_pcomb_c(n, rot_b) : ib_pcomb(n); };
+    const auto rot_pc = [&](const uint32_t& n) { return (kIBRot and rot_rt) ? ib_pcomb_c(n, rot_b) : ib_pcomb(n); };
+    const auto rot_claim = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 64); };
     const auto rot_hdr = [&](const uint32_t& c) { return reinterpret_cast<uint64_t*>(ib_pcomb_c(ib_my_node, c)); };
     const auto rot_nt = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 128); };
     const auto rot_mask = [&](const uint32_t& c, const uint32_t& nr) {
@@ -1133,6 +1147,39 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t u = lane_idx; u < kRowUnits; u += 32)
                         row[u] = ones;
                 }
+            }
+        }
+    };
+    // shared deferred re-arm of copy c (any warp, all 32 lanes): items claimed until none is left
+    const auto rot_work = [&](const uint32_t& c) {
+        constexpr uint32_t kRowUnits = kHidden * 2 / 16, kQ = 4, kQUnits = kRowUnits / kQ;
+        DG_STATIC_ASSERT(kQUnits * kQ == kRowUnits and kQUnits % 32 == 0, "PCOMB_ROT work item");
+        constexpr uint32_t kSlotMask = kNumTopk >= 32 ? 0xffffffffu : (1u << kNumTopk) - 1u;
+        const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        const uint32_t nrem = ib_num_nodes - 1;
+        uint32_t total = 0;
+        for (uint32_t nr = 0; nr < nrem; ++ nr)
+            total += cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr)) * kQ;
+        while (true) {
+            uint32_t g = 0;
+            if (lane_idx == 0) g = atomicAdd(rot_claim(c), 1u);
+            g = __shfl_sync(0xffffffffu, g, 0);
+            if (g >= total) break;
+            uint32_t nr = 0;
+            for (; nr + 1 < nrem; ++ nr) {
+                const uint32_t n_items = cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr)) * kQ;
+                if (g < n_items) break;
+                g -= n_items;
+            }
+            const uint32_t t = g / kQ, q = g % kQ;
+            uint32_t m = ptx::ld_volatile(rot_mask(c, nr) + t) & kSlotMask;
+            const auto base = ib_pcomb_c(ib_node_of_slot(nr), c);
+            while (m) {
+                const uint32_t k = __ffs(m) - 1;
+                m &= m - 1;
+                const auto row = reinterpret_cast<uint4*>(base + (static_cast<int64_t>(k) * kIBT + t) * kHidden * 2) + q * kQUnits;
+                for (uint32_t u = lane_idx; u < kQUnits; u += 32)
+                    row[u] = ones;
             }
         }
     };
@@ -1569,7 +1616,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             const auto ret_dst = ib_ret(ib_parity, ib_my_node);
             if constexpr (kIBRot) {
-                if (lane_idx == 0) rot_nt(rot_b)[nr] = nt;  // read by the launch that re-arms this copy (same value from every warp)
+                if (rot_rt and lane_idx == 0) rot_nt(rot_b)[nr] = nt;  // read by the launch that re-arms this copy (same value from every warp)
             }
             if (nt == 0 or (fi_on and fi_g / fi_R >= nt * (kIBRetGroups > 0 ? kIBRetGroups : 4))) {
                 if (not fi_on and is_leader)
@@ -1658,7 +1705,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 if constexpr (kIBRot) {
-                    if (qtr == 0 and lane_idx == 0) rot_mask(rot_b, nr)[t] = on_mask;  // PCOMB_ROT: the rows a later launch re-arms
+                    if (rot_rt and qtr == 0 and lane_idx == 0) rot_mask(rot_b, nr)[t] = on_mask;  // PCOMB_ROT: the rows a later launch re-arms
                 }
                 // Reduce node-local slots in top-k order (fp32): per slot, the item's pieces are loaded together
                 float2 acc[kPPI][4];
@@ -1699,8 +1746,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             if constexpr (kIBReduceOnArrival) {
                                 tt_miss |= ib_is_sentinel4(v[bb][i]);
                                 IB_POLL(ib_is_sentinel4(v[bb][i]), v[bb][i] = ib_ldv4(ptr), "c2_pcomb", t, k);
-                                if constexpr (not kIBDeferRearm and not kIBRot)
-                                    *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                                if constexpr (not kIBDeferRearm)
+                                    if (not (kIBRot and rot_rt))
+                                        *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
                             }
                             const auto b = reinterpret_cast<const nv_bfloat162*>(&v[bb][i]);
                             #pragma unroll
@@ -1887,7 +1935,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // PCOMB_ROT: state of the two rotating partial buffers, read by every SM before dispatch grid sync 0 (SM 0 rewrites it after)
         uint64_t rot_hb = ~0ull, rot_ho = ~0ull;
-        if constexpr (kIBRot) {
+        if constexpr (kIBRot) if (rot_rt) {
             rot_hb = ptx::ld_volatile(rot_hdr(rot_b));
             rot_ho = ptx::ld_volatile(rot_hdr(rot_o));
             // the buffer this launch's partials land in still holds an earlier launch's rows (the launch in between was not a
@@ -2000,8 +2048,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [&]() { return make_gin(0); }, ib_epoch, false, true, false);
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
         if constexpr (kIBRot) {
-            if (sm_idx == 0 and thread_idx == 0)
+            if (rot_rt and sm_idx == 0 and thread_idx == 0) {
+                *rot_claim(rot_b) = 0;       // its re-arm queue, drained by the next rotating launch
                 *rot_hdr(rot_b) = ib_epoch;  // from here on copy rot_b holds this launch's rows (every SM read the old state before grid sync 0)
+            }
         }
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -2068,8 +2118,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if constexpr (kIBRot) {
             // PCOMB_ROT: the previous rotating launch's rows sit in the copy this launch does not use: re-arm them while the counts
             // are in flight (every dispatch warp of every SM passes here on every path; nobody writes that copy before the next launch)
-            if (rot_ho != ~0ull)
-                rot_rearm(rot_o);
+            if (rot_rt and rot_ho != ~0ull) {
+                if constexpr (kIBRotMode >= 2) rot_work(rot_o);  // whatever the epilogue warps have not claimed yet
+                else rot_rearm(rot_o);
+            }
             TT_MAX(14, lane_idx == 0);  // trace: deferred re-arm done (OPUS_TRACE6 rearm_done), slowest warp
         }
 #endif
@@ -2774,7 +2826,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
 #endif
         if constexpr (kIBRot) {
-            if (sm_idx == 0 and thread_idx == 0 and rot_ho != ~0ull)
+            if (rot_rt and sm_idx == 0 and thread_idx == 0 and rot_ho != ~0ull)
                 *rot_hdr(rot_o) = ~0ull;  // every SM's dispatch warps re-armed their share of the other copy before their pulls
         }
         if (sm_idx == 0 and thread_idx == 0)
@@ -4638,6 +4690,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBRot and kIBRotMode >= 2) {
+            // PCOMB_ROT=2: no D0 / D1 work left on this SM and no task yet: help re-arm the copy the previous rotating launch wrote
+            // (its header stays "dirty" until SM 0 stamps it clean at the end of this kernel; the queue is its claim counter)
+            if (rot_rt and ptx::ld_volatile(rot_hdr(rot_o)) != ~0ull)
+                rot_work(rot_o);
+            TT_MAX(14, lane_idx == 0);
+        }
+#endif
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 

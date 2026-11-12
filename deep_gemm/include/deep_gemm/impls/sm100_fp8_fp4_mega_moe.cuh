@@ -1110,6 +1110,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSSTNB = false;
 #endif
+    // DG_MEGA_MOE_IB_WMARK=1 (with SST_NB): landing watermark. With early counts ~576 pull warps per GPU would spin on mirror
+    // rows the NIC is still writing (NVLink loads of NIC-written lines). Instead ONE thread per mirror on the proxy (a
+    // dispatch warp of SM 0, which never pulls) polls the last 16 bytes of each x row in row order (rows land in posting
+    // order per QP) and publishes "rows landed up to" in ordinary memory (ib_o_landed[source node][0], epoch-tagged); a
+    // pull waits for the watermark to pass its row (one lane, with a pause) and only then loads the row, still polling
+    // every unit for the sentinel as before, so the watermark is a hint and correctness / rule A are unchanged. The start
+    // message carries (epoch, ordered bit, num_tokens) 8 bytes ahead of the counts; a source that posts in token order
+    // (below ORD_MIN) is published as fully available.
+#if defined(DG_MEGA_MOE_IB_WMARK) and DG_MEGA_MOE_IB_WMARK
+    constexpr bool kIBWmark = kIBSSTNB;
+#else
+    constexpr bool kIBWmark = false;
+#endif
+    constexpr int64_t kNBHdr = kIBWmark ? 8 : 0;
     constexpr uint32_t kNBCap = kNumExperts / 2;  // experts per node (>= 2 nodes)
     constexpr uint32_t kNBKeys = kNumExpertsPerRank + 1;
     DG_STATIC_ASSERT(not kIBSSTNB or (kNBCap + kNumEpilogueWarps + 1 + kNBKeys) * 4 <= sizeof(SharedStorage::smem_d), "SST_NB counters in smem_d");
@@ -1719,6 +1733,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBWmark) {
+            // WMARK poller: SM 0's dispatch warp nr watches the mirror of our counterpart on remote node slot nr
+            if (sm_idx == 0 and warp_idx < ib_R and lane_idx == 0) {
+                const uint32_t nr = warp_idx, n = ib_node_of_slot(nr);
+                const auto mirp = ib_mirror(ib_parity, n);
+                const auto hw = reinterpret_cast<const uint64_t*>(mirp + kIBOffSTab - static_cast<int64_t>(kNumExpertsPerRank * ib_lsa) * 4 - 8);
+                auto* const wm = reinterpret_cast<volatile uint64_t*>(&workspace.signals->ib_o_landed[n][0]);
+                const uint64_t ep = ib_epoch & 0xffffffffull;
+                uint64_t h = ptx::ld_volatile(hw);
+                IB_POLL((h >> 32) != ep, h = ptx::ld_volatile(hw), "wm_hdr", nr, 0);
+                const uint32_t nt = static_cast<uint32_t>(h & 0x7fffffffull);
+                if (not ((h >> 31) & 1ull)) {
+                    *wm = (ep << 32) | 0x7fffffffull;  // token-order source: no gating
+                } else {
+                    uint32_t p = 0;
+                    constexpr uint32_t kWB = 16;  // row tails loaded per round
+                    while (p < nt) {
+                        uint4 v[kWB];
+                        #pragma unroll
+                        for (uint32_t b = 0; b < kWB; ++ b)
+                            v[b] = ib_ldv4(mirp + static_cast<int64_t>(cute::min(p + b, nt - 1) + 1) * kIBTokBytes - 16);
+                        uint32_t adv = 0;
+                        #pragma unroll
+                        for (uint32_t b = 0; b < kWB; ++ b)
+                            if (adv == b and p + b < nt and not ib_is_sentinel4(v[b])) adv = b + 1;
+                        if (adv) { p += adv; *wm = (ep << 32) | p; }
+                        else __nanosleep(100);
+                    }
+                    *wm = (ep << 32) | 0x7fffffffull;
+                }
+            }
+            __syncwarp();
+        }
+#endif
 
         // Pull token data and SF from remote ranks into local L1 buffer
         uint32_t pull_mbarrier_phase = 0;
@@ -1968,6 +2017,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             const uint32_t ib_xslot = ib_packed ? (src_token_topk_raw >> 16) : kIBWaveSort and ib_rem ?
                 ib_tab[kIBTabSlot + ib_k_of_rank(current_rank_in_expert_idx) * kIBTabT + src_token_idx] : src_token_idx;
+            if constexpr (kIBWmark) {
+                if (ib_rem and lane_idx == 0) {
+                    const auto wp = sym_buffer.map(reinterpret_cast<const uint64_t*>(&workspace.signals->ib_o_landed[current_rank_in_expert_idx / ib_lsa][0]), ib_proxy);
+                    uint64_t wv = ptx::ld_volatile(wp);
+                    IB_POLL((wv >> 32) != (ib_epoch & 0xffffffffull) or static_cast<uint32_t>(wv) <= ib_xslot,
+                            (__nanosleep(200), wv = ptx::ld_volatile(wp)), "wmark", current_rank_in_expert_idx, ib_xslot);
+                }
+                __syncwarp();
+            }
             const auto src_base_ptr = ib_rem ?
                 sym_buffer.map(ib_mir + static_cast<int64_t>(ib_xslot) * kIBTokBytes, ib_proxy) :
                 sym_buffer.map(reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()), current_rank_in_expert_idx);
@@ -2768,9 +2826,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint64_t ab = ptx::ld_volatile(ib_xo_flag + 251 + nr);
                     const uint32_t a = static_cast<uint32_t>(ab >> 32), b = static_cast<uint32_t>(ab);  // NB: a = 0, b = entries
                     const uint32_t cb = kNumExpertsPerRank * ib_lsa * 4;
-                    gin_w.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - cb,
+                    gin_w.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - cb - kNBHdr,
                               kIBSSTNB ? ib_nb_stg(nr) : ib_mirror(ib_parity, ib_my_node) + kIBOffCnt + static_cast<int64_t>(nr) * cb + static_cast<int64_t>(a) * 4,
-                              static_cast<uint64_t>(cb) + static_cast<uint64_t>(b - a) * 4, ib_cp(sym_buffer.rank_idx, n));
+                              static_cast<uint64_t>(kNBHdr) + static_cast<uint64_t>(cb) + static_cast<uint64_t>(b - a) * 4, ib_cp(sym_buffer.rank_idx, n));
                     SL_TR(0, 30, true);  // SST put issued (slowest lane)
                 }
             }
@@ -2859,7 +2917,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto* const oh = nb_tot + 1;
                 const auto in_idx = reinterpret_cast<const long long*>(ib_input_base + kIBOffIdx);
                 const bool ord = ib_ord_on(num_tokens);
-                auto* const stg_cnt = reinterpret_cast<uint32_t*>(ib_nb_stg(nr));
+                auto* const stg_cnt = reinterpret_cast<uint32_t*>(ib_nb_stg(nr) + kNBHdr);
+                if (kIBWmark and epilogue_thread_idx == 0)
+                    *reinterpret_cast<uint64_t*>(ib_nb_stg(nr)) = (ib_epoch << 32) | (ord ? 0x80000000ull : 0ull) | num_tokens;
                 auto* const stg_ent = stg_cnt + node_experts;
                 SL_TR(0, 33, epilogue_thread_idx == 0);
                 for (uint32_t i = epilogue_thread_idx; i < kNBCap + kNumEpilogueWarps + 1 + kNBKeys; i += kNumEpilogueThreads)
@@ -2966,8 +3026,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
                         const auto gin_s = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);  // header context
 #endif
-                        gin_s.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - static_cast<int64_t>(node_experts) * 4, ib_nb_stg(nr),
-                                  static_cast<uint64_t>(node_experts) * 4 + static_cast<uint64_t>(*nb_tot) * 4, ib_cp(sym_buffer.rank_idx, n));
+                        gin_s.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - static_cast<int64_t>(node_experts) * 4 - kNBHdr, ib_nb_stg(nr),
+                                  static_cast<uint64_t>(kNBHdr) + static_cast<uint64_t>(node_experts) * 4 + static_cast<uint64_t>(*nb_tot) * 4, ib_cp(sym_buffer.rank_idx, n));
                         SL_TR(0, 30, true);
                     }
                     if (ord)

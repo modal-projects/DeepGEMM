@@ -438,6 +438,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSST = false;
 #endif
+    // DG_MEGA_MOE_IB_OUTLINE=1: the SST / ORD sender and receiver blocks become non-inlined lambdas, so the code they add does
+    // not take part in the register allocation of the hot (MMA / epilogue / pull) loops of the one kernel function
+#if defined(DG_MEGA_MOE_IB_OUTLINE) and DG_MEGA_MOE_IB_OUTLINE
+#define DG_IB_OUTLINE_BEGIN [&]() __attribute__((noinline)) {
+#define DG_IB_OUTLINE_END }();
+#else
+#define DG_IB_OUTLINE_BEGIN {
+#define DG_IB_OUTLINE_END }
+#endif
     // Runtime gate of every SST path (both paths are compiled): DG_MEGA_MOE_IB_SST_DEAD=1 is the CODEGEN CONTROL arm: the SST /
     // ORD code is compiled in but the kernel runs the legacy path (the condition is a memory load the compiler cannot fold)
 #if defined(DG_MEGA_MOE_IB_SST_DEAD) and DG_MEGA_MOE_IB_SST_DEAD
@@ -2848,6 +2857,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
         IB_TRACE(23, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
         if (kIBSSTW and ib_sst) {
+            DG_IB_OUTLINE_BEGIN
             if (sm_idx + 2 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and (num_tokens > 0 or kIBSSTRPut)) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const auto gin_w = make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase);
@@ -2867,9 +2877,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             __syncwarp();
+            DG_IB_OUTLINE_END
         }
         // ORD: the order builder SM (see the knob)
         if constexpr (kIBOrd > 0) {
+            DG_IB_OUTLINE_BEGIN
             if (kIBPrewarm and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and ib_ord_on(num_tokens)) {
                 const uint32_t nr = lane_idx, orig = 2 * ib_R + nr % ib_xnctx();
                 make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase).put_value(
@@ -2936,9 +2948,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::st_rel(ib_xo_flag + 240 + epilogue_thread_idx, ib_epoch);
                 SL_TR(0, 40, epilogue_thread_idx == 0);  // order published
             }
+            DG_IB_OUTLINE_END
         }
         // SST_NB: one builder SM per remote node (see the knob)
         if (kIBSSTNB and ib_sst) {
+            DG_IB_OUTLINE_BEGIN
             const uint32_t nb_nr = kNumSMs - (kNumRanks - ib_lsa) - 5 - sm_idx;  // wraps to a huge value on the other SMs
             if (nb_nr < ib_R) {
                 const uint32_t nr = nb_nr, n = ib_node_of_slot(nr);
@@ -3108,8 +3122,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+            DG_IB_OUTLINE_END
         }
         if (kIBSST and not kIBSSTNB and ib_sst) {
+            DG_IB_OUTLINE_BEGIN
             if (sm_idx + 1 + (kNumRanks - ib_lsa) == kNumSMs) {
                 // SST build (see the knob). Counters: 16 bits per global expert, two per word (counts <= kIBT, cursors < 65536)
                 const auto in_idx = reinterpret_cast<const unsigned long long*>(ib_input_base + kIBOffIdx);
@@ -3261,6 +3277,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::st_rel(ib_xo_flag + 255, ib_epoch);
 #endif
             }
+            DG_IB_OUTLINE_END
         }
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
         if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
@@ -3702,6 +3719,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
         if constexpr (kIBWSPost > 0 or kIBOrd > 0) {
+            DG_IB_OUTLINE_BEGIN
             if (((kIBWSPost > 0 and ib_ws_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) or
                  (ib_ord_on(num_tokens) and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs)) and epilogue_warp_idx == 0 and
                 lane_idx + 1 < ib_num_nodes and num_tokens > 0) {
@@ -3735,6 +3753,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             __syncwarp();
+            DG_IB_OUTLINE_END
         }
         IB_TRACE(0, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
         // D1 (host scan; v1 had the proxy do this and push tables over NVLink, measured ~20 us slower): every GPU scans,
@@ -3832,6 +3851,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
 #endif
                 if (ib_sst) {
+                    DG_IB_OUTLINE_BEGIN
                     // SST: r's counts for this node ([node-local rank][local expert], ending at kIBOffSTab) and its entries
                     // (from kIBOffSTab) arrive in one early put. Publish our counts, copy our slice into the slot table
                     const uint32_t sst_n = ib_lsa * kNumExpertsPerRank;
@@ -3884,6 +3904,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (epilogue_thread_idx == 0)
                         ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
                     IB_TRACE_MAX(32, epilogue_thread_idx == 0);  // tables done
+                    DG_IB_OUTLINE_END
                 }
                 // SST: only r's proxy goes on (header, rule-A polls of idx / weights, return order); legacy path: everyone
                 if (not (ib_sst and proxy != sym_buffer.rank_idx)) {

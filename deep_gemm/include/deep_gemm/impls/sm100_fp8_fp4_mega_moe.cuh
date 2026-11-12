@@ -768,8 +768,11 @@ __device__ __noinline__ void ib_fwd_drain_fn(
 // round is NOT re-issued: spinning bulk loads would compete with the GEMM's weight stream). Re-arm as today (per unit, by the reader).
 // kLA: one-item lookahead of the claim -> order lookup -> top-k row chain (three serial round trips) under the bulk round, only
 // while the previous item found all its partials landed (throughput-bound); a warp that waited claims after its item, as today.
+// kDC: the item's chunk-counter atomic is issued after the fence as today, but its result is consumed (chunk put, done counter) only
+// once the NEXT item's bulk round and x loads are issued, so its round trip is not serial with them (a completed chunk's put is
+// issued ~1 round trip later; flushed before the warp leaves the node).
 // Returns the mbarrier phase.
-template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kSlots, uint32_t kSlotsPerBuf, bool kRetHdr, bool kLA, typename barrier_t>
+template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kSlots, uint32_t kSlotsPerBuf, bool kRetHdr, bool kLA, bool kDC, typename barrier_t>
 __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
     const uint32_t* o_nt, uint32_t* fitem, uint32_t* fchunk, uint32_t* fdone, const uint64_t* order_ready, const uint64_t epoch, const uint32_t* tab,
     uint8_t* mir0, const int64_t node_stride, const int64_t off_idx, const int64_t off_sf, uint8_t* pc0, const int64_t pc_stride, uint8_t* fst0,
@@ -787,6 +790,9 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
     DG_STATIC_ASSERT(kSlots >= 1 and kSlots <= 32 and kSlotsPerBuf >= 1, "FWD_BULK slots per round");
     DG_STATIC_ASSERT(kPPI * 32 * 16 == kQB and kQB * 4 == kHidden * 2 and kXU * 16 * 4 == kHidden, "FWD_BULK pieces");
     const uint32_t lane_idx = ptx::get_lane_idx();
+    // The pull waits on this mbarrier with its elected lane only, so only lane 0 holds the true phase; here every lane waits
+    // (a lane with the wrong parity would fall through the wait and read the buffer before the copy has landed)
+    phase = __shfl_sync(0xffffffffu, phase, 0);
     const bool rot = rot_mask0 != nullptr;
     const auto ldv4 = [](const void* ptr) {
         uint4 v;
@@ -839,6 +845,32 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                 }
             }
         };
+        // lane 0: the chunk counter's old value says whether this item completed chunk c; if so: done counter + the chunk's put
+        const auto finish = [&](const uint32_t& old, const uint32_t& c) {
+            const uint32_t size = cute::min(32u, nt - c * 32);
+            if (old + 1 != size * 4)
+                return;
+            const bool all = add_acq_rel(fdone + n, 1u) + 1 == nchunks;
+            const int64_t off = static_cast<int64_t>(c) * 32 * kRec;
+            const uint64_t t_pre = tt ? now() : 0ull;
+            if (gin_active)
+                comm::gin_put_fn(dev_comm, window, gin_base, c + nr, ret_dst + off, fst + off, static_cast<uint64_t>(size) * kRec, s);
+            if (tt) {
+                const uint64_t t_ = now();
+                atomicMax(reinterpret_cast<unsigned long long*>(tt + 4), static_cast<unsigned long long>(t_pre));
+                atomicMax(reinterpret_cast<unsigned long long*>(tt + 5), static_cast<unsigned long long>(t_));
+                atomicAdd(reinterpret_cast<unsigned long long*>(tt + 23), 1ull);
+                if (trace[5] > trace[16]) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 26), 1ull);
+                if (nr == 0 and c < 64) tt[64 + c] = t_;  // tl_tchunk
+                atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 14), static_cast<unsigned long long>(t_));
+                atomicMin(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 44), static_cast<unsigned long long>(t_));
+                atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 45), static_cast<unsigned long long>(t_));
+            }
+            if (all and kRetHdr and gin_active)
+                comm::gin_put_value_fn(dev_comm, window, gin_base, c + nr + 1, reinterpret_cast<uint64_t*>(ret_dst + ret_hdr), epoch, s);
+        };
+        bool pend = false;         // lane 0 (kDC): a chunk-counter result not yet consumed
+        uint32_t pend_old = 0, pend_c = 0;
         uint32_t item = claim();
         uint32_t t = 0;
         int e = -1;
@@ -885,6 +917,11 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                 #pragma unroll
                 for (uint32_t l = 0; l < 4; ++ l)
                     acc[i][l] = {0.f, 0.f};
+            if constexpr (kDC) {
+                if (pend) finish(pend_old, pend_c);
+                pend = false;
+                __syncwarp();
+            }
             bool miss = false;
             while (m) {
                 ptx::mbarrier_wait_and_flip_phase(mbar, phase);
@@ -947,10 +984,7 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
             if (lane_idx == 0) {
                 __threadfence();
                 const uint32_t c = p_rec / 32;
-                const uint32_t size = cute::min(32u, nt - c * 32);
-                const bool chunk_done = add_acq_rel(fchunk + n * kMaxUnits + c, 1u) + 1 == size * 4;
-                bool all = false;
-                if (chunk_done) all = add_acq_rel(fdone + n, 1u) + 1 == nchunks;
+                const uint32_t old = add_acq_rel(fchunk + n * kMaxUnits + c, 1u);
                 if (tt) {
                     const uint64_t t_ = now();
                     atomicMax(reinterpret_cast<unsigned long long*>(tt + 3), static_cast<unsigned long long>(t_));
@@ -958,25 +992,8 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                     if (miss) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 17), 1ull);
                     else atomicAdd(reinterpret_cast<unsigned long long*>(tt + 20), static_cast<unsigned long long>(t_ - tt0));
                 }
-                if (chunk_done) {
-                    const int64_t off = static_cast<int64_t>(c) * 32 * kRec;
-                    const uint64_t t_pre = tt ? now() : 0ull;
-                    if (gin_active)
-                        comm::gin_put_fn(dev_comm, window, gin_base, c + nr, ret_dst + off, fst + off, static_cast<uint64_t>(size) * kRec, s);
-                    if (tt) {
-                        const uint64_t t_ = now();
-                        atomicMax(reinterpret_cast<unsigned long long*>(tt + 4), static_cast<unsigned long long>(t_pre));
-                        atomicMax(reinterpret_cast<unsigned long long*>(tt + 5), static_cast<unsigned long long>(t_));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(tt + 23), 1ull);
-                        if (trace[5] > trace[16]) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 26), 1ull);
-                        if (nr == 0 and c < 64) tt[64 + c] = t_;  // tl_tchunk
-                        atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 14), static_cast<unsigned long long>(t_));
-                        atomicMin(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 44), static_cast<unsigned long long>(t_));
-                        atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 45), static_cast<unsigned long long>(t_));
-                    }
-                    if (all and kRetHdr and gin_active)
-                        comm::gin_put_value_fn(dev_comm, window, gin_base, c + nr + 1, reinterpret_cast<uint64_t*>(ret_dst + ret_hdr), epoch, s);
-                }
+                if constexpr (kDC) pend = true, pend_old = old, pend_c = c;
+                else finish(old, c);
             }
             __syncwarp();
             prev_miss = miss;
@@ -986,6 +1003,10 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                 item = claim();
                 if (item < num_items) t = tok_of(item), e = idx_of(t);
             }
+        }
+        if constexpr (kDC) {
+            if (pend) finish(pend_old, pend_c);
+            __syncwarp();
         }
     }
     return phase;
@@ -3135,6 +3156,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_SLOTS
 #define DG_MEGA_MOE_IB_FWD_BULK_SLOTS 32  // cap on the quarter-rows per bulk round (default: all the warp's pull buffers hold)
 #endif
+#ifndef DG_MEGA_MOE_IB_FWD_BULK_DC
+#define DG_MEGA_MOE_IB_FWD_BULK_DC 0      // 1: the chunk-counter result is consumed under the next item's bulk round
+#endif
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_LA
 #define DG_MEGA_MOE_IB_FWD_BULK_LA 0      // 1: one-item lookahead of the claim / order lookup / top-k row chain
 #endif
@@ -3175,7 +3199,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
         uint64_t* const bk_tt = nullptr;
 #endif
-        return ib_fwd_bulk_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), kBkSlots, kBkPerBuf, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_BULK_LA != 0, Barrier>(
+        return ib_fwd_bulk_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), kBkSlots, kBkPerBuf, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_BULK_LA != 0, DG_MEGA_MOE_IB_FWD_BULK_DC != 0, Barrier>(
             workspace.signals->ib_o_nt, &workspace.signals->ib_o_fitem[ib_parity][0], &workspace.signals->ib_o_fchunk[ib_parity][0][0],
             &workspace.signals->ib_o_fdone[ib_parity][0], workspace.signals->ib_o_order_ready, ib_epoch, ib_tab,
             ib_mirror(ib_parity, 0), kIBNodeStride, kIBOffIdx, kIBOffSF, bk_pc0, bk_pc_stride, ib_fstage(0), ib_ret(ib_parity, ib_my_node), kIBRetHdr,

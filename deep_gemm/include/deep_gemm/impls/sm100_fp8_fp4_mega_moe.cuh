@@ -836,13 +836,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_FF_READ
 #define DG_MEGA_MOE_IB_FF_READ 1
 #endif
+// FF_SIG=4: relaxed counter increment issued inside the store loop by the row's first lane, right after its data op (no extra
+// metadata load, nothing after the task barrier). FF_WAIT=0 (timing only): the proxy does not wait on the counters.
+#ifndef DG_MEGA_MOE_IB_FF_WAIT
+#define DG_MEGA_MOE_IB_FF_WAIT 1
+#endif
 #if defined(DG_MEGA_MOE_IB_FUSED_FIN) and DG_MEGA_MOE_IB_FUSED_FIN
     constexpr bool kIBFused = kIBReduceOnArrival and kNumRanks > 16;
 #else
     constexpr bool kIBFused = false;
 #endif
     constexpr uint32_t kFFData = DG_MEGA_MOE_IB_FF_DATA, kFFSig = DG_MEGA_MOE_IB_FF_SIG, kFFRead = DG_MEGA_MOE_IB_FF_READ;
-    constexpr bool kFFClean = kFFData != 0 and kFFSig != 0 and kFFRead != 0;  // the sums are zero again at the end of a launch
+    constexpr bool kFFWait = DG_MEGA_MOE_IB_FF_WAIT != 0;
+    constexpr bool kFFClean = kFFData != 0 and kFFSig != 0 and kFFRead != 0 and kFFWait;  // the sums are zero again at the end of a launch
     constexpr int64_t kFFSlot = kIBT * kHidden * 2;
     constexpr uint32_t kFFNBlocks = L2_SHAPE_N / BLOCK_N;  // counter increments per (row, launch): one per L2 N-block task
     constexpr uint32_t kFFMagic = 0x46464e31u;
@@ -1334,7 +1340,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // FUSED_FIN: the node's L2 epilogues added this token's rows into one running sum; wait for the counter, then
                     // read this item's part of the sum and zero it for the next launch
                     if (m != 0) {
-                        if constexpr (kFFSig != 0) {
+                        if constexpr (kFFSig != 0 and kFFWait) {
                             const uint32_t expected = static_cast<uint32_t>(__popc(m)) * kFFNBlocks;
                             const auto cp = ff_cnt(n) + t;
                             uint32_t cv = ptx::ld_acq_sys(cp);
@@ -3926,12 +3932,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     asm volatile("red.relaxed.sys.global.add.noftz.v4.bf16x2 [%0], {%1, %2, %3, %4};"
                                                  : : "l"(ap), "r"(pk->x), "r"(pk->y), "r"(pk->z), "r"(pk->w) : "memory");
                                 }
+                                if constexpr (kFFSig == 4) {
+                                    if (lane_idx % 16 == 0)
+                                        asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(sym_buffer.map(
+                                            ff_cnt(dst_rank_idx / ib_lsa) + dst_token_idx, ib_cp(dst_rank_idx, ib_my_node))) : "memory");
+                                }
                                 continue;
                             }
                             const auto off = reinterpret_cast<const uint8_t*>(dst_ptr) -
                                 reinterpret_cast<const uint8_t*>(buffer.combine_token_buffer.get_base_ptr());
                             *sym_buffer.map(reinterpret_cast<float4*>(ib_pcomb(dst_rank_idx / ib_lsa) + off),
                                             ib_cp(dst_rank_idx, ib_my_node)) = packed;
+                            if constexpr (kIBFused and kFFSig == 4) {
+                                if (lane_idx % 16 == 0)
+                                    asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(sym_buffer.map(
+                                        ff_cnt(dst_rank_idx / ib_lsa) + dst_token_idx, ib_cp(dst_rank_idx, ib_my_node))) : "memory");
+                            }
                             continue;
                         }
                         if constexpr (kIBFusedSrc) {
@@ -3951,7 +3967,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-                if constexpr (kIBFused and kFFSig != 0) {
+                if constexpr (kIBFused and (kFFSig == 1 or kFFSig == 2)) {
                     // FUSED_FIN completion signal: every thread of this CTA that added a part of these rows has passed the barrier
                     // above, so a release here covers all of them (base causality order through the barrier). One increment per
                     // (row, N-block task) on the source token's counter at the proxy.

@@ -936,6 +936,9 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                     #pragma unroll
                     for (uint32_t i = 0; i < kPPI; ++ i)
                         v[i] = ptx::ld_shared(reinterpret_cast<const uint4*>(sp + (i * 32 + lane_idx) * 16));
+#if defined(DG_MEGA_MOE_IB_FWD_BULK_VERIFY) and DG_MEGA_MOE_IB_FWD_BULK_VERIFY
+                    bool vbad = false;
+#endif
                     #pragma unroll
                     for (uint32_t i = 0; i < kPPI; ++ i) {
                         const auto ptr = row + (i * 32 + lane_idx) * 16;
@@ -943,6 +946,19 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                             miss = true;
                             BLK_POLL(sent4(v[i]), v[i] = ldv4(ptr), "blk_pcomb", t, k);
                         }
+#if defined(DG_MEGA_MOE_IB_FWD_BULK_VERIFY) and DG_MEGA_MOE_IB_FWD_BULK_VERIFY
+                        {   // debug: the unit as the buffer holds it now (it has landed: nobody writes it until our re-arm)
+                            const uint4 w = ldv4(ptr);
+                            if (w.x != v[i].x or w.y != v[i].y or w.z != v[i].z or w.w != v[i].w or sent4(v[i])) {
+                                printf("OPUS_BULKDIFF rank=%u sm=%u thread=%u t=%u k=%u q=%u i=%u j=%u smem=%08x.%08x.%08x.%08x mem=%08x.%08x.%08x.%08x epoch=%llu\n",
+                                       rank_idx, ptx::get_sm_idx(), threadIdx.x, t, k, q, i, j, v[i].x, v[i].y, v[i].z, v[i].w, w.x, w.y, w.z, w.w,
+                                       (unsigned long long) epoch);
+                                v[i] = w;
+                                vbad = true;
+                            }
+                        }
+                        if (i + 1 == kPPI and __any_sync(0xffffffffu, vbad)) asm volatile("trap;");  // after every lane of the warp has printed
+#endif
                         if (not rot)
                             *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
                         const auto bb = reinterpret_cast<const nv_bfloat162*>(&v[i]);

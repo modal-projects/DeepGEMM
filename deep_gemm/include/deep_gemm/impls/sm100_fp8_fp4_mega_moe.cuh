@@ -2005,6 +2005,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const uint32_t kNumGlobalWarps = ib_pull_sms == kNumSMs and ib_pull_sm0 == 0 ? kNumGlobalWarpsAll : (ib_pull_sms - ib_pull_sm0) * kNumPullWarps;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         uint64_t ib_order_seen = 0;  // remote sources whose order tables our D1 has published (bit k)
+        // DG_MEGA_MOE_IB_SST_LEAN=1: nothing of SST inside the pull row loop. Every pulling warp waits ONCE, before its
+        // first row, until the slot tables of all remote sources are ready (plain spin, no printf / trap path), and the
+        // rule-A weight re-poll is a two-instruction spin. (The per-row table-ready test and the IB_POLL bodies inside the
+        // row loop cost +12 us at EP16 1024 even when they never execute: start c16e.)
+#if defined(DG_MEGA_MOE_IB_SST_LEAN) and DG_MEGA_MOE_IB_SST_LEAN
+        constexpr bool kIBSSTLean = true;
+        if (ib_sst and sm_idx >= ib_pull_sm0 and sm_idx < ib_pull_sms) {
+            if (lane_idx == 0) {
+                for (uint32_t k_t = 0; k_t < kNumRanks - sym_buffer.num_lsa_ranks; ++ k_t)
+                    while (ptx::ld_acq_sys(&workspace.signals->ib_o_tab_ready[k_t]) != ib_epoch);
+            }
+            __syncwarp();
+        }
+#else
+        constexpr bool kIBSSTLean = false;
+#endif
 #endif
         for (uint32_t token_idx = (sm_idx - ib_pull_sm0) * kNumPullWarps + warp_idx;
              sm_idx >= ib_pull_sm0 and sm_idx < ib_pull_sms and not (kSkipLastPullWarp and warp_idx >= kNumPullWarps) and not is_flag_warp; token_idx += kNumGlobalWarps) {
@@ -2112,7 +2128,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if (kIBEarlyPublish or (ib_sst and not (kCGDrop & 8))) {
+            if (kIBEarlyPublish or (ib_sst and not kIBSSTLean and not (kCGDrop & 8))) {
                 // SPLIT_SCAN: counts went out before the slot table of this remote source was written
                 if (is_remote(current_rank_in_expert_idx)) {
                     const uint32_t k_t = ib_k_of_rank(current_rank_in_expert_idx);
@@ -2236,7 +2252,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 ib_w_pre = ib_rem ?
                     *sym_buffer.map(reinterpret_cast<const float*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy) :
                     *sym_buffer.map(buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
-                if (kIBSenderTables or (ib_sst and not (kCGDrop & 8))) {  // rule A: no scan polled this weight
+                if constexpr (kIBSSTLean) {
+                    if (ib_sst and ib_rem) {
+                        const auto wp = sym_buffer.map(reinterpret_cast<const uint32_t*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy);
+                        uint32_t wb = __float_as_uint(ib_w_pre);
+                        while (wb == 0xffffffffu) wb = ptx::ld_volatile(wp);
+                        ib_w_pre = __uint_as_float(wb);
+                    }
+                }
+                if (kIBSenderTables or (ib_sst and not kIBSSTLean and not (kCGDrop & 8))) {  // rule A: no scan polled this weight
                     if (ib_rem) {
                         const auto wp = sym_buffer.map(reinterpret_cast<const uint32_t*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy);
                         uint32_t wb = __float_as_uint(ib_w_pre);

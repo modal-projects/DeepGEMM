@@ -529,9 +529,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
 #define IB_BACKOFF(n) do {} while (0)
 #endif
+// DG_MEGA_MOE_IB_NO_DIAG=1 (start side, 4da26f2): poll loops without the timeout diagnostics (no clock64, no printf argument set-up, no
+// trap path): ~40 sites, several inside hot loops (EP16 MegaSeek 1024: -22 us). A protocol bug then spins until the request
+// timeout instead of trapping with a message: debug with diagnostics on, measure with NO_DIAG.
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
+#define IB_POLL(cond, reload, tag, a, b) do { uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; } } while (0)
+#else
 #define IB_POLL(cond, reload, tag, a, b) do { const long long t0_ = clock64(); uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; \
         if (clock64() - t0_ > (1ll << 34)) { printf("OPUS_HANG %s rank=%u sm=%u warp=%u lane=%u a=%u b=%u epoch=%llu\n", tag, \
             sym_buffer.rank_idx, sm_idx, warp_idx, lane_idx, (unsigned) (a), (unsigned) (b), (unsigned long long) ib_epoch); asm volatile("trap;"); } } } while (0)
+#endif
 #endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
@@ -4360,8 +4367,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 // rows + counter: the counter is the flag, so the row store must be a strong system-scope write
                                 const auto rp = sym_buffer.map(reinterpret_cast<float4*>(rot_pc(dst_rank_idx / ib_lsa) + off), ib_cp(dst_rank_idx, ib_my_node));
                                 const auto pk = reinterpret_cast<const uint4*>(&packed);
+#if defined(DG_MEGA_MOE_IB_FF_ROWS_WEAK) and DG_MEGA_MOE_IB_FF_ROWS_WEAK
+                                // mechanism arm: exactly today's plain store (not covered by the memory model across threads)
+                                *reinterpret_cast<float4*>(rp) = packed;
+                                (void) pk;
+#else
                                 asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};"
                                              : : "l"(rp), "r"(pk->x), "r"(pk->y), "r"(pk->z), "r"(pk->w) : "memory");
+#endif
                             } else {
                                 *sym_buffer.map(reinterpret_cast<float4*>(rot_pc(dst_rank_idx / ib_lsa) + off),
                                                 ib_cp(dst_rank_idx, ib_my_node)) = packed;

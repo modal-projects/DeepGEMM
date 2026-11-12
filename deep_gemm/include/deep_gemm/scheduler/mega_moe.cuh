@@ -470,7 +470,7 @@ struct MegaMoEScheduler {
 
     template <BlockPhase kBlockPhase, uint32_t kShapeN, uint32_t kShapeK>
     CUTLASS_DEVICE void shared_mainloop(const uint32_t& num_tokens, const uint32_t& lane_idx, const uint32_t* task_count_ptr,
-                                        const bool& yield_on_counts = false) {
+                                        const bool& yield_on_counts = false, uint32_t max_claims = 0xffffffffu) {
         constexpr uint32_t kNumNClusters = kShapeN / BLOCK_N / 2;
         DG_STATIC_ASSERT(kNumNClusters % kNumLocalityDomains == 0, "Each domain must take whole clusters");
         const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
@@ -480,6 +480,10 @@ struct MegaMoEScheduler {
             // ROUTED_FIRST: stop claiming shared tasks once the routed counts are known (the rest run after the routed ones)
             if (yield_on_counts and expert_recv_count_ready())
                 break;
+#if defined(DG_MEGA_MOE_IB_FWD_RETIRE_SHARED) and DG_MEGA_MOE_IB_FWD_RETIRE_SHARED
+            if (max_claims -- == 0)  // (FWD_RETIRE_SHARED: a quota of the dynamically claimed tasks)
+                break;
+#endif
 
             // Use dynamic scheduling to reduce tailing across shared L1/L2 tile shapes.
             if (not get_next_task_idx<kNumNClusters>(task_count_ptr, num_m_blocks, m_block_idx, n_cluster_idx))
@@ -553,6 +557,15 @@ struct MegaMoEScheduler {
             if (task_info.is_valid()) publish_task(task_info, lane_idx);
         } while (task_info.is_valid());
 
+#if defined(DG_MEGA_MOE_IB_FWD_RETIRE) and DG_MEGA_MOE_IB_FWD_RETIRE and defined(DG_MEGA_MOE_IB_FWD_RETIRE_SHARED) and DG_MEGA_MOE_IB_FWD_RETIRE_SHARED
+        // DG_MEGA_MOE_IB_FWD_RETIRE_SHARED=n: a retiring cluster first takes n of the shared-expert L2 tail tasks (its share: they are
+        // claimed dynamically, and with half of the clusters retired the other half needs twice the waves for them: last routed L2 ->
+        // L2 sync 26 us instead of 13 at MegaSeek EP32 1024, traced). The shared L1 is long done (it precedes the routed tasks).
+        DG_STATIC_ASSERT(not kRoutedFirst, "FWD_RETIRE_SHARED: the shared L1 must be complete before the routed tasks (no ROUTED_FIRST)");
+        if constexpr (kHasShared) if (retired and not is_shared_l2_early)
+            shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
+                num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr(), false, DG_MEGA_MOE_IB_FWD_RETIRE_SHARED);
+#endif
         if constexpr (kHasShared) if (not retired) {
             if (kRoutedFirst)  // remaining shared L1 claims (the counter continues where the yield left it)
                 shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(

@@ -750,6 +750,248 @@ __device__ __noinline__ void ib_fwd_drain_fn(
 }
 #endif
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_FWD_BULK) and DG_MEGA_MOE_IB_FWD_BULK
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
+#define BLK_POLL(cond, reload, tag, a, b) do { while (cond) { reload; } } while (0)
+#else
+#define BLK_POLL(cond, reload, tag, a, b) do { uint32_t n_ = 0; while (cond) { reload; \
+        if (++ n_ == (1u << 25)) { printf("OPUS_HANG %s rank=%u sm=%u thread=%u a=%u b=%u epoch=%llu\n", tag, rank_idx, ptx::get_sm_idx(), threadIdx.x, \
+            (unsigned) (a), (unsigned) (b), (unsigned long long) epoch); asm volatile("trap;"); } } } while (0)
+#endif
+// DG_MEGA_MOE_IB_FWD_BULK=1 (>= 512 tail: reduce supply of the dispatch warps binds, PROFILE.md 12 / 14): the forward-combine item
+// of the DISPATCH warps after their pull, out of line. Same items (token, hidden quarter), same claim / chunk / done counters, same
+// top-k fp32 sum order, same record bytes and chunk puts as the inlined loop (the epilogue warps keep running that one beside it).
+// What differs: the item's partial quarter-rows (2560 B each, one per node-local slot) are copied with cp.async.bulk from the proxy
+// combine buffer into the warp's pull buffer(s), which are free once the pull has ended, kSlots quarter-rows per round on ONE
+// mbarrier (today: one register round trip per slot, ~4.75 per item at MegaSeek EP32). Rule A is checked on the smem copy, every
+// 16-byte unit; a unit that is still a sentinel is re-polled by its lane with ld.volatile from the buffer itself (as today; the bulk
+// round is NOT re-issued: spinning bulk loads would compete with the GEMM's weight stream). Re-arm as today (per unit, by the reader).
+// kLA: one-item lookahead of the claim -> order lookup -> top-k row chain (three serial round trips) under the bulk round, only
+// while the previous item found all its partials landed (throughput-bound); a warp that waited claims after its item, as today.
+// Returns the mbarrier phase.
+template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kSlots, uint32_t kSlotsPerBuf, bool kRetHdr, bool kLA, typename barrier_t>
+__device__ __noinline__ uint32_t ib_fwd_bulk_fn(
+    const uint32_t* o_nt, uint32_t* fitem, uint32_t* fchunk, uint32_t* fdone, const uint64_t* order_ready, const uint64_t epoch, const uint32_t* tab,
+    uint8_t* mir0, const int64_t node_stride, const int64_t off_idx, const int64_t off_sf, uint8_t* pc0, const int64_t pc_stride, uint8_t* fst0,
+    uint8_t* ret_dst, const int64_t ret_hdr,
+    const uint32_t my_node, const uint32_t lsa, const uint32_t num_r, const uint32_t rank_idx, const uint32_t rot0,
+    const uint32_t sc_min, const uint32_t ws_min, const bool need_order, const bool skip_xpoll, uint32_t* rot_mask0, uint32_t* rot_ntp,
+    const ncclDevComm_t* dev_comm, ncclWindow_t window, const int64_t gin_base, const bool gin_active,
+    uint64_t* tt, const uint64_t* trace,
+    uint8_t* sbuf, const uint32_t sbuf_stride, barrier_t* mbar, uint32_t phase) {
+    constexpr uint32_t kMaxUnits = layout::MegaMoESignals::kIBOMaxChunks;
+    constexpr int64_t kRec = kHidden + kHidden / 128 * 4;
+    constexpr uint32_t kQB = kHidden * 2 / 4;      // bytes of one partial quarter-row
+    constexpr uint32_t kPPI = kQB / (32 * 16);     // 16-byte units per lane and quarter-row
+    constexpr uint32_t kXU = kHidden / 16 / 4, kXA = (kXU + 31) / 32;
+    DG_STATIC_ASSERT(kSlots >= 1 and kSlots <= 32 and kSlotsPerBuf >= 1, "FWD_BULK slots per round");
+    DG_STATIC_ASSERT(kPPI * 32 * 16 == kQB and kQB * 4 == kHidden * 2 and kXU * 16 * 4 == kHidden, "FWD_BULK pieces");
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const bool rot = rot_mask0 != nullptr;
+    const auto ldv4 = [](const void* ptr) {
+        uint4 v;
+        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr) : "memory");
+        return v;
+    };
+    const auto sent4 = [](const uint4& v) { return (v.x & v.y & v.z & v.w) == 0xffffffffu; };
+    const auto add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
+        uint32_t old;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(v) : "memory");
+        return old;
+    };
+    const auto now = []() { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); return t_; };
+    for (uint32_t nr_it = 0; nr_it < num_r; ++ nr_it) {
+        uint32_t nr = nr_it + rot0;
+        if (nr >= num_r) nr -= num_r;
+        const uint32_t n = nr < my_node ? nr : nr + 1;
+        const uint32_t nt = ptx::ld_volatile(o_nt + n);
+        if (nt == 0)
+            continue;  // the zero-token return header is the dispatch leader's
+        const uint32_t s = n * lsa + rank_idx % lsa, k_s = nr * lsa + rank_idx % lsa;
+        if (rot and lane_idx == 0) rot_ntp[nr] = nt;
+        if (need_order)
+            BLK_POLL(ptx::ld_acq_sys(order_ready + k_s) != epoch, (void) 0, "blk_order_ready", k_s, 0);
+        const auto mir = mir0 + static_cast<int64_t>(n) * node_stride;
+        const auto fst = fst0 + static_cast<int64_t>(n) * node_stride;
+        const auto pc = pc0 + static_cast<int64_t>(n) * pc_stride;
+        const auto idxp = reinterpret_cast<const uint64_t*>(mir + off_idx);
+        const uint32_t num_items = nt * 4, nchunks = (nt + 31) / 32;
+        const auto claim = [&]() {
+            uint32_t v = 0;
+            if (lane_idx == 0) v = atomicAdd(fitem + n, 1u);
+            return __shfl_sync(0xffffffffu, v, 0);
+        };
+        const auto tok_of = [&](const uint32_t& it) { return nt >= sc_min ? ptx::ld_volatile(tab + 64 * kT + nr * kT + it / 4) : it / 4; };
+        const auto idx_of = [&](const uint32_t& t_) {
+            return lane_idx < kNumTopk ? static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idxp + t_ * kNumTopk + lane_idx))) : -1;
+        };
+        // lane 0: the next (at most kSlots) node-local slots' quarter-rows, one transaction on the warp's mbarrier
+        const auto issue = [&](uint32_t mm, const uint32_t& t_, const uint32_t& q_) {
+            if (lane_idx == 0) {
+                ptx::mbarrier_arrive_and_set_tx(mbar, cute::min(static_cast<uint32_t>(__popc(mm)), kSlots) * kQB);
+                #pragma unroll
+                for (uint32_t j = 0; j < kSlots; ++ j) {
+                    if (mm == 0) break;
+                    const uint32_t k = __ffs(mm) - 1;
+                    mm &= mm - 1;
+                    ptx::tma_load_1d(sbuf + (j / kSlotsPerBuf) * sbuf_stride + (j % kSlotsPerBuf) * kQB,
+                                     pc + (static_cast<int64_t>(k) * kT + t_) * kHidden * 2 + static_cast<int64_t>(q_) * kQB, mbar, kQB);
+                }
+            }
+        };
+        uint32_t item = claim();
+        uint32_t t = 0;
+        int e = -1;
+        if (item < num_items) t = tok_of(item), e = idx_of(t);
+        bool prev_miss = true;
+        while (item < num_items) {
+            const uint32_t p_rec = item / 4, q = item % 4;
+            const bool on = e >= 0 and static_cast<uint32_t>(e) / kEPR / lsa == my_node;
+            const uint32_t on_mask = __ballot_sync(0xffffffffu, on);
+            const uint64_t tt0 = tt ? now() : 0ull;
+            uint32_t m = on_mask;
+            issue(m, t, q);
+            // lookahead: the next claim is issued now; its order lookup and top-k row follow below, under the bulk round
+            const bool la = kLA and not prev_miss;
+            uint32_t nxt = 0, t_n = 0;
+            int e_n = -1;
+            if (la and lane_idx == 0) nxt = atomicAdd(fitem + n, 1u);
+            // Rule A: this item's part of the token's x row (and, with quarter 0, its SF row) has landed
+            if (not (skip_xpoll and on_mask != 0)) {
+                const uint32_t xslot = nt >= ws_min ? ptx::ld_volatile(tab + k_s * kT + t) : t;
+                const auto xrow = mir + static_cast<int64_t>(xslot) * kHidden + static_cast<int64_t>(q) * kXU * 16;
+                uint4 xv[kXA];
+                #pragma unroll
+                for (uint32_t u = 0; u < kXA; ++ u)
+                    xv[u] = u * 32 + lane_idx < kXU ? ldv4(xrow + (u * 32 + lane_idx) * 16) : uint4{0, 0, 0, 0};
+                #pragma unroll
+                for (uint32_t u = 0; u < kXA; ++ u)
+                    BLK_POLL(sent4(xv[u]), xv[u] = ldv4(xrow + (u * 32 + lane_idx) * 16), "blk_x", s, t);
+                if (q == 0 and lane_idx < kHidden / 32 / 16) {
+                    const auto sfp = mir + off_sf + static_cast<int64_t>(t) * (kHidden / 32) + lane_idx * 16;
+                    BLK_POLL(sent4(ldv4(sfp)), (void) 0, "blk_sf", s, t);
+                }
+                __syncwarp();
+            }
+            if (la) {
+                nxt = __shfl_sync(0xffffffffu, nxt, 0);
+                if (nxt < num_items) t_n = tok_of(nxt), e_n = idx_of(t_n);
+            }
+            if (rot and q == 0 and lane_idx == 0)
+                rot_mask0[static_cast<int64_t>(nr) * kT + t] = on_mask;  // PCOMB_ROT: the rows a later launch re-arms
+            float2 acc[kPPI][4];
+            #pragma unroll
+            for (uint32_t i = 0; i < kPPI; ++ i)
+                #pragma unroll
+                for (uint32_t l = 0; l < 4; ++ l)
+                    acc[i][l] = {0.f, 0.f};
+            bool miss = false;
+            while (m) {
+                ptx::mbarrier_wait_and_flip_phase(mbar, phase);
+                #pragma unroll
+                for (uint32_t j = 0; j < kSlots; ++ j) {
+                    if (m == 0) break;
+                    const uint32_t k = __ffs(m) - 1;
+                    m &= m - 1;
+                    const auto sp = sbuf + (j / kSlotsPerBuf) * sbuf_stride + (j % kSlotsPerBuf) * kQB;
+                    const auto row = pc + (static_cast<int64_t>(k) * kT + t) * kHidden * 2 + static_cast<int64_t>(q) * kQB;
+                    uint4 v[kPPI];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kPPI; ++ i)
+                        v[i] = ptx::ld_shared(reinterpret_cast<const uint4*>(sp + (i * 32 + lane_idx) * 16));
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kPPI; ++ i) {
+                        const auto ptr = row + (i * 32 + lane_idx) * 16;
+                        if (sent4(v[i])) {  // not landed when the bulk copy read it: this lane polls the unit itself
+                            miss = true;
+                            BLK_POLL(sent4(v[i]), v[i] = ldv4(ptr), "blk_pcomb", t, k);
+                        }
+                        if (not rot)
+                            *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                        const auto bb = reinterpret_cast<const nv_bfloat162*>(&v[i]);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < 4; ++ l)
+                            ptx::accumulate(acc[i][l], bb[l]);
+                    }
+                }
+                __syncwarp();
+                if (m) issue(m, t, q);
+            }
+            miss = __any_sync(0xffffffffu, miss);
+            if (tt and lane_idx == 0) atomicMax(reinterpret_cast<unsigned long long*>(tt + 2), static_cast<unsigned long long>(now()));
+            const auto rec = fst + static_cast<int64_t>(p_rec) * kRec;
+            #pragma unroll
+            for (uint32_t i = 0; i < kPPI; ++ i) {
+                // 8 columns per lane, 16 lanes per 128-column block: amax over the half-warp
+                float amax = 0.f;
+                #pragma unroll
+                for (uint32_t l = 0; l < 4; ++ l)
+                    amax = fmaxf(amax, fmaxf(fabsf(acc[i][l].x), fabsf(acc[i][l].y)));
+                #pragma unroll
+                for (uint32_t d = 1; d < 16; d <<= 1)
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
+                const float scale = amax > 0.f ? amax / 448.f : 1.f;
+                const float inv = 1.f / scale;
+                uint2 qv;
+                auto qs = reinterpret_cast<__nv_fp8x2_storage_t*>(&qv);
+                #pragma unroll
+                for (uint32_t l = 0; l < 4; ++ l)
+                    qs[l] = __nv_cvt_float2_to_fp8x2(make_float2(acc[i][l].x * inv, acc[i][l].y * inv), __NV_SATFINITE, __NV_E4M3);
+                const uint32_t col = ((q * kPPI + i) * 32 + lane_idx) * 8;
+                *reinterpret_cast<uint2*>(rec + col) = qv;
+                if (lane_idx % 16 == 0)
+                    *reinterpret_cast<float*>(rec + kHidden + col / 128 * 4) = scale;
+            }
+            __syncwarp();
+            // Fence, one counter atomic for the item's chunk; the warp completing a chunk puts it
+            if (lane_idx == 0) {
+                __threadfence();
+                const uint32_t c = p_rec / 32;
+                const uint32_t size = cute::min(32u, nt - c * 32);
+                const bool chunk_done = add_acq_rel(fchunk + n * kMaxUnits + c, 1u) + 1 == size * 4;
+                bool all = false;
+                if (chunk_done) all = add_acq_rel(fdone + n, 1u) + 1 == nchunks;
+                if (tt) {
+                    const uint64_t t_ = now();
+                    atomicMax(reinterpret_cast<unsigned long long*>(tt + 3), static_cast<unsigned long long>(t_));
+                    atomicAdd(reinterpret_cast<unsigned long long*>(tt + 16), 1ull);
+                    if (miss) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 17), 1ull);
+                    else atomicAdd(reinterpret_cast<unsigned long long*>(tt + 20), static_cast<unsigned long long>(t_ - tt0));
+                }
+                if (chunk_done) {
+                    const int64_t off = static_cast<int64_t>(c) * 32 * kRec;
+                    const uint64_t t_pre = tt ? now() : 0ull;
+                    if (gin_active)
+                        comm::gin_put_fn(dev_comm, window, gin_base, c + nr, ret_dst + off, fst + off, static_cast<uint64_t>(size) * kRec, s);
+                    if (tt) {
+                        const uint64_t t_ = now();
+                        atomicMax(reinterpret_cast<unsigned long long*>(tt + 4), static_cast<unsigned long long>(t_pre));
+                        atomicMax(reinterpret_cast<unsigned long long*>(tt + 5), static_cast<unsigned long long>(t_));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(tt + 23), 1ull);
+                        if (trace[5] > trace[16]) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 26), 1ull);
+                        if (nr == 0 and c < 64) tt[64 + c] = t_;  // tl_tchunk
+                        atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 14), static_cast<unsigned long long>(t_));
+                        atomicMin(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 44), static_cast<unsigned long long>(t_));
+                        atomicMax(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(trace) + 45), static_cast<unsigned long long>(t_));
+                    }
+                    if (all and kRetHdr and gin_active)
+                        comm::gin_put_value_fn(dev_comm, window, gin_base, c + nr + 1, reinterpret_cast<uint64_t*>(ret_dst + ret_hdr), epoch, s);
+                }
+            }
+            __syncwarp();
+            prev_miss = miss;
+            if (la) {
+                item = nxt, t = t_n, e = e_n;
+            } else {
+                item = claim();
+                if (item < num_items) t = tok_of(item), e = idx_of(t);
+            }
+        }
+    }
+    return phase;
+}
+#endif
+
 #if defined(DG_MEGA_MOE_IB_SPLIT) and DG_MEGA_MOE_IB_SPLIT
 // DG_MEGA_MOE_IB_SPLIT=1: the kernel body is instantiated twice; the few SMs that run the heavy SST / ORD blocks (builders,
 // poster, receivers) take the copy that contains them, every other SM runs a copy without them, so their register
@@ -2889,6 +3131,63 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             DG_MEGA_MOE_IB_FWD_DRAIN_ADAPT ? static_cast<uint32_t>(kNumSMs * kNumEpilogueWarps * DG_MEGA_MOE_IB_FWD_DRAIN_ADAPT / 4 / dr_R) : 0u);
     };
 #endif
+#if defined(DG_MEGA_MOE_IB_FWD_BULK) and DG_MEGA_MOE_IB_FWD_BULK
+#ifndef DG_MEGA_MOE_IB_FWD_BULK_SLOTS
+#define DG_MEGA_MOE_IB_FWD_BULK_SLOTS 32  // cap on the quarter-rows per bulk round (default: all the warp's pull buffers hold)
+#endif
+#ifndef DG_MEGA_MOE_IB_FWD_BULK_LA
+#define DG_MEGA_MOE_IB_FWD_BULK_LA 0      // 1: one-item lookahead of the claim / order lookup / top-k row chain
+#endif
+    // FWD_BULK: the dispatch warps' forward-combine with bulk partial loads (ib_fwd_bulk_fn); returns the pull mbarrier's phase.
+    // DG_MEGA_MOE_IB_FWD_BULK_MIN=T (optional): only from T tokens on, the inlined loop below that (both compiled in; a T above
+    // every batch = the dead control)
+    const auto ib_forward_bulk = [&](const uint32_t& global_warp, const uint32_t& mb_phase) -> uint32_t {
+        DG_STATIC_ASSERT(kIBFwdDyn and kIBReduceOnArrival and kIBFp8Combine and kIBRetGroups == 0 and kIBRetGroup == 1 and not kIBFwdInterleave and
+                         not kIBDeferRearm and not kIBNoOvReturn and not kIBFwdPrefetch, "FWD_BULK needs FWD_JOIN + fp8 records, no RET_GROUP / INTERLEAVE / DEFER_REARM / PREFETCH");
+        DG_STATIC_ASSERT(kIBTabSlot == 0 and kIBTabPerm2 == 64 * kIBTabT and kIBTabT == kIBT and kIBTokBytes == kHidden and kIBSFBytes == kHidden / 32 and
+                         kIBRecBytes == kHidden + kHidden / 128 * 4 and kIBChunk == 32, "FWD_BULK layout mirror");
+        DG_STATIC_ASSERT(not kIBC3Early, "FWD_BULK uses the dispatch warps' smem late: not with C3_EARLY");
+        DG_STATIC_ASSERT(DG_MEGA_MOE_IB_SHARING == 0 and not kIBXLast, "FWD_BULK puts its chunks through gin_put_fn on context chunk + slot");
+#if defined(DG_MEGA_MOE_IB_RET_CHUNK_DB) and DG_MEGA_MOE_IB_RET_CHUNK_DB
+        DG_STATIC_ASSERT(false, "FWD_BULK: no RET_CHUNK_DB");
+#endif
+#if defined(DG_MEGA_MOE_IB_FWD_TOK) and DG_MEGA_MOE_IB_FWD_TOK
+        DG_STATIC_ASSERT(false, "FWD_BULK: no FWD_TOK");
+#endif
+        constexpr uint32_t kBkQB = kHidden * 2 / 4;
+        constexpr uint32_t kBkPerBuf = kNumBytesPerPull / kBkQB;
+        DG_STATIC_ASSERT(kBkPerBuf >= 1 and kNumBytesPerPull % kBkQB == 0, "FWD_BULK: a pull buffer holds whole partial quarter-rows");
+        constexpr uint32_t kBkSlots = cute::min(cute::min(kBkPerBuf * kNumPullBufs, static_cast<uint32_t>(DG_MEGA_MOE_IB_FWD_BULK_SLOTS)), kNumTopk);
+        const uint32_t bk_R = ib_num_nodes - 1;
+        const uint32_t bk_rot0 = (kIBFwdRotate and num_tokens >= DG_MEGA_MOE_IB_FWD_ROTATE_MIN) ? global_warp % bk_R : 0u;
+        uint8_t* bk_pc0 = ib_pcomb(0);
+        int64_t bk_pc_stride = kIBNodeStride;
+        uint32_t* bk_rot_mask = nullptr;
+        uint32_t* bk_rot_nt = nullptr;
+        if constexpr (kIBRot) {
+            if (rot_rt) {
+                bk_pc0 = ib_pcomb_c(0, rot_b), bk_pc_stride = kIBPCombStride;
+                bk_rot_mask = rot_mask(rot_b, 0), bk_rot_nt = rot_nt(rot_b);
+            }
+        }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+        uint64_t* const bk_tt = tl_ttrace;
+#else
+        uint64_t* const bk_tt = nullptr;
+#endif
+        return ib_fwd_bulk_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), kBkSlots, kBkPerBuf, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_BULK_LA != 0, Barrier>(
+            workspace.signals->ib_o_nt, &workspace.signals->ib_o_fitem[ib_parity][0], &workspace.signals->ib_o_fchunk[ib_parity][0][0],
+            &workspace.signals->ib_o_fdone[ib_parity][0], workspace.signals->ib_o_order_ready, ib_epoch, ib_tab,
+            ib_mirror(ib_parity, 0), kIBNodeStride, kIBOffIdx, kIBOffSF, bk_pc0, bk_pc_stride, ib_fstage(0), ib_ret(ib_parity, ib_my_node), kIBRetHdr,
+            ib_my_node, ib_lsa, bk_R, sym_buffer.rank_idx, bk_rot0,
+            kIBStreamCombine ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
+            kIBWaveSort ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
+            (kIBWaveSort or kIBStreamCombine), kIBSkipXPoll, bk_rot_mask, bk_rot_nt,
+            &ib_dev_comm, ib_window, sym_buffer.base, ib_gin_active, bk_tt, workspace.signals->ib_trace,
+            reinterpret_cast<uint8_t*>(shared_storage.dispatch_send_buffer[warp_idx]), kNumDispatchWarps * kNumBytesPerPull,
+            &shared_storage.dispatch_barriers[warp_idx], mb_phase);
+    };
+#endif
 #endif
 
     // Different warp roles
@@ -3710,6 +4009,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
             ib_forward_drain(warp_idx * kNumSMs + sm_idx, cute::Int<DG_MEGA_MOE_IB_FWD_DRAIN_ND>{}, false);
+#elif defined(DG_MEGA_MOE_IB_FWD_BULK) and DG_MEGA_MOE_IB_FWD_BULK
+            // FWD_BULK: bulk partial loads into the pull buffer(s), free from here on (the inlined loop is not instantiated for
+            // the dispatch warps unless FWD_BULK_MIN is given)
+#if defined(DG_MEGA_MOE_IB_FWD_BULK_MIN)
+            if (num_tokens < DG_MEGA_MOE_IB_FWD_BULK_MIN) {
+                ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0,
+                                   cute::Int<DG_MEGA_MOE_IB_FWD_BATCH_D>{}, false);
+            } else
+#endif
+            {
+                if (sm_idx == 0 and thread_idx == 0 and ib_gin_active) {  // zero-token nodes: their return header, once
+                    for (uint32_t q = 0; q + 1 < ib_num_nodes; ++ q)
+                        if (ptx::ld_volatile(&workspace.signals->ib_o_nt[ib_node_of_slot(q)]) == 0)
+                            comm::gin_put_value_fn(&ib_dev_comm, ib_window, sym_buffer.base, q, reinterpret_cast<uint64_t*>(ib_ret(ib_parity, ib_my_node) + kIBRetHdr),
+                                                   ib_epoch, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(q)));
+                }
+                __syncwarp();
+                pull_mbarrier_phase = ib_forward_bulk(warp_idx * kNumSMs + sm_idx, pull_mbarrier_phase);
+            }
 #else
             ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0,
                                cute::Int<DG_MEGA_MOE_IB_FWD_BATCH_D>{}, false);

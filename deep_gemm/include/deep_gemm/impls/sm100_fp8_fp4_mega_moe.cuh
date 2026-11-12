@@ -2366,7 +2366,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 bool ff_end = false;
                 const long long ff_t0 = clock64();
                 while (not ff_end) {
-                    const uint32_t h = ptx::ld_acq(ff_head(sm_idx));  // every lane acquires
+                    // every lane acquires; the warp then works on the smallest value any lane saw, so its control flow stays uniform
+                    const uint32_t h = __reduce_min_sync(0xffffffffu, ptx::ld_acq(ff_head(sm_idx)));
                     if (h == tl) {
                         if (clock64() - ff_t0 > (1ll << 36)) {
                             if (lane_idx == 0) printf("OPUS_HANG ff_releaser rank=%u sm=%u tail=%u epoch=%llu\n", sym_buffer.rank_idx, sm_idx, tl, (unsigned long long) ib_epoch);

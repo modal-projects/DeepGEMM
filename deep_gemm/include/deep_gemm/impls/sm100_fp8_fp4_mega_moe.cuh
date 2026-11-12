@@ -1061,7 +1061,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // not one of the two rotating ones (COPIES >= 4, or exactly 2 on a build that never rotates); a marker word in our own node's
     // scratch copy says whether its flag units are still all sentinels (SAFE_CEIL=3 keeps them so, FF_DATA=3 does not)
     constexpr uint32_t kIBScratchCopy = kIBPCombCopies >= 4 ? static_cast<uint32_t>(kIBPCombCopies - 1) : (kIBPCombCopies == 2 ? 1u : 0u);
-    DG_STATIC_ASSERT(not (kIBFused and kFFData == 3) or kIBPCombCopies != 3, "FF_DATA=3 needs COPIES 2 or >= 4 (copies 1-2 rotate)");
+    DG_STATIC_ASSERT(not (kIBFused and kFFData == 3) or kIBScratchCopy >= 1,
+                     "FF_DATA=3 needs a scratch pcomb copy: DG_MEGA_MOE_IB_PCOMB_COPIES 2 or >= 4, allocated AND defined (a dev server must list it under static=)");
 #if defined(DG_MEGA_MOE_IB_SAFE_CEIL) and DG_MEGA_MOE_IB_SAFE_CEIL >= 3
     // SAFE_CEIL=3 (clean ceiling): the epilogue's stores are EXACTLY today's (same instruction, whole rows) but land in the scratch
     // copy; the forward-combine polls + re-arms only one unit in 16 there and sums nothing

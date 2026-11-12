@@ -60,8 +60,7 @@ template <
     typename task_info_t = sched::TaskInfo<kHasShared>
 >
 CUTLASS_DEVICE void
-sm100_fp8_fp4_mega_moe_body(kNumThreads, 1) void
-sm100_fp8_fp4_mega_moe_impl(void* y,
+sm100_fp8_fp4_mega_moe_body(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const layout::SymBuffer<kNumRanks>& sym_buffer,

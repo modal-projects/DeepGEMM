@@ -4231,7 +4231,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     }
                     // Row copy with kB independent 16-byte loads in flight per thread
-                    constexpr uint32_t kRowUnits = kIBTokBytes / 16, kB = 10;
+                    // DG_MEGA_MOE_IB_STAGE_KB: 16-byte loads in flight per thread in the chunk stagers (default 10 = 5 rounds per 32-row
+                    // chunk; every round of global loads costs 2-5 us this early in the kernel, and the first ordered piece waits for it)
+#ifndef DG_MEGA_MOE_IB_STAGE_KB
+#define DG_MEGA_MOE_IB_STAGE_KB 10
+#endif
+                    constexpr uint32_t kRowUnits = kIBTokBytes / 16, kB = DG_MEGA_MOE_IB_STAGE_KB;
                     const uint32_t num_units = (c1 - c0) * kRowUnits;
                     for (uint32_t u0 = epilogue_thread_idx; u0 < num_units; u0 += kNumEpilogueThreads * kB) {
                         uint4 v[kB];

@@ -3054,6 +3054,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 3
+        IB_STAGE(8, thread_idx == 0);
+#endif
 
         // Barrier before pulling
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -3081,8 +3084,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
 #endif
 
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 3
+        IB_STAGE(9, thread_idx == 0);
+#endif
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 3
+        IB_STAGE(10, thread_idx == 0);
+#endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if (kIBWmark and ib_sst) {
             // WMARK poller: SM 0's dispatch warp nr watches the mirror of our counterpart on remote node slot nr
@@ -4220,7 +4229,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             scheduler.mainloop(num_tokens, sm_locality_domains);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 2
+        IB_STAGE(20, lane_idx == 0);  // an epilogue warp got here (before the register allocation)
+#endif
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 2
+        IB_STAGE(21, lane_idx == 0);  // an epilogue warp has its registers
+#endif
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
@@ -4951,6 +4966,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
             printf("OPUS_D0 rank=%u epoch=%llu num_tokens=%u enter\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, num_tokens);
 #endif
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 2
+        IB_STAGE(22, lane_idx == 0);  // an epilogue warp reached the meta posting
+#endif
         if (sm_idx == kIBMetaSM and num_tokens == kIBT and not kIBFront) {
             // Full batch: every top-k / weight row is polled by the proxy, so the input slices go out as they are
             // (no staging): one put for top-k idx + weights (contiguous in the input region), one for the header
@@ -5135,7 +5153,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (epilogue_thread_idx == 0)
                 *reinterpret_cast<uint64_t*>(stg + kIBOffHdr) = (ib_epoch << 32) | num_tokens;
             __threadfence();
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 4
+        IB_STAGE(23, epilogue_thread_idx == 0);
+#endif
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 4
+        IB_STAGE(24, epilogue_thread_idx == 0);
+#endif
 #if defined(DG_MEGA_MOE_IB_STAGE_NT) and DG_MEGA_MOE_IB_STAGE_NT
             // after the barrier: every thread has read the previous count; the meta put does not cover these bytes
             if (kIBLeanMeta and epilogue_thread_idx == 0 and not cim_count_here)
@@ -5278,6 +5302,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES == 4
+        IB_STAGE(25, epilogue_thread_idx == 0);
+#endif
             // The bulk x / SF puts are posted only after the meta, so the meta is not queued behind them on the wire
             if (epilogue_thread_idx == 0 and (kIBMetaFirstAll or not kIBFront))
                 { uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); workspace.signals->ib_o_meta_posted_t = t_; }
@@ -5707,6 +5734,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (epilogue_thread_idx == 0) {
                     uint64_t h = 0;
                     comm::wait_until([&]() { h = ptx::ld_volatile(hdr); if (ib_oracle_now and h != ~0ull) return true; if (not kIBHdrSpin and (h >> 32) != (ib_epoch & 0xffffffffull)) __nanosleep(200); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
+#if defined(DG_MEGA_MOE_IB_DBG_STAGES) and DG_MEGA_MOE_IB_DBG_STAGES
+                        {   // this rank's own per-SM stage marks (it is a source too): where did its senders stop?
+                            uint32_t hist[32] = {};
+                            for (uint32_t s_ = 0; s_ < kNumSMs; ++ s_) {
+                                const uint64_t v_ = ptx::ld_volatile(workspace.signals->ib_sm_stage + s_);
+                                hist[(v_ >> 8) == ib_epoch ? (v_ & 31) : 0] += 1;
+                            }
+                            printf("OPUS_HANG stages rank=%u sm0=%llu sm1=%llu\n", sym_buffer.rank_idx,
+                                   (unsigned long long) (ptx::ld_volatile(workspace.signals->ib_sm_stage + 0) & 255), (unsigned long long) (ptx::ld_volatile(workspace.signals->ib_sm_stage + 1) & 255));
+                            for (uint32_t k_ = 0; k_ < 32; ++ k_)
+                                if (hist[k_])
+                                    printf("OPUS_HANG stages rank=%u epoch=%llu stage=%u sms=%u (meta posted epoch %llu)\n", sym_buffer.rank_idx,
+                                           (unsigned long long) ib_epoch, k_, hist[k_], (unsigned long long) ptx::ld_volatile(&workspace.signals->ib_o_meta_posted));
+                        }
+#endif
                         printf("DeepGEMM IB header timeout: rank=%u, source=%u, proxy=%u, header=%llx, epoch=%llu\n",
                                sym_buffer.rank_idx, r, proxy, (unsigned long long) h, (unsigned long long) ib_epoch);
                     });

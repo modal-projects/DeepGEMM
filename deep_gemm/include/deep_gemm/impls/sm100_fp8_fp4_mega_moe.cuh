@@ -2786,6 +2786,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     SL_TR(0, 30, true);  // SST put issued (slowest lane)
                 }
                 __syncwarp();
+#if defined(DG_MEGA_MOE_IB_SST_XHOLD) and DG_MEGA_MOE_IB_SST_XHOLD
+                // DG_MEGA_MOE_IB_SST_XHOLD=1 (mechanism test): the x / SF pieces are issued only after the SST put, so its
+                // issue never competes with the ~100 x put issues (flag = the unused last X_ORDER slot; GPU scope)
+                if (epilogue_thread_idx == 0)
+                    ptx::st_rel(ib_xo_flag + 255, ib_epoch);
+#endif
             }
         }
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
@@ -3140,6 +3146,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     constexpr bool kMetaFirst = false;  // measured harmful with the host scan (GB200: ms-scale stalls)
 #endif
                     while (kMetaFirst and ptx::ld_acq_gpu(&workspace.signals->ib_o_meta_posted) < ib_epoch);
+#if defined(DG_MEGA_MOE_IB_SST_XHOLD) and DG_MEGA_MOE_IB_SST_XHOLD
+                    if constexpr (kIBSST)
+                        IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + 255) != ib_epoch, (void) 0, "sst_xhold", q, 0);
+#endif
 #if defined(DG_MEGA_MOE_IB_XDELAY_NS) and DG_MEGA_MOE_IB_XDELAY_NS
                     // DG_MEGA_MOE_IB_XDELAY_NS=N (with META_FIRST_ALL): x / SF pieces wait N ns after the meta was posted, so the
                     // meta is not interleaved with megabytes of x on the NIC (hypothesis test: counts @1024 land ~50 us late)

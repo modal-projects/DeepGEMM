@@ -1841,7 +1841,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // before reaching the same barrier (B300 int15: +16 us at 128 with SENDER_TABLES when SM 0 still pulled)
         const uint32_t ib_pull_sm0 = kIBFront ? 1u : 0u;
         // SST: only the proxy's R counterpart-source SMs (the last R) still scan (rule A + return order, off the count path)
-        const uint32_t ib_pull_sms = kIBSST ? kNumSMs - ib_R : kNumSMs - (kNumRanks - sym_buffer.num_lsa_ranks) * ib_P;
+        // DG_MEGA_MOE_IB_SST_PULL_SMS=1 (mechanism arm): SST keeps the legacy rotation (all kNumRanks - lsa former scan SMs stay
+        // out), DG_MEGA_MOE_IB_SST_PULL_SMS=N: the last N SMs stay out
+#ifndef DG_MEGA_MOE_IB_SST_PULL_SMS
+#define DG_MEGA_MOE_IB_SST_PULL_SMS 0
+#endif
+        const uint32_t ib_pull_sms = kIBSST ? kNumSMs - (DG_MEGA_MOE_IB_SST_PULL_SMS == 0 ? ib_R : DG_MEGA_MOE_IB_SST_PULL_SMS == 1 ? kNumRanks - sym_buffer.num_lsa_ranks : static_cast<uint32_t>(DG_MEGA_MOE_IB_SST_PULL_SMS))
+                                            : kNumSMs - (kNumRanks - sym_buffer.num_lsa_ranks) * ib_P;
 #else
         const uint32_t ib_pull_sm0 = 0;
         const uint32_t ib_pull_sms = kNumSMs;

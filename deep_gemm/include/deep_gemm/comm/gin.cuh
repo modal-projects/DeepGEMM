@@ -99,5 +99,18 @@ struct GinIB {
     }
 };
 
+// One shared, non-inlined copy of the Gin put for cold callers (DG_MEGA_MOE_IB_PUT_FN): every inlined put site adds a large
+// body to the kernel function (measured: each new SST block with a put cost ~+10 us at 1024 without ever running)
+static __device__ __noinline__ void gin_put_fn(const ncclDevComm_t* dev_comm, ncclWindow_t window, int64_t base, uint32_t ctx,
+                                               const void* dst_sym_ptr, const void* src_ptr, uint64_t num_bytes, uint32_t dst_rank_idx) {
+    GinIB g(*dev_comm, window, base, ctx);
+    g.put(dst_sym_ptr, src_ptr, num_bytes, dst_rank_idx);
+}
+static __device__ __noinline__ void gin_put_value_fn(const ncclDevComm_t* dev_comm, ncclWindow_t window, int64_t base, uint32_t ctx,
+                                                     uint64_t* sym_ptr, uint64_t value, uint32_t dst_rank_idx) {
+    GinIB g(*dev_comm, window, base, ctx);
+    g.put_value(sym_ptr, value, dst_rank_idx);
+}
+
 } // namespace deep_gemm::comm
 #endif

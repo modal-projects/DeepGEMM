@@ -561,6 +561,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSST = false;
 #endif
+    // DG_MEGA_MOE_IB_PUT_FN=1: the SST / ORD blocks issue their puts through ONE shared non-inlined function (comm::gin_put_fn,
+    // scalars and pointers by value) instead of inlining the Gin put at each site
+#if defined(DG_MEGA_MOE_IB_PUT_FN) and DG_MEGA_MOE_IB_PUT_FN
+    constexpr bool kIBPutFn = DG_MEGA_MOE_IB_SHARING == 0;
+#else
+    constexpr bool kIBPutFn = false;
+#endif
+#define IB_PUT(g, ctx, dst, src, bytes, peer) do { if constexpr (kIBPutFn) { if (ib_gin_active) comm::gin_put_fn( \
+        reinterpret_cast<const ncclDevComm_t*>(sym_buffer.gin_dev_comm), ib_window, sym_buffer.base, ctx, dst, src, bytes, peer); } \
+    else { g.put(dst, src, bytes, peer); } } while (0)
+#define IB_PUTV(g, ctx, ptr, val, peer) do { if constexpr (kIBPutFn) { if (ib_gin_active) comm::gin_put_value_fn( \
+        reinterpret_cast<const ncclDevComm_t*>(sym_buffer.gin_dev_comm), ib_window, sym_buffer.base, ctx, ptr, val, peer); } \
+    else { g.put_value(ptr, val, peer); } } while (0)
     // DG_MEGA_MOE_IB_CG_DROP=mask (codegen bisect, only meaningful with SST_DEAD): compile out 1 early-weight block, 2 SST
     // builder, 4 SST receive, 8 pull-loop waits / polls, 16 NB builder, 32 order builder + poster,
     // 512 ib_P select, 1024 pull-rotation select, 2048 k mapping, 4096 legacy-scan guards, 8192 header-only meta put, 16384 ib_sst = false (constant)
@@ -3035,7 +3048,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const auto gin_w = make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase);
                 if (num_tokens > 0)
-                    gin_w.put(ib_mirror(ib_parity, ib_my_node) + kIBOffW, ib_input_base + kIBOffW,
+                    IB_PUT(gin_w, nr, ib_mirror(ib_parity, ib_my_node) + kIBOffW, ib_input_base + kIBOffW,
                         static_cast<uint64_t>(num_tokens) * kNumTopk * 4, ib_cp(sym_buffer.rank_idx, n));
                 SL_TR(0, 42, true);  // early weight put issued
                 if constexpr (kIBSSTRPut) {
@@ -3043,8 +3056,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint64_t ab = ptx::ld_volatile(ib_xo_flag + 251 + nr);
                     const uint32_t a = static_cast<uint32_t>(ab >> 32), b = static_cast<uint32_t>(ab);  // NB: a = 0, b = entries
                     const uint32_t cb = kNumExpertsPerRank * ib_lsa * 4;
-                    gin_w.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - cb - kNBHdr,
-                              kIBSSTNB ? ib_nb_stg(nr) : ib_mirror(ib_parity, ib_my_node) + kIBOffCnt + static_cast<int64_t>(nr) * cb + static_cast<int64_t>(a) * 4,
+                    IB_PUT(gin_w, nr, ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - cb - kNBHdr,
+                              (kIBSSTNB ? ib_nb_stg(nr) : ib_mirror(ib_parity, ib_my_node) + kIBOffCnt + static_cast<int64_t>(nr) * cb + static_cast<int64_t>(a) * 4),
                               static_cast<uint64_t>(kNBHdr) + static_cast<uint64_t>(cb) + static_cast<uint64_t>(b - a) * 4, ib_cp(sym_buffer.rank_idx, n));
                     SL_TR(0, 30, true);  // SST put issued (slowest lane)
                 }
@@ -3057,8 +3070,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             DG_IB_OUTLINE_BEGIN
             if (kIBHeavy and kIBPrewarm and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and ib_ord_on(num_tokens)) {
                 const uint32_t nr = lane_idx, orig = 2 * ib_R + nr % ib_xnctx();
-                make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase).put_value(
-                    reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(nr)));
+                const auto gin_p = make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase);
+                IB_PUTV(gin_p, orig, reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(nr)));
             }
             __syncwarp();
             if (kIBHeavy and not kIBSSTNB and ib_ord_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) {
@@ -3311,7 +3324,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
                         const auto gin_s = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);  // header context
 #endif
-                        gin_s.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - static_cast<int64_t>(node_experts) * 4 - kNBHdr, ib_nb_stg(nr),
+#if defined(DG_MEGA_MOE_IB_SST_CTX) and DG_MEGA_MOE_IB_SST_CTX == 1
+                        const uint32_t kNBCtx = nr;
+#else
+                        const uint32_t kNBCtx = hdr_orig(nr);
+#endif
+                        IB_PUT(gin_s, kNBCtx, ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - static_cast<int64_t>(node_experts) * 4 - kNBHdr, ib_nb_stg(nr),
                                   static_cast<uint64_t>(kNBHdr) + static_cast<uint64_t>(node_experts) * 4 + static_cast<uint64_t>(*nb_tot) * 4, ib_cp(sym_buffer.rank_idx, n));
                         SL_TR(0, 30, true);
                     }
@@ -3463,7 +3481,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
                     const auto gin_s = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);  // header context
 #endif
-                    gin_s.put(ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - sst_cb,
+#if defined(DG_MEGA_MOE_IB_SST_CTX) and DG_MEGA_MOE_IB_SST_CTX == 1
+                    const uint32_t kNBCtx = nr;
+#else
+                    const uint32_t kNBCtx = hdr_orig(nr);
+#endif
+                    IB_PUT(gin_s, kNBCtx, ib_mirror(ib_parity, ib_my_node) + kIBOffSTab - sst_cb,
                               stg + static_cast<int64_t>(nr) * sst_cb + static_cast<int64_t>(a) * 4,
                               static_cast<uint64_t>(sst_cb) + static_cast<uint64_t>(b - a) * 4, ib_cp(sym_buffer.rank_idx, n));
                     SL_TR(0, 30, true);  // SST put issued (slowest lane)
@@ -3936,7 +3959,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + q) != ib_epoch, (void) 0, "ws_post", nr, c);
                     }
                     const uint32_t t0 = c0 * kIBChunk, t1 = cute::min(c1 * kIBChunk, num_tokens);
-                    gin_x.put(ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(t0) * kIBTokBytes, x_stage + static_cast<int64_t>(t0) * kIBTokBytes,
+                    IB_PUT(gin_x, orig, ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(t0) * kIBTokBytes, x_stage + static_cast<int64_t>(t0) * kIBTokBytes,
                               static_cast<uint64_t>(t1 - t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, n));
                     SL_TR(0, 28, true);
                     SL_TR(0, 38, c0 == 0);  // first wave piece issued (slowest node)

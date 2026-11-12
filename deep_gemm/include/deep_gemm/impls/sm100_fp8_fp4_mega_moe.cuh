@@ -561,14 +561,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBSST = false;
 #endif
-    // DG_MEGA_MOE_IB_OUTLINE=1: the SST / ORD sender and receiver blocks become non-inlined lambdas, so the code they add does
-    // not take part in the register allocation of the hot (MMA / epilogue / pull) loops of the one kernel function
     // DG_MEGA_MOE_IB_CG_DROP=mask (codegen bisect, only meaningful with SST_DEAD): compile out 1 early-weight block, 2 SST
-    // builder, 4 SST receive, 8 pull-loop waits / polls, 16 NB builder, 32 order builder + poster
+    // builder, 4 SST receive, 8 pull-loop waits / polls, 16 NB builder, 32 order builder + poster,
+    // 512 ib_P select, 1024 pull-rotation select, 2048 k mapping, 4096 legacy-scan guards, 8192 header-only meta put, 16384 ib_sst = false (constant)
 #ifndef DG_MEGA_MOE_IB_CG_DROP
 #define DG_MEGA_MOE_IB_CG_DROP 0
 #endif
     constexpr uint32_t kCGDrop = DG_MEGA_MOE_IB_CG_DROP;
+    // DG_MEGA_MOE_IB_OUTLINE=1: the SST / ORD sender and receiver blocks become non-inlined lambdas, so the code they add does
+    // not take part in the register allocation of the hot (MMA / epilogue / pull) loops of the one kernel function
 #if defined(DG_MEGA_MOE_IB_OUTLINE) and DG_MEGA_MOE_IB_OUTLINE
 #define DG_IB_OUTLINE_BEGIN [&]() __attribute__((noinline)) {
 #define DG_IB_OUTLINE_END }();
@@ -579,9 +580,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Runtime gate of every SST path (both paths are compiled): DG_MEGA_MOE_IB_SST_DEAD=1 is the CODEGEN CONTROL arm: the SST /
     // ORD code is compiled in but the kernel runs the legacy path (the condition is a memory load the compiler cannot fold)
 #if defined(DG_MEGA_MOE_IB_SST_DEAD) and DG_MEGA_MOE_IB_SST_DEAD
-    const bool ib_sst = kIBSST and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) == ~0ull;
+    const bool ib_sst = kIBSST and not (DG_MEGA_MOE_IB_CG_DROP & 16384) and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) == ~0ull;
 #else
-    const bool ib_sst = kIBSST and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) != ~0ull;
+    const bool ib_sst = kIBSST and not (DG_MEGA_MOE_IB_CG_DROP & 16384) and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) != ~0ull;
 #endif
     DG_STATIC_ASSERT(not kIBSST or (kIBFront and kIBHdrCtx and not kIBThreadCtx and not kIBEarlyPublish and not kIBCountsEarly),
                      "DG_MEGA_MOE_IB_SST needs FRONT + HDR_CTX, shared contexts, and no COUNTS_IN_META / SPLIT_SCAN / COUNTS_EARLY");
@@ -1136,7 +1137,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_SLICE_MAX_SMS 32
 #endif
     const uint32_t ib_P = [&]() {
-        if (ib_sst) return 1u;  // no receiver scan on the count path
+        if (ib_sst and not (kCGDrop & 512)) return 1u;  // no receiver scan on the count path
         if (kIBScanSlices <= 1 or num_tokens * kNumTopk < DG_MEGA_MOE_IB_SLICE_MIN) return 1u;
         const uint32_t nrem = cute::max(1u, kNumRanks - ib_lsa);
         uint32_t p = kIBScanSlices;
@@ -1995,7 +1996,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_SST_PULL_SMS
 #define DG_MEGA_MOE_IB_SST_PULL_SMS 0
 #endif
-        const uint32_t ib_pull_sms = ib_sst ? kNumSMs - (DG_MEGA_MOE_IB_SST_PULL_SMS == 0 ? ib_R : DG_MEGA_MOE_IB_SST_PULL_SMS == 1 ? kNumRanks - sym_buffer.num_lsa_ranks : static_cast<uint32_t>(DG_MEGA_MOE_IB_SST_PULL_SMS))
+        const uint32_t ib_pull_sms = ib_sst and not (kCGDrop & 1024) ? kNumSMs - (DG_MEGA_MOE_IB_SST_PULL_SMS == 0 ? ib_R : DG_MEGA_MOE_IB_SST_PULL_SMS == 1 ? kNumRanks - sym_buffer.num_lsa_ranks : static_cast<uint32_t>(DG_MEGA_MOE_IB_SST_PULL_SMS))
                                             : kNumSMs - (kNumRanks - sym_buffer.num_lsa_ranks) * ib_P;
 #else
         const uint32_t ib_pull_sm0 = 0;
@@ -3612,7 +3613,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     SL_TR(0, 25, true);
                 } else {
                     const auto gin_h = make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase);
-                    if (kIBSSTW and ib_sst) {  // the weight rows went out at kernel start: header only
+                    if (kIBSSTW and ib_sst and not (kCGDrop & 8192)) {  // the weight rows went out at kernel start: header only
                         gin_h.put_value(reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
                     } else {
                     gin_h.put(dst + kIBOffW, stg + kIBOffW, static_cast<uint64_t>(kIBOffHdr + 8 - kIBOffW), cp);
@@ -3925,7 +3926,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sm_idx + num_remote * ib_P >= kNumSMs) {
                 const uint32_t k = [&]() {
                     const uint32_t sm_rev = kNumSMs - 1 - sm_idx;
-                    if (ib_sst) {
+                    if (ib_sst and not (kCGDrop & 2048)) {
                         // SST: our own counterpart sources (the only ones still scanned) on the last R SMs, the others below
                         const uint32_t myj = sym_buffer.rank_idx % ib_lsa, lm1 = cute::max(1u, ib_lsa - 1);
                         if (sm_rev < ib_R)
@@ -4090,7 +4091,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     DG_IB_OUTLINE_END
                 }
                 // SST: only r's proxy goes on (header, rule-A polls of idx / weights, return order); legacy path: everyone
-                if (not (ib_sst and proxy != sym_buffer.rank_idx)) {
+                if (not (ib_sst and not (kCGDrop & 4096) and proxy != sym_buffer.rank_idx)) {
                 // One thread polls the (NVLink-remote) header with a pause between polls: hundreds of threads spinning
                 // on a proxy's HBM while its NIC writes there slows the NIC down drastically on GB200
                 auto nt_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d) + kNumExpertsPerRank;
@@ -4352,7 +4353,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 if (d1_key1) atomicMin(keys1 + i / kNumTopk, le);
                                 if (d1_key2) atomicMax(keys2 + i / kNumTopk, le);
                             }
-                            if (not ib_sst and ib_P == 1 and not ib_st_on(nt) and e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
+                            if (not (ib_sst and not (kCGDrop & 4096)) and ib_P == 1 and not ib_st_on(nt) and e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
                                 const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
                                 const uint32_t slot = atomicAdd_block((ib_early_on(nt) ? cnt2 : cnt) + le, 1u);
                                 *workspace.get_src_token_topk_idx_ptr(le, r, slot) = i;
@@ -4369,7 +4370,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
                 if (not ib_early_on(nt))
                     IB_TRACE(22, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
-                if (not ib_sst and not ib_early_on(nt) and ib_P == 1) {
+                if (not (ib_sst and not (kCGDrop & 4096)) and not ib_early_on(nt) and ib_P == 1) {
                     for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
                         *workspace.get_expert_recv_count_ptr(r, i) = cnt[i];
                         if constexpr (kIBCountsEarly) {
@@ -4380,7 +4381,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         ptx::atomic_add(workspace.get_expert_recv_count_sum_ptr(i),
                                         (static_cast<uint64_t>(kNumSMs) << 32) | static_cast<uint64_t>(cnt[i]));
                     }
-                } else if (not ib_sst) {
+                } else if (not (ib_sst and not (kCGDrop & 4096))) {
                     if constexpr (kIBCountsInMeta) {
                         for (uint32_t i = epilogue_thread_idx; not ib_st_on(nt) and i < kNumExpertsPerRank; i += kNumEpilogueThreads)
                             if (cnt2[i] != cnt[i])

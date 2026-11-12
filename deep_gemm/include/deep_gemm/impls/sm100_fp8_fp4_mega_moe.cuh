@@ -1152,7 +1152,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     };
     // shared deferred re-arm of copy c (any warp, all 32 lanes): items claimed until none is left
     const auto rot_work = [&](const uint32_t& c) {
-        constexpr uint32_t kRowUnits = kHidden * 2 / 16, kQ = 4, kQUnits = kRowUnits / kQ;
+        constexpr uint32_t kRowUnits = kHidden * 2 / 16, kQ = kIBRotMode == 4 ? 1 : 4, kQUnits = kRowUnits / kQ;
         DG_STATIC_ASSERT(kQUnits * kQ == kRowUnits and kQUnits % 32 == 0, "PCOMB_ROT work item");
         constexpr uint32_t kSlotMask = kNumTopk >= 32 ? 0xffffffffu : (1u << kNumTopk) - 1u;
         const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
@@ -2155,7 +2155,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // are in flight (every dispatch warp of every SM passes here on every path; nobody writes that copy before the next launch)
             if (rot_rt and rot_ho != ~0ull) {
                 if constexpr (kIBRotMode == 3) rot_rearm_tma(rot_o, pull_buffer.get_base_ptr(), (kNumBytesPerPull / 16) * 16);
-                else if constexpr (kIBRotMode == 2) rot_work(rot_o);  // whatever the epilogue warps have not claimed yet
+                // =4: the same work queue, dispatch warps only (traced at EP16: a warp's share takes ~12 us, but with the static
+                // split of =1 the SMs whose dispatch warps arrive last, held by their epilogue's D1 scan until the counts are
+                // nearly there, still have to do their share and enter the pulls ~12 us late; with a queue the early SMs take it all)
+                else if constexpr (kIBRotMode == 2 or kIBRotMode == 4) rot_work(rot_o);
                 else rot_rearm(rot_o);
             }
             TT_MAX(14, lane_idx == 0);  // trace: deferred re-arm done (OPUS_TRACE6 rearm_done), slowest warp

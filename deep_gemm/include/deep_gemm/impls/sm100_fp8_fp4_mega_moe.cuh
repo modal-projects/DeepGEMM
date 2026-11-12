@@ -4408,6 +4408,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr uint32_t kOK = kNumExpertsPerRank + 1;  // buckets per node (the last: no pick on the node)
                 constexpr uint32_t kMx = kIBMSO > 0 ? kIBMSO : 1u;
                 constexpr uint32_t kOT = math::constexpr_ceil_div(static_cast<uint32_t>(kIBT), kNumEpilogueThreads * kMx);
+#if defined(DG_MEGA_MOE_IB_ORD_CONTIG) and DG_MEGA_MOE_IB_ORD_CONTIG
+                constexpr bool kOrdContig = kIBMSO > 0;
+#else
+                constexpr bool kOrdContig = false;
+#endif
+                const uint32_t ord_per = (num_tokens + kMx - 1) / kMx;  // tokens per SM (<= kOT * threads)
                 auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
                 constexpr uint32_t kOWStride = 3 * kOK;  // FAST: per-warp buckets [warp][<= 3 remote nodes][key] after oh
                 DG_STATIC_ASSERT(not kIBSSTFast or (kNumEpilogueWarps + 2 + (kIBMSO > 0 ? 2u : 0u)) * kOWStride * 2 + 4 <= sizeof(SharedStorage::smem_d), "ORD per-warp buckets in smem_d");
@@ -4425,7 +4431,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 SL_TR(0, 44, epilogue_thread_idx == 0);  // zeroed
                 uint32_t kk[kOT];
                 for (uint32_t j = 0; j < kOT; ++ j) {
-                    const uint32_t t = (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
+                    // DG_MEGA_MOE_IB_ORD_CONTIG=1: SM m owns a CONTIGUOUS token range (its 19 x 8 B idx rows are adjacent lines) instead of
+                    // every kMx-th token (each SM then touched every line of the idx region for 1/8 of its entries: keyed at 14 us)
+                    const uint32_t t = kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
+                                                  : (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
                     uint32_t packed = kNumExpertsPerRank * 0x01010101u;
                     if (t < num_tokens) {
                         uint32_t v[kNumTopk];
@@ -4507,7 +4516,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 for (uint32_t j = 0; j < kOT; ++ j) {
-                    const uint32_t t = (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
+                    // DG_MEGA_MOE_IB_ORD_CONTIG=1: SM m owns a CONTIGUOUS token range (its 19 x 8 B idx rows are adjacent lines) instead of
+                    // every kMx-th token (each SM then touched every line of the idx region for 1/8 of its entries: keyed at 14 us)
+                    const uint32_t t = kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
+                                                  : (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
                     if (t < num_tokens) {
                         if constexpr (not kIBSSTFast) {
                         for (uint32_t nr = 0; nr < ib_R; ++ nr) {
@@ -5368,7 +5380,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     }
                     // Row copy with kB independent 16-byte loads in flight per thread
-                    constexpr uint32_t kRowUnits = kIBTokBytes / 16, kB = 10;
+                    // DG_MEGA_MOE_IB_STAGE_KB: 16-byte loads in flight per thread in the chunk stagers (default 10 = 5 rounds per 32-row
+                    // chunk; every round of global loads costs 2-5 us this early in the kernel, and the first ordered piece waits for it)
+#ifndef DG_MEGA_MOE_IB_STAGE_KB
+#define DG_MEGA_MOE_IB_STAGE_KB 10
+#endif
+                    constexpr uint32_t kRowUnits = kIBTokBytes / 16, kB = DG_MEGA_MOE_IB_STAGE_KB;
                     const uint32_t num_units = (c1 - c0) * kRowUnits;
                     for (uint32_t u0 = epilogue_thread_idx; u0 < num_units; u0 += kNumEpilogueThreads * kB) {
                         uint4 v[kB];
@@ -5402,7 +5419,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put_value(
                             reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, q_n));
                     SL_TR(0, 29, true);  // SB: poster warm (slowest)
-                    for (uint32_t w = 0; w < 3; ++ w)
+                    // SB & 128: no hold at all (x issue starts at t = 0 as in the legacy path; the meta puts race it)
+                    for (uint32_t w = 0; (kIBSB & 128) == 0 and w < 3; ++ w)
                         while (ptx::ld_acq_gpu(ib_xo_flag + 232 + w) != ib_epoch);
                     SL_TR(0, 41, true);  // SB: meta flags seen (slowest poster)
                 }
@@ -5493,13 +5511,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t orig = 2 * ib_R + nr % ib_xnctx();
                 const auto gin_x = make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase);
                 constexpr uint32_t kPC = (kIBOrd > 0 ? kIBOrd : kIBWSPost) / kIBChunk;  // chunks per put
-                for (uint32_t c0 = 0; c0 < num_x_chunks; c0 += kPC) {
-                    const uint32_t c1 = cute::min(c0 + kPC, num_x_chunks);
+                // DG_MEGA_MOE_IB_ORD_HEAD=h (chunks, < kPC): ramp: the first put of every node carries only the first h chunks (h x 32
+                // rows), the second the rest of the first group, then full groups: the head is on the receivers after ~h/4 of the
+                // first piece's wire time (3 nodes x 128 rows = 2 MB = ~20 us before ANY first row was complete)
+#ifndef DG_MEGA_MOE_IB_ORD_HEAD
+#define DG_MEGA_MOE_IB_ORD_HEAD 0
+#endif
+                constexpr uint32_t kHead = DG_MEGA_MOE_IB_ORD_HEAD < kPC ? DG_MEGA_MOE_IB_ORD_HEAD : 0u;
+                for (uint32_t c0 = 0, c_next = 0; c0 < num_x_chunks; c0 = c_next) {
+                    c_next = (kHead > 0 and c0 == 0) ? kHead : (kHead > 0 and c0 == kHead) ? kPC : c0 + kPC;
+                    const uint32_t c1 = cute::min(c_next, num_x_chunks);
                     for (uint32_t c = c0; c < c1; ++ c) {
                         const uint32_t q = nr * num_pieces + 1 + c;
                         if (q < 256)
                             IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + q) != ib_epoch, (void) 0, "ws_post", nr, c);
                     }
+                    SL_TR(0, 56, c0 == 0);  // poster: first group's chunks all staged (slowest node)
+#if defined(DG_MEGA_MOE_IB_DBG_XLATE) and DG_MEGA_MOE_IB_DBG_XLATE
+                    // Debug proof knob: rank 0 issues its LAST ordered x put to remote node slot 0 DBG_XLATE ns late (a put
+                    // whose source bytes must stay stable until it is issued and read: the C3_SPLIT scratch alias case)
+                    if (sym_buffer.rank_idx == 0 and nr == 0 and c1 == num_x_chunks) {
+                        // (a spin here holds this SM out of the grid syncs, so the combine cannot start under it: the put is
+                        // handed to the source combine instead, which issues it after its pass 0; see c3 below)
+                        continue;
+                    }
+#endif
                     const uint32_t t0 = c0 * kIBChunk, t1 = cute::min(c1 * kIBChunk, num_tokens);
                     IB_PUT(gin_x, orig, ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(t0) * kIBTokBytes, x_stage + static_cast<int64_t>(t0) * kIBTokBytes,
                               static_cast<uint64_t>(t1 - t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, n));
@@ -6725,6 +6761,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (not kC3Split) c3_gate_wait();
         for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < 2; ++ c3_pass)
         for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + (c3_poller ? num_tokens * kNumChunks : c3_gw); token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += c3_nw) {
+#if defined(DG_MEGA_MOE_IB_DBG_XLATE) and DG_MEGA_MOE_IB_DBG_XLATE
+            // Debug proof knob, second half: the first lane to get here in pass 1 on rank 0 waits DBG_XLATE ns (every SM has
+            // parked its pass-0 sums by then) and only then issues the withheld last ordered x put to node slot 0
+            if (c3_pass == 1 and lane_idx == 0 and sym_buffer.rank_idx == 0 and ib_ord_on(num_tokens) and num_tokens > 0 and
+                atomicExch(reinterpret_cast<unsigned long long*>(ib_xo_flag + 235), static_cast<unsigned long long>(ib_epoch)) != ib_epoch) {
+                uint64_t t0_, t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0_));
+                do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); } while (t_ < t0_ + DG_MEGA_MOE_IB_DBG_XLATE);
+                const uint32_t d_chunks = (num_tokens + kIBChunk - 1) / kIBChunk, d_pc = kIBOrd / kIBChunk;
+                const uint32_t d_t0 = ((d_chunks - 1) / d_pc) * d_pc * kIBChunk;
+                const uint32_t d_orig = 2 * ib_R;
+                const auto d_stage = ib_pcomb(ib_my_node);
+                make_gin_site(4, ctx_piece(0, d_orig), d_orig, ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(d_t0) * kIBTokBytes,
+                    d_stage + static_cast<int64_t>(d_t0) * kIBTokBytes, static_cast<uint64_t>(num_tokens - d_t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(0)));
+            }
+            __syncwarp();
+#endif
             TT_CLOCK(tt_c0);
             const bool c3_local = not kC3Split or c3_pass == 0;
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
@@ -7079,6 +7131,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                        sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(48), mu(49), mu(50), mu(51), mu(52), mu(53), mu(54), mu(55));
             }
 #endif
+            if constexpr (kIBOrd > 0) {
+                const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_TRACEO rank=%u epoch=%llu | ord: first_group_staged=%.1f\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(56));
+            }
             if constexpr (kIBSB > 0) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
                 printf("OPUS_TRACESB rank=%u epoch=%llu | sb: meta_issued=%.1f poster_warm=%.1f flags_seen=%.1f on=%d\n",

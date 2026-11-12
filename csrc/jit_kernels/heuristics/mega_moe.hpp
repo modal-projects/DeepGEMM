@@ -73,7 +73,8 @@ struct MegaMoEConfig {
 // (block dim, dynamic smem bytes) and the kernel's template arguments, hence they live on the host; the resolved values
 // reach the kernel source as template arguments and DG_MEGA_MOE_HOSTCFG_* defines (part of the JIT cache key).
 // A value that cannot be honoured throws: there is no silent fallback.
-//   DG_MEGA_MOE_HOST_DISPATCH_THREADS  dispatch threads per CTA (128; multiple of 32, >= 64)
+//   DG_MEGA_MOE_HOST_DISPATCH_THREADS  dispatch threads per CTA (128; multiple of 128: the epilogue warps must start on a
+//                                      warpgroup boundary, as tensor memory lanes follow warp_idx % 4)
 //   DG_MEGA_MOE_HOST_EPILOGUE_THREADS  epilogue threads per CTA (256; multiple of 128)
 //   DG_MEGA_MOE_HOST_PULL_BUFS         smem pull buffers + mbarriers per dispatch warp (1; 1..4)
 //   DG_MEGA_MOE_HOST_PULL_BYTES        bytes per pull buffer (hidden bytes halved until <= 8192; must divide them, % 16 == 0)
@@ -264,8 +265,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_dispatch_threads = override_or("DG_MEGA_MOE_HOST_DISPATCH_THREADS", 128);
     const int num_non_epilogue_threads = 128;
     const int num_epilogue_threads = override_or("DG_MEGA_MOE_HOST_EPILOGUE_THREADS", num_default_epilogue_threads);
-    DG_MEGA_MOE_HOST_CHECK(num_dispatch_threads % 32 == 0 and num_dispatch_threads >= 64,
-        "DG_MEGA_MOE_HOST_DISPATCH_THREADS={}: need a multiple of 32, at least 64", num_dispatch_threads);
+    DG_MEGA_MOE_HOST_CHECK(num_dispatch_threads % 128 == 0,
+        "DG_MEGA_MOE_HOST_DISPATCH_THREADS={}: need a multiple of 128 (whole warpgroups before the epilogue warps)", num_dispatch_threads);
     DG_MEGA_MOE_HOST_CHECK(num_epilogue_threads % 128 == 0,
         "DG_MEGA_MOE_HOST_EPILOGUE_THREADS={}: need a multiple of 128", num_epilogue_threads);
     DG_MEGA_MOE_HOST_CHECK(num_dispatch_threads + num_non_epilogue_threads + num_epilogue_threads <= 1024,

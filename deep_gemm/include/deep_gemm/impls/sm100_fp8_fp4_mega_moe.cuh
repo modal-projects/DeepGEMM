@@ -903,7 +903,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumPullBufs = 1;
 #endif
     DG_STATIC_ASSERT(kNumPullBufs >= 1 and kNumPullBufs <= 4, "Invalid number of pull buffers per dispatch warp");
-    DG_STATIC_ASSERT(kNumDispatchThreads % 32 == 0 and kNumDispatchThreads >= 64, "Invalid number of dispatch threads");
+    // NOTES: the epilogue warps must start on a warpgroup boundary (tensor memory lanes follow `warp_idx % 4`), so
+    // dispatch warps come in fours; a layout that wants e.g. 6 working dispatch warps takes 8 and parks 2 on few registers
+    DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumThreads <= 1024, "Too many threads per CTA");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");

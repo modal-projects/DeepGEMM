@@ -3850,7 +3850,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // weight rows (both on the header context). Receivers poll every idx / weight unit (rule A) and learn nt from
             // the header, so the three may land in any order.
             IB_TRACE(24, epilogue_thread_idx == 0);
-            const bool sb_hdr_last = (kIBSB & 8) != 0 and ib_sb;
+            // SB & 32: header on the idx / weight QP from its own thread, started DG_MEGA_MOE_IB_SB_HDR_NS after the data puts
+            // (they have reserved their queue slots by then, so it lands behind them without waiting for them to return)
+#ifndef DG_MEGA_MOE_IB_SB_HDR_NS
+#define DG_MEGA_MOE_IB_SB_HDR_NS 3000
+#endif
+            const bool sb_hdr_timed = (kIBSB & 32) != 0 and ib_sb;
+            const bool sb_hdr_last = (kIBSB & 8) != 0 and ib_sb and not sb_hdr_timed;
+            const bool sb_same_qp = sb_hdr_last or sb_hdr_timed;
             // SB & 16: the x / SF posters are released when the meta puts START (they then queue behind them in the
             // put-issue serialization instead of waiting ~8 us for them to return)
             if ((kIBSB & 16) != 0 and ib_sb and epilogue_warp_idx <= 2 and lane_idx == 0)
@@ -3866,12 +3873,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             static_cast<uint64_t>(num_tokens) * kNumTopk * 8, cp);
                     SL_TR(0, 25, true);
                 } else if (epilogue_warp_idx == 1) {
-                    if (not sb_hdr_last)
+                    if (sb_hdr_timed) {
+                        uint64_t t0_, t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0_));
+                        do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); } while (t_ < t0_ + DG_MEGA_MOE_IB_SB_HDR_NS);
+                        make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put_value(
+                            reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
+                    } else if (not sb_hdr_last)
                     make_gin_site(2, ctx_mhdr(nr, hdr_orig(nr)), hdr_orig(nr), ib_xbase).put_value(
                         reinterpret_cast<uint64_t*>(dst + kIBOffHdr), (ib_epoch << 32) | num_tokens, cp);
                     SL_TR(0, 26, not sb_hdr_last);
                 } else if (num_tokens > 0) {
-                    if (sb_hdr_last)  // same QP as the idx rows: the header issued after both lands after both
+                    if (sb_same_qp)  // same QP as the idx rows: the header issued after both lands after both
                         make_gin_site(1, ctx_meta(nr, nr), nr, ib_xbase).put(dst + kIBOffW, ib_input_base + kIBOffW,
                             static_cast<uint64_t>(num_tokens) * kNumTopk * 4, cp);
                     else
@@ -4538,9 +4550,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // One thread polls the (NVLink-remote) header with a pause between polls: hundreds of threads spinning
                 // on a proxy's HBM while its NIC writes there slows the NIC down drastically on GB200
                 auto nt_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d) + kNumExpertsPerRank;
+#if defined(DG_MEGA_MOE_IB_HDR_SPIN) and DG_MEGA_MOE_IB_HDR_SPIN
+                constexpr bool kIBHdrSpin = true;   // the header poller spins without the 200 ns sleep (one thread per scan SM)
+#else
+                constexpr bool kIBHdrSpin = false;
+#endif
                 if (epilogue_thread_idx == 0) {
                     uint64_t h = 0;
-                    comm::wait_until([&]() { h = ptx::ld_volatile(hdr); if (ib_oracle_now and h != ~0ull) return true; if ((h >> 32) != (ib_epoch & 0xffffffffull)) __nanosleep(200); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
+                    comm::wait_until([&]() { h = ptx::ld_volatile(hdr); if (ib_oracle_now and h != ~0ull) return true; if (not kIBHdrSpin and (h >> 32) != (ib_epoch & 0xffffffffull)) __nanosleep(200); return (h >> 32) == (ib_epoch & 0xffffffffull); }, [&]() {
                         printf("DeepGEMM IB header timeout: rank=%u, source=%u, proxy=%u, header=%llx, epoch=%llu\n",
                                sym_buffer.rank_idx, r, proxy, (unsigned long long) h, (unsigned long long) ib_epoch);
                     });
@@ -4679,6 +4696,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Overlap orders: key1 (wave sort; every receiver) and key2 (stream combine; only r's proxy)
                 const bool d1_key1 = ib_ws_on(nt) and scan_j == 0;
                 const bool d1_key2 = ib_sc_on(nt) and proxy == sym_buffer.rank_idx and scan_j == 0;
+                // DG_MEGA_MOE_IB_KEY2_LATE=1: the proxy's return-order keys (global atomics, several per thread in sequence)
+                // are built in a second pass AFTER the counts are published: they are needed only by the forward-combine,
+                // and the proxy SMs were the slowest scans of every rank (B300 EP16 128 tokens: header 25 -> slots 35 us)
+#if defined(DG_MEGA_MOE_IB_KEY2_LATE) and DG_MEGA_MOE_IB_KEY2_LATE
+                constexpr bool kIBKey2Late = true;
+#else
+                constexpr bool kIBKey2Late = false;
+#endif
                 const auto keys1 = ib_keys(0), keys2 = ib_keys(1);
                 if (d1_key1 or d1_key2) {
                     for (uint32_t t = epilogue_thread_idx; t < nt; t += kNumEpilogueThreads)
@@ -4791,10 +4816,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             IB_POLL(v[u] == kIBIdxSentinel, v[u] = ptx::ld_volatile(idx + i), "d1_idx", r, i);
                             IB_POLL(wv[u] == 0xffffffffu, wv[u] = ptx::ld_volatile(wts + i), "d1_w", r, i);
                             const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                            if ((d1_key1 or d1_key2) and e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank / ib_lsa == ib_my_node) {
+                            if ((d1_key1 or (d1_key2 and not kIBKey2Late)) and e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank / ib_lsa == ib_my_node) {
                                 const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
                                 if (d1_key1) atomicMin(keys1 + i / kNumTopk, le);
-                                if (d1_key2) atomicMax(keys2 + i / kNumTopk, le);
+                                if (d1_key2 and not kIBKey2Late) atomicMax(keys2 + i / kNumTopk, le);
                             }
                             if (not (ib_sst and not (kCGDrop & 4096)) and ib_P == 1 and not ib_st_on(nt) and e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank == sym_buffer.rank_idx) {
                                 const uint32_t le = static_cast<uint32_t>(e) % kNumExpertsPerRank;
@@ -4840,6 +4865,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Overlap orders, after the count publish (off the count critical path): slot table (token -> mirror
                 // x row) and the proxy's return order, then an epoch flag the pulls / forward-combine acquire
                 if constexpr (kIBWaveSort or kIBStreamCombine or kIBEarlyPublish) {
+                    if (kIBKey2Late and d1_key2) {  // every entry was polled by the scan above (rule A): plain reloads
+                        for (uint32_t i = epilogue_thread_idx; i < nt * kNumTopk; i += kNumEpilogueThreads) {
+                            const int e = static_cast<int>(static_cast<int64_t>(ptx::ld_volatile(idx + i)));
+                            if (e >= 0 and static_cast<uint32_t>(e) / kNumExpertsPerRank / ib_lsa == ib_my_node)
+                                atomicMax(keys2 + i / kNumTopk, static_cast<uint32_t>(e) % kNumExpertsPerRank);
+                        }
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
                     if (d1_key1) {
                         ib_stable_sort(keys1, nt, epilogue_thread_idx, [&](const uint32_t& t, const uint32_t& pos) {
                             ib_tab[kIBTabSlot + k * kIBTabT + t] = kIBWSMode >= 2 ? t : pos;

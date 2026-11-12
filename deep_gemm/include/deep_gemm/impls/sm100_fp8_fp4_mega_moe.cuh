@@ -832,10 +832,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // DG_MEGA_MOE_IB_FF_DATA (1 = vector red, 0 = plain racing store, 2 = value-returning vector atom),
     // DG_MEGA_MOE_IB_FF_SIG (1 = release counter, 2 = relaxed counter, 0 = none: the proxy does not wait),
     // DG_MEGA_MOE_IB_FF_READ (1 = read + zero the sum, 0 = stage a zero record without reading). Only 1 / 1 / 1 is correct.
-    // FF_DATA=3 ("no re-arm" half): the epilogue stores the K partial rows as today and the proxy reads them once the counter is
-    // complete, with no sentinel poll and no re-arm (the counter is the flag). Numerically right with SIG=1 / READ=1, but it leaves the
-    // proxy's pcomb rows un-re-armed: every non-FUSED variant that runs later on the same buffer reads them as landed (the
-    // PCOMB_PARITY hazard). Dev server: alone in its request and the server restarted afterwards.
+    // FF_DATA=3 (rows + counter): the epilogue stores the K partial rows (st.relaxed.sys, a strong write) and the proxy reads them once the
+    // counter is complete, with no sentinel poll and no re-arm at all (the counter is the flag; stale rows are simply overwritten).
+    // The rows then never return to sentinels, so they must not live where another variant polls: with DG_MEGA_MOE_IB_PCOMB_COPIES >= 2
+    // they go to copy 1 (private); with one copy they stay in the shared buffer and every later non-FUSED variant reads them as
+    // landed (the PCOMB_PARITY hazard): on a dev server only with COPIES >= 2.
 #ifndef DG_MEGA_MOE_IB_FF_DATA
 #define DG_MEGA_MOE_IB_FF_DATA 1
 #endif
@@ -963,7 +964,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kIBRot = false;
 #endif
     const uint32_t rot_b = 1 + ib_parity, rot_o = 2 - ib_parity;
-    const auto rot_pc = [&](const uint32_t& n) { return kIBRot ? ib_pcomb_c(n, rot_b) : ib_pcomb(n); };
+    // FUSED_FIN with FF_DATA=3 (rows + counter): with extra copies the rows live in copy 1 (never re-armed, never read by another variant)
+    const auto rot_pc = [&](const uint32_t& n) {
+        return kIBRot ? ib_pcomb_c(n, rot_b) : ((kIBFused and kFFData == 3 and kIBPCombCopies >= 2) ? ib_pcomb_c(n, 1) : ib_pcomb(n)); };
     const auto rot_hdr = [&](const uint32_t& c) { return reinterpret_cast<uint64_t*>(ib_pcomb_c(ib_my_node, c)); };
     const auto rot_nt = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 128); };
     const auto rot_mask = [&](const uint32_t& c, const uint32_t& nr) {
@@ -4132,8 +4135,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                                 ib_cp(dst_rank_idx, ib_my_node)) = packed;
                                 continue;
                             }
-                            *sym_buffer.map(reinterpret_cast<float4*>(rot_pc(dst_rank_idx / ib_lsa) + off),
-                                            ib_cp(dst_rank_idx, ib_my_node)) = packed;
+                            if constexpr (kIBFused and kFFData == 3) {
+                                // rows + counter: the counter is the flag, so the row store must be a strong system-scope write
+                                const auto rp = sym_buffer.map(reinterpret_cast<float4*>(rot_pc(dst_rank_idx / ib_lsa) + off), ib_cp(dst_rank_idx, ib_my_node));
+                                const auto pk = reinterpret_cast<const uint4*>(&packed);
+                                asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};"
+                                             : : "l"(rp), "r"(pk->x), "r"(pk->y), "r"(pk->z), "r"(pk->w) : "memory");
+                            } else {
+                                *sym_buffer.map(reinterpret_cast<float4*>(rot_pc(dst_rank_idx / ib_lsa) + off),
+                                                ib_cp(dst_rank_idx, ib_my_node)) = packed;
+                            }
                             if constexpr (kIBFused and kFFSig == 4) {
                                 if (lane_idx % 16 == 0)
                                     asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(sym_buffer.map(

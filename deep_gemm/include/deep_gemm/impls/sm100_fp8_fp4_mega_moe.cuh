@@ -3283,6 +3283,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr uint32_t kOK = kNumExpertsPerRank + 1;  // buckets per node (the last: no pick on the node)
                 constexpr uint32_t kMx = kIBMSO > 0 ? kIBMSO : 1u;
                 constexpr uint32_t kOT = math::constexpr_ceil_div(static_cast<uint32_t>(kIBT), kNumEpilogueThreads * kMx);
+#if defined(DG_MEGA_MOE_IB_ORD_CONTIG) and DG_MEGA_MOE_IB_ORD_CONTIG
+                constexpr bool kOrdContig = kIBMSO > 0;
+#else
+                constexpr bool kOrdContig = false;
+#endif
+                const uint32_t ord_per = (num_tokens + kMx - 1) / kMx;  // tokens per SM (<= kOT * threads)
                 auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
                 constexpr uint32_t kOWStride = 3 * kOK;  // FAST: per-warp buckets [warp][<= 3 remote nodes][key] after oh
                 DG_STATIC_ASSERT(not kIBSSTFast or (kNumEpilogueWarps + 2 + (kIBMSO > 0 ? 2u : 0u)) * kOWStride * 2 + 4 <= sizeof(SharedStorage::smem_d), "ORD per-warp buckets in smem_d");
@@ -3300,7 +3306,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 SL_TR(0, 44, epilogue_thread_idx == 0);  // zeroed
                 uint32_t kk[kOT];
                 for (uint32_t j = 0; j < kOT; ++ j) {
-                    const uint32_t t = (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
+                    // DG_MEGA_MOE_IB_ORD_CONTIG=1: SM m owns a CONTIGUOUS token range (its 19 x 8 B idx rows are adjacent lines) instead of
+                    // every kMx-th token (each SM then touched every line of the idx region for 1/8 of its entries: keyed at 14 us)
+                    const uint32_t t = kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
+                                                  : (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
                     uint32_t packed = kNumExpertsPerRank * 0x01010101u;
                     if (t < num_tokens) {
                         uint32_t v[kNumTopk];
@@ -3382,7 +3391,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 for (uint32_t j = 0; j < kOT; ++ j) {
-                    const uint32_t t = (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
+                    // DG_MEGA_MOE_IB_ORD_CONTIG=1: SM m owns a CONTIGUOUS token range (its 19 x 8 B idx rows are adjacent lines) instead of
+                    // every kMx-th token (each SM then touched every line of the idx region for 1/8 of its entries: keyed at 14 us)
+                    const uint32_t t = kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
+                                                  : (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
                     if (t < num_tokens) {
                         if constexpr (not kIBSSTFast) {
                         for (uint32_t nr = 0; nr < ib_R; ++ nr) {

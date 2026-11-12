@@ -886,7 +886,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 ? kNumDeviceLocalityDomains : 1;
 
     // Template checks
-    DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
+    // Host layout (csrc/jit_kernels/heuristics/mega_moe.hpp, DG_MEGA_MOE_HOST_*): a host module that implements the
+    // overrides swallows the DG_MEGA_MOE_HOST_* names and defines DG_MEGA_MOE_HOSTCFG_*; an older one passes them
+    // through as plain defines without acting on them, which must not build
+#if (defined(DG_MEGA_MOE_HOST_DISPATCH_THREADS) and DG_MEGA_MOE_HOST_DISPATCH_THREADS) or \
+    (defined(DG_MEGA_MOE_HOST_EPILOGUE_THREADS) and DG_MEGA_MOE_HOST_EPILOGUE_THREADS) or \
+    (defined(DG_MEGA_MOE_HOST_PULL_BUFS) and DG_MEGA_MOE_HOST_PULL_BUFS) or \
+    (defined(DG_MEGA_MOE_HOST_PULL_BYTES) and DG_MEGA_MOE_HOST_PULL_BYTES) or \
+    (defined(DG_MEGA_MOE_HOST_STAGES) and DG_MEGA_MOE_HOST_STAGES) or \
+    (defined(DG_MEGA_MOE_HOST_SMEM_EXTRA) and DG_MEGA_MOE_HOST_SMEM_EXTRA)
+#error "DG_MEGA_MOE_HOST_* is set, but this host module (dev-server build) does not implement the host layout overrides"
+#endif
+#ifdef DG_MEGA_MOE_HOSTCFG_PULL_BUFS
+    constexpr uint32_t kNumPullBufs = DG_MEGA_MOE_HOSTCFG_PULL_BUFS;        // smem pull buffers + mbarriers per dispatch warp
+#else
+    constexpr uint32_t kNumPullBufs = 1;
+#endif
+    DG_STATIC_ASSERT(kNumPullBufs >= 1 and kNumPullBufs <= 4, "Invalid number of pull buffers per dispatch warp");
+    DG_STATIC_ASSERT(kNumDispatchThreads % 32 == 0 and kNumDispatchThreads >= 64, "Invalid number of dispatch threads");
+    DG_STATIC_ASSERT(kNumThreads <= 1024, "Too many threads per CTA");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
@@ -1492,7 +1510,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     struct SharedStorage {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
-        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
+        // Buffer b of dispatch warp w is `dispatch_send_buffer[w + b * kNumDispatchWarps]` (mbarrier: same index)
+        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps * kNumPullBufs][kNumBytesPerPull];
         union {
             alignas(kSharedMemoryAlignment) cutlass::float_e4m3_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M_L2 * BLOCK_N];
@@ -1503,7 +1522,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         task_info_t task_infos[kNumScheduleStages];
-        Barrier dispatch_barriers[kNumDispatchWarps];
+        Barrier dispatch_barriers[kNumDispatchWarps * kNumPullBufs];
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
@@ -1514,12 +1533,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t tmem_ptr_in_smem;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
+    // The host launches with DG_MEGA_MOE_HOSTCFG_SMEM_BYTES of dynamic smem, of which the last
+    // DG_MEGA_MOE_HOSTCFG_SMEM_EXTRA (DG_MEGA_MOE_HOST_SMEM_EXTRA, a multiple of 1024) are not part of `SharedStorage`:
+    // free scratch at `smem_buffer + kHostSmemExtraOffset` (16-byte aligned, `kHostSmemExtraBytes` long)
+    constexpr uint32_t kSharedStorageEnd = offsetof(SharedStorage, tmem_ptr_in_smem) + sizeof(uint32_t);
+#ifdef DG_MEGA_MOE_HOSTCFG_SMEM_BYTES
+    constexpr uint32_t kHostSmemExtraOffset = (DG_MEGA_MOE_HOSTCFG_SMEM_BYTES - DG_MEGA_MOE_HOSTCFG_SMEM_EXTRA + 15u) / 16u * 16u;
+    constexpr uint32_t kHostSmemExtraBytes = DG_MEGA_MOE_HOSTCFG_SMEM_BYTES - kHostSmemExtraOffset;
+    DG_STATIC_ASSERT(DG_MEGA_MOE_HOSTCFG_SMEM_BYTES <= 232448, "Dynamic smem above the SM100 capacity");
+    DG_STATIC_ASSERT(kSharedStorageEnd <= DG_MEGA_MOE_HOSTCFG_SMEM_BYTES - DG_MEGA_MOE_HOSTCFG_SMEM_EXTRA,
+                     "SharedStorage does not fit the dynamic smem the host launches with");
+#else
+    constexpr uint32_t kHostSmemExtraOffset = 0, kHostSmemExtraBytes = 0;
+#endif
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
     // Send buffers
     constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
     const auto smem_send_buffers = layout::Buffer(
-        pull_layout, kNumDispatchWarps, 1,
+        pull_layout, kNumDispatchWarps * kNumPullBufs, 1,
         static_cast<void*>(shared_storage.dispatch_send_buffer));
 
     // Tensor memory size
@@ -1547,7 +1579,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     } else if (warp_idx == 1) {
         // Init m-barriers for dispatch
         #pragma unroll
-        for (uint32_t i = lane_idx; i < kNumDispatchWarps; i += 32)
+        for (uint32_t i = lane_idx; i < kNumDispatchWarps * kNumPullBufs; i += 32)
             shared_storage.dispatch_barriers[i].init(1);
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
@@ -1673,9 +1705,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     // IB: the dispatch warps hold Gin state and the row poll/copy; keep the 96-register split
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64 and not kIsIB;
+    // DG_MEGA_MOE_REGS_DISPATCH / _MID / _EPILOGUE: per-thread register split (setmaxnreg), e.g. to pay for more
+    // dispatch warps (DG_MEGA_MOE_HOST_DISPATCH_THREADS) out of the epilogue's registers
+#if defined(DG_MEGA_MOE_REGS_DISPATCH) and DG_MEGA_MOE_REGS_DISPATCH
+    constexpr uint32_t kNumDispatchRegisters = DG_MEGA_MOE_REGS_DISPATCH;
+#else
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
+#endif
+#if defined(DG_MEGA_MOE_REGS_MID) and DG_MEGA_MOE_REGS_MID
+    constexpr uint32_t kNumNonEpilogueRegisters = DG_MEGA_MOE_REGS_MID;
+#else
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
+#endif
+#if defined(DG_MEGA_MOE_REGS_EPILOGUE) and DG_MEGA_MOE_REGS_EPILOGUE
+    constexpr uint32_t kNumEpilogueRegisters = DG_MEGA_MOE_REGS_EPILOGUE;
+#else
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;
+#endif
+    DG_STATIC_ASSERT(kNumDispatchRegisters % 8 == 0 and kNumNonEpilogueRegisters % 8 == 0 and kNumEpilogueRegisters % 8 == 0 and
+                     kNumDispatchRegisters >= 24 and kNumNonEpilogueRegisters >= 24 and kNumEpilogueRegisters <= 256,
+                     "setmaxnreg takes multiples of 8 in [24, 256]");
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,

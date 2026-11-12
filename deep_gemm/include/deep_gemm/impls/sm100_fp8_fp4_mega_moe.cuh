@@ -438,6 +438,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // NVLink in their pull (one load per row) instead of the proxy writing ~K x T scattered entries over NVLink
     constexpr int64_t kIBPTabStride = static_cast<int64_t>(kNumRanks) * kNumExpertsPerRank * kIBT * 4;
     constexpr int64_t kIBNodeStride = 2 * kIBMirrorStride + 2 * kIBRetStride + kIBPCombStride + kIBFStageStride + kIBPTabStride;
+    // DG_MEGA_MOE_IB_PCOMB_COPIES=C (allocation-time: deep_gemm/mega/__init__.py reads the same env var): C - 1 extra copies of every
+    // node's proxy combine buffer, placed AFTER all node slots, so a kernel built without the knob uses exactly the old offsets
+    // and never touches them. Copy c >= 1 of node n: tail + nodes * kIBNodeStride + ((c - 1) * nodes + n) * kIBPCombStride.
+#ifndef DG_MEGA_MOE_IB_PCOMB_COPIES
+#define DG_MEGA_MOE_IB_PCOMB_COPIES 1
+#endif
+    constexpr int64_t kIBPCombCopies = DG_MEGA_MOE_IB_PCOMB_COPIES;
     constexpr uint32_t kIBChunk = 32;  // tokens per dispatch x put and per return put
     // DG_MEGA_MOE_IB_X_PIECE=N: tokens per dispatch x put (sender only; receivers poll rows), default kIBChunk.
     // DG_MEGA_MOE_IB_X_NCTX=C: x / SF pieces spread over at most C contexts (HDR_CTX). With X_ORDER, fewer and larger
@@ -643,6 +650,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ib_mirror = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + p * kIBMirrorStride; };
     const auto ib_ret = [&](const uint32_t& p, const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + p * kIBRetStride; };
     const auto ib_pcomb = [&](const uint32_t& n) { return ib_tail + n * kIBNodeStride + 2 * kIBMirrorStride + 2 * kIBRetStride; };
+    const auto ib_pcomb_c = [&](const uint32_t& n, const uint32_t& c) {
+        return c == 0 ? ib_pcomb(n) : ib_tail + ib_num_nodes * kIBNodeStride + (static_cast<int64_t>(c - 1) * ib_num_nodes + n) * kIBPCombStride; };
     const auto ib_fstage = [&](const uint32_t& n) { return ib_pcomb(n) + kIBPCombStride; };
     const auto ib_ptab = [&](const uint32_t& n) { return reinterpret_cast<uint32_t*>(ib_fstage(n) + kIBFStageStride); };
     const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
@@ -1082,6 +1091,51 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool kIBDeferRearm = false;
 #endif
+    // DG_MEGA_MOE_IB_PCOMB_ROT=1 (end side; needs PCOMB_COPIES >= 3; TRT-LLM LamportComm rotating buffers, PRIOR_ART 2b): the partial rows
+    // keep today's protocol (the data is its own flag, every 16-byte unit polled), but nothing is re-armed inside the layer. Launch
+    // N's partials go to copy 1 + (N & 1); the forward-combine records which rows it read (per token: mask of node-local top-k
+    // slots) and the NEXT rotating launch re-arms exactly those rows at its count wait, when the dispatch warps are idle. Copy 0
+    // is never used by a rotating launch, so non-rotating variants on the same buffer always find it all-sentinel.
+    // Self-describing state per copy, in OUR OWN node's (otherwise unused) copy of that buffer: header u64 (~0 = every row is a
+    // sentinel, as after allocation; else the epoch of the launch whose rows it holds), nt[16], masks [R][T]. A launch that finds
+    // the copy it is about to use still dirty (the launch in between was not a rotating one) re-arms it BEFORE the dispatch grid
+    // sync, i.e. before the pre-pull barrier and any node peer's L2. An aborted launch traps and takes the buffer with it.
+#if defined(DG_MEGA_MOE_IB_PCOMB_ROT) and DG_MEGA_MOE_IB_PCOMB_ROT
+    constexpr bool kIBRot = kIBReduceOnArrival;
+    DG_STATIC_ASSERT(kIBPCombCopies >= 3, "PCOMB_ROT needs DG_MEGA_MOE_IB_PCOMB_COPIES >= 3 (set when the buffer is allocated)");
+    DG_STATIC_ASSERT(not kIBDeferRearm, "PCOMB_ROT excludes FWD_DEFER_REARM");
+#else
+    constexpr bool kIBRot = false;
+#endif
+    const uint32_t rot_b = 1 + ib_parity, rot_o = 2 - ib_parity;
+    const auto rot_pc = [&](const uint32_t& n) { return kIBRot ? ib_pcomb_c(n, rot_b) : ib_pcomb(n); };
+    const auto rot_hdr = [&](const uint32_t& c) { return reinterpret_cast<uint64_t*>(ib_pcomb_c(ib_my_node, c)); };
+    const auto rot_nt = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 128); };
+    const auto rot_mask = [&](const uint32_t& c, const uint32_t& nr) {
+        return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 256) + static_cast<int64_t>(nr) * kIBT; };
+    // re-arm every row copy c holds (dispatch warps of all SMs, one warp per token)
+    const auto rot_rearm = [&](const uint32_t& c) {
+        const uint32_t gw = warp_idx * kNumSMs + sm_idx;
+        constexpr uint32_t kGW = kNumSMs * kNumDispatchWarps;
+        constexpr uint32_t kRowUnits = kHidden * 2 / 16;
+        constexpr uint32_t kSlotMask = kNumTopk >= 32 ? 0xffffffffu : (1u << kNumTopk) - 1u;
+        const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+            const uint32_t nt_prev = cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr));
+            const auto pc_prev = ib_pcomb_c(ib_node_of_slot(nr), c);
+            const auto tab = rot_mask(c, nr);
+            for (uint32_t t = gw; t < nt_prev; t += kGW) {
+                uint32_t m = ptx::ld_volatile(tab + t) & kSlotMask;
+                while (m) {
+                    const uint32_t k = __ffs(m) - 1;
+                    m &= m - 1;
+                    const auto row = reinterpret_cast<uint4*>(pc_prev + (static_cast<int64_t>(k) * kIBT + t) * kHidden * 2);
+                    for (uint32_t u = lane_idx; u < kRowUnits; u += 32)
+                        row[u] = ones;
+                }
+            }
+        }
+    };
     // DG_MEGA_MOE_IB_EARLY_REARM=1 (tail 3, end of kernel): the dispatch warps re-arm the mirrors BEFORE the cleanup barrier, as
     // soon as every node-local rank has published its combine-ready flag (= its L2 grid sync, so all its L1 pulls from our
     // mirrors are done) and our forward-combine polled every row, instead of after the cleanup barrier at the very end
@@ -1514,6 +1568,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             const auto ret_dst = ib_ret(ib_parity, ib_my_node);
+            if constexpr (kIBRot) {
+                if (lane_idx == 0) rot_nt(rot_b)[nr] = nt;  // read by the launch that re-arms this copy (same value from every warp)
+            }
             if (nt == 0 or (fi_on and fi_g / fi_R >= nt * (kIBRetGroups > 0 ? kIBRetGroups : 4))) {
                 if (not fi_on and is_leader)
                     make_gin_site(16, ctx_rhdr(nr, nr), nr, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ret_dst + kIBRetHdr), ib_epoch, s);
@@ -1522,7 +1579,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             const auto mir = ib_mirror(ib_parity, n);
             const auto fst = ib_fstage(n);
-            const auto pc = ib_pcomb(n);
+            const auto pc = rot_pc(n);
             const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
             // Work item = (token, quarter of the hidden dim): 4 warps per token, every load of an item issued back to back
             constexpr uint32_t kSplit = kIBRetGroups > 0 ? kIBRetGroups : 4;
@@ -1600,6 +1657,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         else IB_POLL(ib_is_sentinel4(ib_ldv4(sfp)), (void) 0, "c2_sf", s, t);
                     }
                 }
+                if constexpr (kIBRot) {
+                    if (qtr == 0 and lane_idx == 0) rot_mask(rot_b, nr)[t] = on_mask;  // PCOMB_ROT: the rows a later launch re-arms
+                }
                 // Reduce node-local slots in top-k order (fp32): per slot, the item's pieces are loaded together
                 float2 acc[kPPI][4];
                 #pragma unroll
@@ -1639,7 +1699,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             if constexpr (kIBReduceOnArrival) {
                                 tt_miss |= ib_is_sentinel4(v[bb][i]);
                                 IB_POLL(ib_is_sentinel4(v[bb][i]), v[bb][i] = ib_ldv4(ptr), "c2_pcomb", t, k);
-                                if constexpr (not kIBDeferRearm)
+                                if constexpr (not kIBDeferRearm and not kIBRot)
                                     *reinterpret_cast<uint4*>(ptr) = uint4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
                             }
                             const auto b = reinterpret_cast<const nv_bfloat162*>(&v[bb][i]);
@@ -1824,6 +1884,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 #endif
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // PCOMB_ROT: state of the two rotating partial buffers, read by every SM before dispatch grid sync 0 (SM 0 rewrites it after)
+        uint64_t rot_hb = ~0ull, rot_ho = ~0ull;
+        if constexpr (kIBRot) {
+            rot_hb = ptx::ld_volatile(rot_hdr(rot_b));
+            rot_ho = ptx::ld_volatile(rot_hdr(rot_o));
+            // the buffer this launch's partials land in still holds an earlier launch's rows (the launch in between was not a
+            // rotating one): they must be sentinels before any node peer's L2, i.e. before the pre-pull barrier
+            if (rot_hb != ~0ull)
+                rot_rearm(rot_b);
+        }
+#endif
         IB_STAGE(6, thread_idx == 0);  // dispatch warps started
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -1927,6 +1999,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             [&]() { return make_gin(0); }, ib_epoch, false, true, false);
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
+        if constexpr (kIBRot) {
+            if (sm_idx == 0 and thread_idx == 0)
+                *rot_hdr(rot_b) = ib_epoch;  // from here on copy rot_b holds this launch's rows (every SM read the old state before grid sync 0)
+        }
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
@@ -1988,6 +2064,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBRot) {
+            // PCOMB_ROT: the previous rotating launch's rows sit in the copy this launch does not use: re-arm them while the counts
+            // are in flight (every dispatch warp of every SM passes here on every path; nobody writes that copy before the next launch)
+            if (rot_ho != ~0ull)
+                rot_rearm(rot_o);
+        }
+#endif
         // Wait token data arrival
         IB_TRACE_MAX(12, thread_idx == 0);  // dispatch warps reach the count wait, slowest SM
         scheduler.fetch_expert_recv_count();
@@ -2688,6 +2772,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and thread_idx == 0)
             workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
 #endif
+        if constexpr (kIBRot) {
+            if (sm_idx == 0 and thread_idx == 0 and rot_ho != ~0ull)
+                *rot_hdr(rot_o) = ~0ull;  // every SM's dispatch warps re-armed their share of the other copy before their pulls
+        }
         if (sm_idx == 0 and thread_idx == 0)
             *workspace.get_ib_epoch_ptr() = ib_epoch;
 #else
@@ -4929,7 +5017,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (is_remote(dst_rank_idx)) {
                             const auto off = reinterpret_cast<const uint8_t*>(dst_ptr) -
                                 reinterpret_cast<const uint8_t*>(buffer.combine_token_buffer.get_base_ptr());
-                            *sym_buffer.map(reinterpret_cast<float4*>(ib_pcomb(dst_rank_idx / ib_lsa) + off),
+                            *sym_buffer.map(reinterpret_cast<float4*>(rot_pc(dst_rank_idx / ib_lsa) + off),
                                             ib_cp(dst_rank_idx, ib_my_node)) = packed;
                             continue;
                         }

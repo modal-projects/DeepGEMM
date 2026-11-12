@@ -62,7 +62,11 @@ class SymmBuffer:
             lsa_guess = int(_os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0')) or min(group.size(), torch.cuda.device_count())
             num_nodes = (group.size() + lsa_guess - 1) // lsa_guess
             tail = a128(num_bytes)
-            num_bytes = tail + num_nodes * node_stride
+            # DG_MEGA_MOE_IB_PCOMB_COPIES=C: C - 1 extra copies of every node's proxy combine buffer after all node slots
+            # (rotating partial buffers, DG_MEGA_MOE_IB_PCOMB_ROT; kernels built without the knob keep the old offsets)
+            pcomb_copies = int(_os.environ.get('DG_MEGA_MOE_IB_PCOMB_COPIES', '1'))
+            assert pcomb_copies >= 1
+            num_bytes = tail + num_nodes * node_stride + (pcomb_copies - 1) * num_nodes * K * T * H * 2
             self.buffer, self.handle = _ib.allocate(group, num_bytes)
             assert self.handle.num_lsa_ranks >= lsa_guess or self.handle.num_lsa_ranks == group.size(), \
                 f'IB tail sized for NVLink domains of {lsa_guess}, got {self.handle.num_lsa_ranks}'

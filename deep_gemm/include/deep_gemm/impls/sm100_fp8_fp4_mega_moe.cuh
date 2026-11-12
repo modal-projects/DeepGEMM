@@ -823,6 +823,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // DG_MEGA_MOE_IB_FF_DATA (1 = vector red, 0 = plain racing store, 2 = value-returning vector atom),
     // DG_MEGA_MOE_IB_FF_SIG (1 = release counter, 2 = relaxed counter, 0 = none: the proxy does not wait),
     // DG_MEGA_MOE_IB_FF_READ (1 = read + zero the sum, 0 = stage a zero record without reading). Only 1 / 1 / 1 is correct.
+    // FF_DATA=3 ("no re-arm" half): the epilogue stores the K partial rows as today and the proxy reads them once the counter is
+    // complete, with no sentinel poll and no re-arm (the counter is the flag). Numerically right with SIG=1 / READ=1, but it leaves the
+    // proxy's pcomb rows un-re-armed: every non-FUSED variant that runs later on the same buffer reads them as landed (the
+    // PCOMB_PARITY hazard). Dev server: alone in its request and the server restarted afterwards.
 #ifndef DG_MEGA_MOE_IB_FF_DATA
 #define DG_MEGA_MOE_IB_FF_DATA 1
 #endif
@@ -843,6 +847,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kFFNBlocks = L2_SHAPE_N / BLOCK_N;  // counter increments per (row, launch): one per L2 N-block task
     constexpr uint32_t kFFMagic = 0x46464e31u;
     DG_STATIC_ASSERT(not kIBFused or kIBFp8Combine, "FUSED_FIN stages fp8 records");
+    DG_STATIC_ASSERT(not kIBFused or kFFData != 3 or kFFSig != 0, "FF_DATA=3 needs the counter (the rows are no longer their own flag)");
     // sum row of token t from source node n (same address on the writer and the proxy: both are on this node)
     const auto ff_acc = [&](const uint32_t& n) { return ib_pcomb(ib_my_node) + (2 + (n < ib_my_node ? n : n - 1)) * kFFSlot; };
     const auto ff_cnt = [&](const uint32_t& n) {
@@ -1326,7 +1331,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tt_miss |= cv != expected;
                             IB_POLL(cv != expected, cv = ptx::ld_acq_sys(cp), "ff_cnt", t, cv);
                         }
-                        if constexpr (kFFRead != 0) {
+                        if constexpr (kFFRead != 0 and kFFData != 3) {
                             const auto row = ff_acc(n) + static_cast<int64_t>(t) * kHidden * 2;
                             uint4 v[kPPI];
                             #pragma unroll
@@ -1342,7 +1347,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
                     }
-                    m = 0;
+                    if constexpr (not (kFFData == 3 and kFFRead != 0))
+                        m = 0;
                 }
                 while (m) {
                     // kBatch slots at a time (top-k order kept): all their loads first, then the checks / accumulation
@@ -1372,7 +1378,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < kPPI; ++ i) {
                             const auto ptr = row + ((qtr * kPPI + i) * 32 + lane_idx) * 16;
-                            if constexpr (kIBReduceOnArrival) {
+                            if constexpr (kIBReduceOnArrival and not kIBFused) {
                                 tt_miss |= ib_is_sentinel4(v[bb][i]);
                                 IB_POLL(ib_is_sentinel4(v[bb][i]), v[bb][i] = ib_ldv4(ptr), "c2_pcomb", t, k);
                                 if constexpr (not kIBDeferRearm)
@@ -2365,6 +2371,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
         if (sm_idx == 0 and thread_idx == 0)
             workspace.signals->ib_trace[18] = workspace.signals->ib_trace[17] - workspace.signals->ib_trace[16];
+#endif
+#if defined(DG_MEGA_MOE_IB_FF_VERIFY) and DG_MEGA_MOE_IB_FF_VERIFY
+        if constexpr (kIBFused and kFFClean) {
+            // FUSED_FIN self-check of the completion signal (debug; ~31 MB of loads at the very end): the proxy zeroes a sum right
+            // after reading it, and every node peer is past its L2 here (cleanup barrier), so any non-zero unit is an add that
+            // arrived AFTER the counter said the token was complete (it would have been dropped from the record)
+            const uint32_t vg = sm_idx * kNumDispatchThreads + thread_idx;
+            uint32_t late = 0;
+            for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+                const uint32_t n = ib_node_of_slot(nr);
+                const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+                const auto ab = ff_acc(n);
+                for (int64_t u = vg; u < static_cast<int64_t>(nt) * (kHidden * 2 / 16); u += kNumSMs * kNumDispatchThreads) {
+                    const uint4 v = ib_ldv4(ab + u * 16);
+                    if (((v.x | v.y | v.z | v.w) & 0x7fff7fffu) != 0u) {
+                        if (late == 0)
+                            printf("DeepGEMM STAGE FF_LATE rank=%u epoch=%llu node=%u token=%u unit=%u v=%08x %08x %08x %08x\n", sym_buffer.rank_idx,
+                                   (unsigned long long) ib_epoch, n, static_cast<uint32_t>(u / (kHidden * 2 / 16)), static_cast<uint32_t>(u % (kHidden * 2 / 16)), v.x, v.y, v.z, v.w);
+                        ++ late;
+                    }
+                }
+            }
+            if (late != 0)
+                asm volatile("trap;");
+        }
 #endif
         if constexpr (kIBFused) {
             if (sm_idx == 0 and thread_idx == 0) {
@@ -3863,7 +3894,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                         // C1: rows of sources on other nodes go to the proxy's combine buffer (same layout), over NVLink
                         if (is_remote(dst_rank_idx)) {
-                            if constexpr (kIBFused) {
+                            if constexpr (kIBFused and kFFData != 3) {
                                 // FUSED_FIN: add this 16-byte unit into the token's running sum on the proxy
                                 const auto ap = sym_buffer.map(
                                     ff_acc(dst_rank_idx / ib_lsa) + static_cast<int64_t>(dst_token_idx) * (kHidden * 2) +

@@ -1727,6 +1727,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumDispatchRegisters % 8 == 0 and kNumNonEpilogueRegisters % 8 == 0 and kNumEpilogueRegisters % 8 == 0 and
                      kNumDispatchRegisters >= 24 and kNumNonEpilogueRegisters >= 24 and kNumEpilogueRegisters <= 256,
                      "setmaxnreg takes multiples of 8 in [24, 256]");
+    // The CTA's register pool is what it is LAUNCHED with: kNumThreads x the kernel's register count, which ptxas caps at
+    // 65536 / kNumThreads rounded down to a multiple of 8 (512 threads: 128 -> 65536; 640 threads: 96 -> 61440). A split
+    // that asks for more never completes its setmaxnreg.inc: the last epilogue warps block forever (EP16, 2026-11-12:
+    // 8 dispatch warps with 96 / 72 / 120 = 64512 > 61440 hung in the first epilogue barrier, no meta was ever posted).
+    constexpr uint32_t kNumLaunchRegisters = 65536u / kNumThreads / 8u * 8u < 128u ? 65536u / kNumThreads / 8u * 8u : 128u;
+    DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
+                     kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
+                     kNumEpilogueRegisters * kNumEpilogueThreads <= kNumLaunchRegisters * kNumThreads,
+                     "Register split exceeds the pool the CTA is launched with (setmaxnreg.inc would block forever)");
+    DG_STATIC_ASSERT(kNumDispatchRegisters <= kNumLaunchRegisters and kNumNonEpilogueRegisters <= kNumLaunchRegisters,
+                     "setmaxnreg.dec above the launch register count");
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,

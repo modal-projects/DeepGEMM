@@ -2690,10 +2690,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 if (task_info.block_phase == sched::BlockPhase::Linear2) {
-                    PF_CLK(pf_d0);
                     l2_k_block_dependency.wait(k_block_idx);
-                    PF_ADDTO(pf_acc_a[6], pf_d0);
-                    PF_HIST(2, k_block_idx == 0 and lane_idx == 0);
+#if DG_PF
+                    if (k_block_idx == 0) {  // slot 4: this L2 task waited for its block's first L1 N blocks (later K blocks are not timed)
+                        PF_L(a, 6);
+                        PF_HIST(2, lane_idx == 0);
+                    }
+#endif
                 }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                 if (task_info.block_phase == sched::BlockPhase::Linear2 and k_block_idx == 0 and cute::elect_one_sync())
@@ -2884,7 +2887,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
 #if DG_PF
                 const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);
-                uint32_t pf_full = 0;
+                uint32_t pf_full = 0;  // PROF >= 2: time this task's K loop waited for TMA data (weights / activations)
                 PF_L(m, 0);  // waited for a task
 #endif
 
@@ -2917,9 +2920,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait TMA load completion
+#if DG_PF and DG_MEGA_MOE_IB_PROF >= 2
                     PF_CLK(pf_f0);
                     shared_storage.full_barriers[stage_idx].wait(phase);
                     PF_ADDTO(pf_full, pf_f0);
+#else
+                    shared_storage.full_barriers[stage_idx].wait(phase);
+#endif
                     ptx::tcgen05_after_thread_sync();
 
                     const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;

@@ -6462,6 +6462,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
         // All local L2 writes are done after this grid sync
+#if defined(DG_MEGA_MOE_IB_FWD_RETIRE) and DG_MEGA_MOE_IB_FWD_RETIRE and not (defined(DG_MEGA_MOE_IB_FWD_JOIN_EARLY) and DG_MEGA_MOE_IB_FWD_JOIN_EARLY)
+#error "DG_MEGA_MOE_IB_FWD_RETIRE needs DG_MEGA_MOE_IB_FWD_JOIN_EARLY=1 (a retired SM's epilogue warps reduce before the L2 grid sync)"
+#endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_FWD_JOIN_EARLY) and DG_MEGA_MOE_IB_FWD_JOIN_EARLY
         // DG_MEGA_MOE_IB_FWD_JOIN_EARLY=1 (tail): the grid sync is ~10 us (128 tokens) to ~16 us (1024) of waiting for every SM's last
         // task and the NVLink store drain. Only epilogue warp 0 waits for it (thread 0 does the count, lanes < ranks raise the

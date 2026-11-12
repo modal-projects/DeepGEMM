@@ -520,13 +520,40 @@ struct MegaMoEScheduler {
         // `get_next_task()` advances global task counters and must not run before the
         // schedule slot is released by consumers.
         task_info_t task_info;
+        // DG_MEGA_MOE_IB_FWD_RETIRE=P (with DG_MEGA_MOE_IB_FWD_JOIN_EARLY; "dynamic SMs"): P percent of the clusters (CTA pairs), evenly
+        // spread, stop claiming tasks once DG_MEGA_MOE_IB_FWD_RETIRE_AT percent of the routed L2 tasks of their locality domain are
+        // handed out. They publish the end sentinel exactly like a cluster that ran out of work (tasks already published are still
+        // executed; nothing is claimed and dropped), skip the shared tail tasks (dynamically claimed: the other clusters take them),
+        // and their epilogue warps go to the forward-combine (JOIN_EARLY: warp 0 counts the SM into the L2 grid sync as today).
+        // Scheduler invariants are untouched: every claim still comes from the global counters in order, and the L1 lead that an L2
+        // claim waits for is a property of the claimed counts, not of how many schedulers are left. RETIRE_AT=101: dead control.
+#if defined(DG_MEGA_MOE_IB_FWD_RETIRE) and DG_MEGA_MOE_IB_FWD_RETIRE
+#ifndef DG_MEGA_MOE_IB_FWD_RETIRE_AT
+#define DG_MEGA_MOE_IB_FWD_RETIRE_AT 80
+#endif
+        const uint32_t retire_cid = blockIdx.x / 2;
+        const bool retire_me = (retire_cid * static_cast<uint32_t>(DG_MEGA_MOE_IB_FWD_RETIRE)) / 100 !=
+                               ((retire_cid + 1) * static_cast<uint32_t>(DG_MEGA_MOE_IB_FWD_RETIRE)) / 100;
+        bool retired = false;
+#else
+        constexpr bool retired = false;
+#endif
         do {
             task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+#if defined(DG_MEGA_MOE_IB_FWD_RETIRE) and DG_MEGA_MOE_IB_FWD_RETIRE
+            if (retire_me) {
+                const uint64_t l2c = ptx::ld_volatile(workspace.get_l2_task_count_ptr() + sm_locality_domain_idx);
+                if (l2c * 100 >= static_cast<uint64_t>(DG_MEGA_MOE_IB_FWD_RETIRE_AT) * num_total_m_blocks * (kNumL2Clusters / kNumLocalityDomains)) {
+                    retired = true;
+                    break;
+                }
+            }
+#endif
             task_info = get_next_task();
             if (task_info.is_valid()) publish_task(task_info, lane_idx);
         } while (task_info.is_valid());
 
-        if constexpr (kHasShared) {
+        if constexpr (kHasShared) if (not retired) {
             if (kRoutedFirst)  // remaining shared L1 claims (the counter continues where the yield left it)
                 shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr());

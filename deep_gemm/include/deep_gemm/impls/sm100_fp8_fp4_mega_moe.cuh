@@ -1038,8 +1038,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     const uint32_t rot_b = 1 + ib_parity, rot_o = 2 - ib_parity;
     // FUSED_FIN with FF_DATA=3 (rows + counter): with extra copies the rows live in copy 1 (never re-armed, never read by another variant)
+    // Scratch copy for variants whose rows never return to sentinels (FF_DATA=3 rows + signal; SAFE_CEIL=3): the LAST copy when it is
+    // not one of the two rotating ones (COPIES >= 4, or exactly 2 on a build that never rotates); a marker word in our own node's
+    // scratch copy says whether its flag units are still all sentinels (SAFE_CEIL=3 keeps them so, FF_DATA=3 does not)
+    constexpr uint32_t kIBScratchCopy = kIBPCombCopies >= 4 ? static_cast<uint32_t>(kIBPCombCopies - 1) : (kIBPCombCopies == 2 ? 1u : 0u);
+    DG_STATIC_ASSERT(not (kIBFused and kFFData == 3) or kIBPCombCopies != 3, "FF_DATA=3 needs COPIES 2 or >= 4 (copies 1-2 rotate)");
+#if defined(DG_MEGA_MOE_IB_SAFE_CEIL) and DG_MEGA_MOE_IB_SAFE_CEIL >= 3
+    // SAFE_CEIL=3 (clean ceiling): the epilogue's stores are EXACTLY today's (same instruction, whole rows) but land in the scratch
+    // copy; the forward-combine polls + re-arms only one unit in 16 there and sums nothing
+    constexpr bool kIBSafeCeil3 = true;
+    DG_STATIC_ASSERT(kIBScratchCopy >= 1, "SAFE_CEIL=3 needs a scratch pcomb copy (COPIES 2 or >= 4)");
+#else
+    constexpr bool kIBSafeCeil3 = false;
+#endif
     const auto rot_pc = [&](const uint32_t& n) {
-        return kIBRot ? ib_pcomb_c(n, rot_b) : ((kIBFused and kFFData == 3 and kIBPCombCopies >= 2) ? ib_pcomb_c(n, 1) : ib_pcomb(n)); };
+        return kIBRot ? ib_pcomb_c(n, rot_b) : (((kIBFused and kFFData == 3) or kIBSafeCeil3) ? ib_pcomb_c(n, kIBScratchCopy) : ib_pcomb(n)); };
+    const auto scr_marker = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, kIBScratchCopy) + 64); };
     const auto rot_hdr = [&](const uint32_t& c) { return reinterpret_cast<uint64_t*>(ib_pcomb_c(ib_my_node, c)); };
     const auto rot_nt = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 128); };
     const auto rot_mask = [&](const uint32_t& c, const uint32_t& nr) {
@@ -1797,6 +1811,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // rotating one): they must be sentinels before any node peer's L2, i.e. before the pre-pull barrier
             if (rot_hb != ~0ull)
                 rot_rearm(rot_b);
+        }
+        if constexpr (kIBSafeCeil3) {
+            // the scratch copy's flag units must be sentinels before any node peer's L2 (a rows + signal arm may have run before)
+            if (ptx::ld_volatile(scr_marker()) != kFFMagic) {
+                const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+                for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+                    const auto base = ib_pcomb_c(ib_node_of_slot(nr), kIBScratchCopy);
+                    for (int64_t v = static_cast<int64_t>(sm_idx) * kNumDispatchThreads + thread_idx; v < kIBPCombStride / 256; v += static_cast<int64_t>(kNumSMs) * kNumDispatchThreads)
+                        *reinterpret_cast<uint4*>(base + v * 256) = ones;
+                }
+            }
         }
         if constexpr (kIBFused) {
             // FUSED_FIN state check (before the dispatch grid sync, so before any node peer's L2): a launch that leaves the counters /
@@ -2731,9 +2756,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sm_idx == 0 and thread_idx == 0 and rot_ho != ~0ull)
                 *rot_hdr(rot_o) = ~0ull;  // every SM's dispatch warps re-armed their share of the other copy before their pulls
         }
-        if constexpr (kIBSafeCeil) {
+        if constexpr (kIBSafeCeil and not kIBSafeCeil3) {
             if (sm_idx == 0 and thread_idx == 0)
                 ff_marker()[0] = 0u, ff_marker()[1] = 0u, ff_marker()[2] = 0u;  // the junk area overlaps the FUSED_FIN sums / counters
+        }
+        if constexpr (kIBScratchCopy >= 1) {
+            if (sm_idx == 0 and thread_idx == 0) {
+                if (kIBSafeCeil3) *scr_marker() = kFFMagic;                 // flag units all re-armed
+                else if (kIBFused and kFFData == 3) *scr_marker() = 0u;     // rows left in the scratch copy
+            }
         }
         if constexpr (kIBFused) {
             if (sm_idx == 0 and thread_idx == 0) {
@@ -4261,7 +4292,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                             const auto off = reinterpret_cast<const uint8_t*>(dst_ptr) -
                                 reinterpret_cast<const uint8_t*>(buffer.combine_token_buffer.get_base_ptr());
-                            if constexpr (kIBSafeCeil) {
+                            if constexpr (kIBSafeCeil and not kIBSafeCeil3) {
                                 // flag unit (first of the row's 16 units in this N-block) to the real buffer, the rest to the junk area
                                 // SAFE_CEIL=1: junk address by a 64-bit modulo per store (measured +19 / +48: the modulo itself slows the
                                 // epilogue); =2: junk = the token's FUSED_FIN sum row (same cheap address arithmetic as the P1 arm)

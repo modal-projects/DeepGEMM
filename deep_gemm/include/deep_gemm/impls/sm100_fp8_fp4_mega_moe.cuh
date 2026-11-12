@@ -877,6 +877,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kIBFusedSrc = false;
 #endif
     const auto ff_self = [&]() { return ib_pcomb(ib_my_node) + (3 + (ib_num_nodes - 1)) * kFFSlot; };
+    // FF_SIG=5 ("releaser warp"; memory-model-clean and off the GEMM pipeline): after an L2 task's CTA-wide barrier, epilogue thread 0
+    // only appends (first pool row, valid rows) to a per-SM ring and issues red.release.GPU on the ring head (a local word, the
+    // same class of op the L1 epilogue already issues per task). The SM's last dispatch warp (idle after its pulls) acquires
+    // the head (ld.acquire.gpu), issues ONE fence.release.sys per batch and then the relaxed counter increments of the batch's
+    // rows: "release fence followed by a strong write" is a release pattern (PTX ISA 8.8), the barrier + release/acquire on the
+    // head put every data add before that fence in base causality order (8.9.4, 8.9.5), and the proxy acquires the counter as
+    // before. The system-scope stall lands on the idle dispatch warp, not on the epilogue threads.
+    const auto ff_ring = [&](const uint32_t& sm) {
+        return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT + 1024 + sm * 256; };
+    const auto ff_head = [&](const uint32_t& sm) {
+        return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT + 1024 + 256 * 256 + sm * 32; };
+    DG_STATIC_ASSERT(kNumSMs <= 256 and BLOCK_M < 256, "FF_SIG=5 ring");
     const auto ff_marker = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT; };
     if constexpr (kIBFused) {
         if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2 + (kIBFusedSrc ? 1u : 0u)) {
@@ -1699,6 +1711,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kFFG = kNumSMs * kNumDispatchThreads;
             const uint32_t ff_R = ib_num_nodes - 1;
             const auto mk = ff_marker();
+            if (kFFSig == 5 and thread_idx < 2)
+                ff_head(sm_idx)[thread_idx] = 0;  // [0] head (epilogue thread 0), [1] tail (releaser warp)
             if (kFFSig != 0 and ptx::ld_volatile(mk) != kFFMagic) {
                 const auto cb = reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + ff_R) * kFFSlot);
                 for (uint32_t u = ff_gtid; u < ff_R * static_cast<uint32_t>(kIBT); u += kFFG)
@@ -2342,7 +2356,43 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(27, thread_idx == 0);  // pull end, slowest SM
-        if constexpr (kIBReduceOnArrival) {
+        if constexpr (kIBFused and kFFSig == 5) {
+            if (warp_idx == kNumDispatchWarps - 1) {
+                // FF_SIG=5 releaser: publish this SM's finished L2 tasks to the proxies' token counters
+                uint32_t tl = 0;
+                bool ff_end = false;
+                const long long ff_t0 = clock64();
+                while (not ff_end) {
+                    const uint32_t h = ptx::ld_acq(ff_head(sm_idx));  // every lane acquires
+                    if (h == tl) {
+                        if (clock64() - ff_t0 > (1ll << 36)) {
+                            if (lane_idx == 0) printf("OPUS_HANG ff_releaser rank=%u sm=%u tail=%u epoch=%llu\n", sym_buffer.rank_idx, sm_idx, tl, (unsigned long long) ib_epoch);
+                            asm volatile("trap;");
+                        }
+                        continue;
+                    }
+                    asm volatile("fence.release.sys;" ::: "memory");
+                    for (; tl != h and not ff_end; ++ tl) {
+                        const uint32_t e = ptx::ld_volatile(ff_ring(sm_idx) + (tl & 255));
+                        if (e == 0xffffffffu) { ff_end = true; break; }
+                        const uint32_t pm = e >> 8, vm = e & 0xffu;
+                        for (uint32_t m = lane_idx; m < vm; m += 32) {
+                            const auto md = *workspace.get_token_src_metadata_ptr(pm + m);
+                            if (is_remote(md.rank_idx))
+                                asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(sym_buffer.map(
+                                    ff_cnt(md.rank_idx / ib_lsa) + md.token_idx, ib_cp(md.rank_idx, ib_my_node))) : "memory");
+                        }
+                    }
+                    __syncwarp();
+                    if (lane_idx == 0) ff_head(sm_idx)[1] = tl;
+                }
+            } else {
+                ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0,
+                                   cute::Int<DG_MEGA_MOE_IB_FWD_BATCH_D>{}, false);
+            }
+            IB_TRACE(6, sm_idx == 0 and thread_idx == 0);
+            TT_MAX(6, lane_idx == 0);
+        } else if constexpr (kIBReduceOnArrival) {
             // The dispatch warps are idle until the cleanup: reduce forwarded tokens as their partials land
             ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0,
                                cute::Int<DG_MEGA_MOE_IB_FWD_BATCH_D>{}, false);
@@ -3675,6 +3725,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
         task_info_t task_info;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        uint32_t ff_h = 0;  // FF_SIG=5: this SM's ring head (epilogue thread 0)
+#endif
         while (scheduler.get_next_task(task_info)) {
             // Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
@@ -4105,6 +4158,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if constexpr (kIBFused and kFFSig == 5) {
+                    if (epilogue_thread_idx == 0 and not task_info.is_shared()) {
+                        if (ff_h >= 256)  // ring full: wait for the releaser (never in practice: ~40 routed L2 tasks per SM per launch)
+                            IB_POLL(ff_h - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring", ff_h, 0);
+                        ff_ring(sm_idx)[ff_h & 255] = (pool_m_idx << 8) | valid_m;
+                        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" : : "l"(ff_head(sm_idx)) : "memory");
+                        ++ ff_h;
+                    }
+                }
                 if constexpr (kIBFused and (kFFSig == 1 or kFFSig == 2)) {
                     // FUSED_FIN completion signal: every thread of this CTA that added a part of these rows has passed the barrier
                     // above, so a release here covers all of them (base causality order through the barrier). One increment per
@@ -4126,6 +4188,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 TT_MAX(task_info.is_shared() ? 1 : 0, epilogue_thread_idx == 0);
             }
         }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBFused and kFFSig == 5) {
+            if (epilogue_thread_idx == 0) {  // end marker: this SM issues no more L2 rows
+                if (ff_h >= 256)
+                    IB_POLL(ff_h - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring_end", ff_h, 0);
+                ff_ring(sm_idx)[ff_h & 255] = 0xffffffffu;
+                asm volatile("red.release.gpu.global.add.u32 [%0], 1;" : : "l"(ff_head(sm_idx)) : "memory");
+            }
+        }
+#endif
 
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs

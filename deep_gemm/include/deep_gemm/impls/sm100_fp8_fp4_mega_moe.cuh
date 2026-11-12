@@ -779,6 +779,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kIBWaveSort = false;
     constexpr uint32_t kIBWSMode = 0;
 #endif
+    // DG_MEGA_MOE_IB_WS_POST=R (with WAVE_SORT=1; EP32 ordered x supply): the chunk SMs only sort + stage their 32 rows and
+    // raise a flag; ONE thread per remote node (on an SM without scan work) posts the staged rows in wave order, R rows per
+    // put, all on one context, so the wire carries each node's rows in order of first need (per-QP FIFO) instead of
+    // ~33 racy pieces per node. R must be a multiple of 32.
+#if defined(DG_MEGA_MOE_IB_WS_POST) and DG_MEGA_MOE_IB_WS_POST
+    constexpr uint32_t kIBWSPost = DG_MEGA_MOE_IB_WS_POST;
+    DG_STATIC_ASSERT(kIBWSMode == 1 and kIBWSPost % 32 == 0, "WS_POST needs WAVE_SORT=1 and a multiple of 32 rows");
+#else
+    constexpr uint32_t kIBWSPost = 0;
+#endif
 #if defined(DG_MEGA_MOE_IB_STREAM_COMBINE) and DG_MEGA_MOE_IB_STREAM_COMBINE
     constexpr bool kIBStreamCombine = true;
     // STREAM_COMBINE=2: the last dispatch warp of every SM does not pull; it runs the forward-combine from the start
@@ -3184,16 +3194,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const bool xo_on = kIBXOrder and num_tokens * kNumTopk >= DG_MEGA_MOE_IB_XO_MIN and ib_R == 1;
                     if (xo_on and q >= xo_nctx and q - xo_nctx < 256)  // previous piece on this context issued first
                         IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + (q - xo_nctx)) != ib_epoch, (void) 0, "x_order", q, 0);
+                    // WS_POST: this chunk is staged (system fence above); the node's poster thread issues it in wave order
+                    const bool ws_posted = kIBWSPost > 0 and ib_ws_on(num_tokens) and piece > 0;
+                    if (not ws_posted)
                     make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put(ib_mirror(ib_parity, ib_my_node) + off, src, static_cast<uint64_t>(bytes),
                                         ib_cp(sym_buffer.rank_idx, n));
-                    if (xo_on and q < 256)
+                    if ((xo_on or ws_posted) and q < 256)
                         ptx::st_rel(ib_xo_flag + q, ib_epoch);
+                    SL_TR(0, 39, ws_posted);  // WS_POST: last chunk staged
                     SL_TR(0, 27, q == 0);
-                    SL_TR(0, 28, true);
-                    IB_TRACE_MAX(7, true);   // x/SF piece put issued, slowest poster
+                    SL_TR(0, 28, not ws_posted);
+                    IB_TRACE_MAX(7, not ws_posted);   // x/SF piece put issued, slowest poster
                     IB_TRACE_MAX(8, q == 0); // first piece (SF) issued
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
-                    {
+                    if (not ws_posted) {
                         uint64_t t_;
                         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
                         atomicMin(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[46]), static_cast<unsigned long long>(t_));
@@ -3203,6 +3217,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+        }
+        if constexpr (kIBWSPost > 0) {
+            if (ib_ws_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and
+                lane_idx + 1 < ib_num_nodes and num_tokens > 0) {
+                const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
+                const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk, num_pieces = 1 + num_x_chunks;
+                const auto x_stage = ib_pcomb(ib_my_node) + static_cast<int64_t>(nr) * kIBT * kIBTokBytes;
+                const uint32_t orig = 2 * ib_R + nr % ib_xnctx();
+                const auto gin_x = make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase);
+                constexpr uint32_t kPC = kIBWSPost / kIBChunk;  // chunks per put
+                for (uint32_t c0 = 0; c0 < num_x_chunks; c0 += kPC) {
+                    const uint32_t c1 = cute::min(c0 + kPC, num_x_chunks);
+                    for (uint32_t c = c0; c < c1; ++ c) {
+                        const uint32_t q = nr * num_pieces + 1 + c;
+                        if (q < 256)
+                            IB_POLL(ptx::ld_acq_gpu(ib_xo_flag + q) != ib_epoch, (void) 0, "ws_post", nr, c);
+                    }
+                    const uint32_t t0 = c0 * kIBChunk, t1 = cute::min(c1 * kIBChunk, num_tokens);
+                    gin_x.put(ib_mirror(ib_parity, ib_my_node) + static_cast<int64_t>(t0) * kIBTokBytes, x_stage + static_cast<int64_t>(t0) * kIBTokBytes,
+                              static_cast<uint64_t>(t1 - t0) * kIBTokBytes, ib_cp(sym_buffer.rank_idx, n));
+                    SL_TR(0, 28, true);
+                    SL_TR(0, 38, c0 == 0);  // first wave piece issued (slowest node)
+                    IB_TRACE_MAX(7, true);
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+                    {
+                        uint64_t t_;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
+                        atomicMin(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[46]), static_cast<unsigned long long>(t_));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&workspace.signals->ib_trace[47]), static_cast<unsigned long long>(t_));
+                    }
+#endif
+                }
+            }
+            __syncwarp();
         }
         IB_TRACE(0, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
         // D1 (host scan; v1 had the proxy do this and push tables over NVLink, measured ~20 us slower): every GPU scans,
@@ -4596,6 +4644,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                        pu(32), pu(36), pu(33), pu(37), pu(34), pu(38), pu(35), pu(39));
             }
 #endif
+            if constexpr (kIBWSPost > 0) {
+                const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_TRACEW rank=%u epoch=%llu | ws_post: first_piece_issued=%.1f last_chunk_staged=%.1f last_piece_issued=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(38), mu(39), mu(28));
+            }
             if constexpr (kIBSST) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
                 printf("OPUS_SST rank=%u epoch=%llu | sender: staged=%.1f put_issued=%.1f | receiver (slowest source): counts_landed=%.1f counts_published=%.1f tables_done=%.1f | build: enter=%.1f zeroed=%.1f counted=%.1f prefix=%.1f scattered=%.1f\n",

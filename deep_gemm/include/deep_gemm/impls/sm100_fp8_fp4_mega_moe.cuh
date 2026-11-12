@@ -174,6 +174,43 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define TT_ADD(i, cond, v) do {} while (0)
 #define TT_CLOCK(t_) constexpr uint64_t t_ = 0
 #endif
+    // DG_MEGA_MOE_IB_PROF=1 (profiler, trace builds only): per-warp state-time accounting + fine histograms. Every warp owns a
+    // private row of 32 u64 (pf_row); PF_MARK(slot) charges the time since the warp's previous mark to `slot` (lane 0 only,
+    // plain load / store on the private row), so a warp's slots always sum to its whole kernel time. Each warp adds its row to
+    // the per-(SM class, role) totals at its very end when ib_epoch % 16 == 15 (the launch BEFORE a printing launch) and
+    // clears it; histograms / per-chunk arrays (pf_hist) are also recorded only in that launch. The printing launch
+    // (ib_epoch % 16 == 0) prints and clears totals and histograms: OPUS_PFS (g = class * 6 + role; ns summed over warps;
+    // value 27 = warps) and OPUS_PFH (h = row, s = 64-bin half, w = bin width ns).
+    // SM class: 0 = SM 0 (meta), 1 = SMs that pull, 2 = D1 scan SMs. Role: 0 dispatch warps, 1 TMA-A loader, 2 TMA-B (weights)
+    // loader, 3 MMA issue, 4 scheduler, 5 epilogue warps. Slots: see PROFILE.md / the PF_MARK call sites.
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_PROF) and DG_MEGA_MOE_IB_PROF
+#define DG_PF 1
+#define PF_MARK(slot) do { if (lane_idx == 0) { TT_NOW(pft_); const uint64_t pfp_ = pf_row[31]; pf_row[(slot)] += pft_ - pfp_; pf_row[31] = pft_; } } while (0)
+#define PF_MARK_SPLIT(slot_rest, slot_part, part) do { if (lane_idx == 0) { TT_NOW(pft_); const uint64_t pfp_ = pf_row[31]; \
+    pf_row[(slot_part)] += (part); pf_row[(slot_rest)] += pft_ - pfp_ - (part); pf_row[31] = pft_; } } while (0)
+#define PF_CLK(t_) TT_NOW(t_)
+#define PF_ADDTO(var, t0_) do { TT_NOW(pfe_); (var) += pfe_ - (t0_); } while (0)
+#define PF_REL(d_) TT_NOW(pft_); const int64_t d_ = static_cast<int64_t>(pft_) - static_cast<int64_t>(ptx::ld_volatile(workspace.signals->ib_trace + 16))
+#define PF_HIST(h, cond) do { if (pf_rec and (cond)) { PF_REL(pfd_); \
+    const uint32_t pfb_ = pfd_ < 0 ? 0u : (pfd_ / pf_binw > 127 ? 127u : static_cast<uint32_t>(pfd_ / pf_binw)); \
+    atomicAdd(pf_hist + (h) * 128 + pfb_, 1u); } } while (0)
+// per-chunk arrays in the same table (index c < 128): time in 0.1 us from kernel start, clamped to [1, 99999]; CMIN stores 100000 - t
+#define PF_CMAX(h, c, cond) do { if (pf_rec and (cond) and (c) < 128u) { PF_REL(pfd_); const int64_t pfv_ = pfd_ / 100; \
+    atomicMax(pf_hist + (h) * 128 + (c), pfv_ < 1 ? 1u : (pfv_ > 99999 ? 99999u : static_cast<uint32_t>(pfv_))); } } while (0)
+#define PF_CMIN(h, c, cond) do { if (pf_rec and (cond) and (c) < 128u) { PF_REL(pfd_); const int64_t pfv_ = pfd_ / 100; \
+    atomicMax(pf_hist + (h) * 128 + (c), 100000u - (pfv_ < 1 ? 1u : (pfv_ > 99999 ? 99999u : static_cast<uint32_t>(pfv_)))); } } while (0)
+#define PF_CADD(h, c, cond) do { if (pf_rec and (cond) and (c) < 128u) atomicAdd(pf_hist + (h) * 128 + (c), 1u); } while (0)
+#else
+#define DG_PF 0
+#define PF_MARK(slot) do {} while (0)
+#define PF_MARK_SPLIT(slot_rest, slot_part, part) do {} while (0)
+#define PF_CLK(t_) do {} while (0)
+#define PF_ADDTO(var, t0_) do {} while (0)
+#define PF_HIST(h, cond) do {} while (0)
+#define PF_CMAX(h, c, cond) do {} while (0)
+#define PF_CMIN(h, c, cond) do {} while (0)
+#define PF_CADD(h, c, cond) do {} while (0)
+#endif
     // Tail slots: 0 routed L2 task done, 1 shared L2 task done, 2 fwd item: last partial seen, 3 fwd item done (chunk counted),
     // 4 return chunk put: before issue, 5 after issue, 6 forward-combine exit (dispatch warp), 7 epilogue reaches the
     // dispatch sync, 8 (min) source combine start, 9 source combine end, 10 return headers seen (SM 0), 11 dispatch cleanup
@@ -1022,6 +1059,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
     if (kIBScanSlices > 1 and sm_idx == 0 and thread_idx < 4) ib_sl_tr[20 + thread_idx] = 0;  // counters (before grid sync 0)
 #endif
+#if DG_PF
+    // Profiler scratch: the unused part of ib_pool_combine_idx between the sort-key scratch and the X_ORDER / slice scratch
+    constexpr uint32_t kPfW = kNumThreads / 32, kPfHists = 26, kPfGroups = 18;
+    constexpr uint32_t kPfOff = (kIBTabKeys + kNumSMs * 2 * kIBTabT + 127) / 128 * 128;
+    DG_STATIC_ASSERT(kPfOff + (kNumSMs * kPfW * 32 + kPfGroups * 32) * 2 + kPfHists * 128 + 64 + 512 + kIBSliceScratch + 4096 <=
+                     layout::MegaMoESignals::kNumMaxIBPoolTokens, "IB profiler scratch");
+    uint64_t* const pf_base = reinterpret_cast<uint64_t*>(workspace.signals->ib_pool_combine_idx + kPfOff);
+    uint64_t* const pf_row = pf_base + (sm_idx * kPfW + warp_idx) * 32;  // private to this warp (lane 0)
+    uint64_t* const pf_tot = pf_base + kNumSMs * kPfW * 32;               // [3 SM classes][6 roles][32]
+    uint32_t* const pf_hist = reinterpret_cast<uint32_t*>(pf_tot + kPfGroups * 32);  // [kPfHists][128]
+    const bool pf_rec = ib_epoch % 16 == 15;
+    const int64_t pf_binw = num_tokens > 256 ? 8000 : 4000;  // ns per histogram bin (128 bins)
+    if (lane_idx == 0) { TT_NOW(pft_); pf_row[31] = pft_; }
+#endif
     // remote-source index k of rank r (the D1 scan order) and remote-node slot of node n
     const auto ib_nr_of_node = [&](const uint32_t& n) { return n < ib_my_node ? n : n - 1; };
     const auto ib_k_of_rank = [&](const uint32_t& r) { return ib_nr_of_node(r / ib_lsa) * ib_lsa + r % ib_lsa; };
@@ -1386,6 +1437,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 TT_CLOCK(tt_item0);
                 bool tt_miss = false;
+                PF_MARK(15);  // item claimed, its top-k row loaded
+                PF_HIST(19, lane_idx == 0);
+                PF_CMIN(20, p_rec / kIBChunk, nr == 0 and lane_idx == 0);
                 // Rule A: this item's part of the token's x row (and, for quarter 0, its SF row) has landed
                 if (not (kIBSkipXPoll and not pf_on and on_mask != 0)) {
                     constexpr uint32_t kU = (kXUnitsPerItem + 31) / 32;
@@ -1406,6 +1460,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (next_item < num_items) t_next = tok_of(next_item);
                     }
                     TT_ADD(19, __any_sync(0xffffffffu, ib_is_sentinel4(v[0])) and lane_idx == 0, 1);
+#if DG_PF
+                    const bool pf_xm = __any_sync(0xffffffffu, ib_is_sentinel4(v[0]));
+#endif
                     #pragma unroll
                     for (uint32_t u = 0; u < kU; ++ u)
                         IB_POLL(ib_is_sentinel4(v[u]), v[u] = ib_ldv4(xrow + (u * 32 + lane_idx) * 16), "c2_x", s, t);
@@ -1413,6 +1470,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (pf_on) IB_POLL(ib_is_sentinel4(sfv), sfv = ib_ldv4(sfp), "c2_sf", s, t);
                         else IB_POLL(ib_is_sentinel4(ib_ldv4(sfp)), (void) 0, "c2_sf", s, t);
                     }
+#if DG_PF
+                    PF_MARK(pf_xm ? 17 : 16);  // rule-A poll of the x / SF row: 17 = it had not landed
+#endif
                 }
                 // Reduce node-local slots in top-k order (fp32): per slot, the item's pieces are loaded together
                 float2 acc[kPPI][4];
@@ -1465,6 +1525,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 tt_miss = __any_sync(0xffffffffu, tt_miss);
                 TT_MAX(2, lane_idx == 0);  // fwd item: all its partials seen
+                PF_MARK(tt_miss ? 19 : 18);  // partial loads + re-arm + sum: 19 = a partial had not arrived (waited for a node peer's L2)
+                PF_HIST(12, tt_miss and lane_idx == 0);
+                PF_CMAX(21, p_rec / kIBChunk, nr == 0 and tt_miss and lane_idx == 0);
+                PF_CADD(22, p_rec / kIBChunk, nr == 0 and tt_miss and lane_idx == 0);
                 const auto rec = fst + static_cast<int64_t>(p_rec) * kIBRecBytes;
                 #pragma unroll
                 for (uint32_t i = 0; i < kPPI; ++ i) {
@@ -1519,6 +1583,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 state = __shfl_sync(0xffffffffu, state, 0);
                 TT_MAX(3, lane_idx == 0);  // fwd item done
+                PF_MARK(20);  // quantize + record store + chunk counters
+                PF_HIST(from_epilogue ? 11 : 10, lane_idx == 0);
+                PF_CMAX(23, p_rec / kIBChunk, nr == 0 and lane_idx == 0);
                 TT_ADD(16, lane_idx == 0, 1);
                 TT_ADD(24, lane_idx == 0 and from_epilogue, 1);
                 TT_ADD(17, lane_idx == 0 and tt_miss, 1);
@@ -1549,6 +1616,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (nr == 0 and pc0 < 64) { TT_NOW(t_); tl_tchunk[pc0] = t_; }
 #endif
                     IB_TRACE_MAX(14, true);  // proxy: return record chunk put issued, last one
+                    PF_MARK(21);  // return put issue (this lane only)
+                    PF_HIST(16, true);
+                    PF_CMAX(24, pc0, nr == 0);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     {
                         uint64_t t_;
@@ -1639,6 +1709,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
         IB_STAGE(6, thread_idx == 0);  // dispatch warps started
+        PF_MARK(0);
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -1669,10 +1740,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Grid sync
         IB_STAGE(7, thread_idx == 0);  // at dispatch grid sync 0
+        PF_MARK(1);
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        PF_MARK(2);
 
         // Write expert count
         if (sm_idx == 0) {
@@ -1731,6 +1804,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        PF_MARK(3);
 
         // Barrier before pulling
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -1741,6 +1815,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             [&]() { return make_gin(0); }, ib_epoch, false, true, false);
         IB_TRACE(2, sm_idx == 0 and thread_idx == 0);
+        PF_MARK(4);
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
@@ -1754,6 +1829,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        PF_MARK(5);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if constexpr (kIBWmark) {
             // WMARK poller: SM 0's dispatch warp nr watches the mirror of our counterpart on remote node slot nr
@@ -1819,6 +1895,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
         IB_TRACE(3, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(28, thread_idx == 0);  // counts, slowest SM
+        PF_MARK(6);
+        PF_HIST(18, lane_idx == 0);
 #endif
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -1981,6 +2059,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
 #endif
+            PF_MARK(27);  // expert advance + min-peeling + table-ready waits (tab_ready / sl_tflag)
             // Read source token-topk index (written by remote dispatch via NVLink)
             const uint32_t src_token_topk_raw = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
@@ -2022,6 +2101,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             }
 
+            PF_MARK(28);  // entry (source token-topk index) load + L1 ring-slot wait
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // D2: a source on another node is pulled from its counterpart's mirror over NVLink; the load is the poll
@@ -2075,6 +2155,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
             constexpr bool kMetaEarly = false;
 #endif
+            PF_MARK(29);  // order_ready / watermark waits, SF pre-load issue; slot 7 after this = weight load + weight poll (SST: IB wait) + local SF
             float ib_w_pre = 0.f;
             if constexpr (kMetaEarly) {
                 ib_w_pre = ib_rem ?
@@ -2105,6 +2186,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr bool kIBLocalReg = false;
 #endif
             const bool ib_reg = ib_rem or kIBLocalReg;
+            PF_MARK(7);
             if (ib_reg) {
                 // Every 16-byte unit is re-read until it is not the 0xFF sentinel, then stored into the L1 ring
                 DG_STATIC_ASSERT(kIBTokBytes % (32 * 16) == 0, "IB row poll");
@@ -2151,6 +2233,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
 #endif
+#if DG_PF
+                    bool pf_m = false;
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kBatch; ++ b)
+                        if (u0 + b < kUnits) pf_m |= ib_is_sentinel4(v[b]);
+                    const bool pf_miss = ib_rem and __any_sync(0xffffffffu, pf_m);
+                    PF_MARK(ib_rem ? 8 : 9);  // the row's loads are back (one NVLink / HBM round trip)
+#endif
                     #pragma unroll
                     for (uint32_t b = 0; b < kBatch; ++ b) {
                         if (u0 + b < kUnits) {
@@ -2159,6 +2249,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_base_ptr) + o) = v[b];
                         }
                     }
+#if DG_PF
+                    PF_MARK(pf_miss ? 10 : 11);  // 10: the row had not landed (polled until it did), 11: stores only
+#endif
                 }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                 if (lane_idx == 0 and ib_rem) {
@@ -2230,6 +2323,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
+#if DG_PF
+            bool pf_sfm = false;
+#endif
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
             #pragma unroll
@@ -2238,6 +2334,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                 if (j < kNumSFUint32) {
                     uint32_t sf = ib_rem ? (kIBPullWhole ? ib_sf_pre[i] : ptx::ld_volatile(remote_sf_ptr + j)) : (kMetaEarly ? ib_sf_pre[i] : remote_sf_ptr[j]);
+#if DG_PF
+                    pf_sfm |= ib_rem and sf == 0xffffffffu;
+#endif
                     IB_POLL(ib_rem and sf == 0xffffffffu, sf = ptx::ld_volatile(remote_sf_ptr + j), "pull_sf", current_rank_in_expert_idx, src_token_idx);
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf;
                 }
@@ -2247,6 +2346,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             }
             __syncwarp();
+#if DG_PF
+            PF_MARK(__any_sync(0xffffffffu, pf_sfm) ? 14 : 12);  // 14: the row's SF had not landed (polled until it did)
+#endif
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -2267,7 +2369,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 );
             }
             __syncwarp();
+#if DG_PF
+            PF_HIST(ib_rem ? 8 : 9, lane_idx == 0);
+            PF_MARK(12);
+#endif
         }
+        PF_MARK(13);
+        PF_HIST(17, lane_idx == 0);
 
 #if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
         IB_TRACE_MAX(27, thread_idx == 0);  // NVLink build: pull end, slowest SM
@@ -2316,6 +2424,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
         TT_MAX(11, thread_idx == 0);
+        PF_MARK(22);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         const auto ib_rearm_mirrors = [&]() {
         // E: re-arm the mirrors of this parity. Every node-local pull from them is done (barrier above); the
@@ -2458,6 +2567,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Wait for all ranks to finish cleaning
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        PF_MARK(23);
         // NVLink part only: cross-node reuse is ordered by parity + the mandatory headers (REDESIGN_OPUS.md 6)
         comm::hybrid_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
@@ -2465,6 +2575,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             [&]() { return make_gin(0); }, ib_epoch, true, false, false);
         TT_MAX(12, thread_idx == 0);
+        PF_MARK(24);
         if (not kIBEarlyRearm)
             ib_rearm_mirrors();
         IB_TRACE(17, sm_idx == 0 and thread_idx == 0);
@@ -2474,6 +2585,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
         if (sm_idx == 0 and thread_idx == 0)
             *workspace.get_ib_epoch_ptr() = ib_epoch;
+        PF_MARK(25);
 #else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
@@ -2502,6 +2614,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (task_info.block_phase == sched::BlockPhase::Linear1 and not ib_noov_ready)
                     ib_noov_wait(kIBNoOvLandedSlot), ib_noov_ready = true;
             }
+#endif
+#if DG_PF
+            const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);  // 1 L1, 2 L2, 3 shared L1, 4 shared L2
+            uint64_t pf_dep = 0;
+            PF_MARK(1);  // waited for a task (scheduler: counts / L1-before-L2 order / task slot)
+            PF_HIST(15, pf_ph == 1 and lane_idx == 0);
 #endif
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts :
@@ -2537,11 +2655,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
+#if DG_PF
+            PF_MARK(pf_ph == 1 ? 2 : 6);  // 2: routed L1 block waited for its rows (pull); 6: shared L2 waited for shared L1
+            PF_HIST(pf_ph == 1 ? 0 : (pf_ph == 3 ? 4 : 6), pf_ph != 2 and lane_idx == 0);
+#endif
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                if (task_info.block_phase == sched::BlockPhase::Linear2)
+                if (task_info.block_phase == sched::BlockPhase::Linear2) {
+                    PF_CLK(pf_d0);
                     l2_k_block_dependency.wait(k_block_idx);
+                    PF_ADDTO(pf_dep, pf_d0);
+                    PF_HIST(2, k_block_idx == 0 and lane_idx == 0);
+                }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                 if (task_info.block_phase == sched::BlockPhase::Linear2 and k_block_idx == 0 and cute::elect_one_sync())
                     IB_HIST(1, true);
@@ -2575,6 +2701,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+#if DG_PF
+            // k loop (TMA issue, paced by the MMA through the stage barriers); slot 4 = L2 waited for its L1 N blocks
+            PF_MARK_SPLIT(pf_ph == 1 ? 3 : (pf_ph == 2 ? 5 : 7), 4, pf_dep);
+#endif
         }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if constexpr (kIBNoOvDispatch) {
@@ -2615,6 +2745,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
+#if DG_PF
+            const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);
+            PF_MARK(1);
+#endif
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights :
                                           task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_weights :
@@ -2670,6 +2804,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+#if DG_PF
+            PF_MARK(pf_ph == 1 ? 3 : (pf_ph == 2 ? 5 : 7));
+#endif
         }
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Adjust registers
@@ -2709,6 +2846,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             task_info_t task_info;
             while (scheduler.get_next_task(task_info)) {
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+#if DG_PF
+                const uint32_t pf_ph = static_cast<uint32_t>(task_info.block_phase);
+                uint64_t pf_full = 0;
+                PF_MARK(1);  // waited for a task
+#endif
 
                 // Dynamic update of UMMA N based on effective M
                 auto& instr_desc = task_info.is_shared() ? shared_instr_desc : routed_instr_desc;
@@ -2719,6 +2861,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
                 shared_storage.tmem_empty_barriers[accum_stage_idx].wait(accum_phase ^ 1);
                 ptx::tcgen05_after_thread_sync();
+                PF_MARK(2);  // waited for the epilogue to release the accumulator stage
 
                 // Empty barrier arrival
                 auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
@@ -2738,7 +2881,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait TMA load completion
+                    PF_CLK(pf_f0);
                     shared_storage.full_barriers[stage_idx].wait(phase);
+                    PF_ADDTO(pf_full, pf_f0);
                     ptx::tcgen05_after_thread_sync();
 
                     const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
@@ -2783,6 +2928,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
                 }
+#if DG_PF
+                // 3 / 5 / 7: MMA issue + commit (L1 / L2 / shared); 8 / 9 / 10: waited for the TMA loads of a K block (weights / acts from HBM)
+                PF_MARK_SPLIT(pf_ph == 1 ? 3 : (pf_ph == 2 ? 5 : 7), pf_ph == 1 ? 8 : (pf_ph == 2 ? 9 : 10), pf_full);
+#endif
             }
 
             // To safely deconstruct barriers, we need another round of waits
@@ -2834,6 +2983,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
         IB_TRACE(23, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
+        PF_MARK(0);
         if constexpr (kIBSSTW) {
             if (sm_idx + 2 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and (num_tokens > 0 or kIBSSTRPut)) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
@@ -3249,6 +3399,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             }
         }
+        PF_MARK(4);  // start branch: SST / NB builder SMs, early weight put (before D0)
 #if defined(DG_MEGA_MOE_IB_DEBUG_D0) and DG_MEGA_MOE_IB_DEBUG_D0
         if (sm_idx == kNumSMs - 1 and epilogue_thread_idx == 0 and ib_epoch <= 2)
             printf("OPUS_D0 rank=%u epoch=%llu num_tokens=%u enter\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, num_tokens);
@@ -3724,6 +3875,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
         IB_TRACE(0, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
+        PF_MARK(1);  // D0: meta staging + put (SM 0), x / SF piece puts, return-order sort
         // D1 (host scan; v1 had the proxy do this and push tables over NVLink, measured ~20 us slower): every GPU scans,
         // for each remote source r, r's mirror on r's counterpart in this node (over NVLink, or locally when that is
         // us) and builds its OWN tables for its own experts exactly like the upstream receiver-side state: per-source
@@ -3889,6 +4041,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t nt = *nt_smem;
                 IB_TRACE(20, epilogue_thread_idx == 0 and sm_idx == kNumSMs - 1);
                 IB_TRACE_MAX(25, epilogue_thread_idx == 0);  // remote header seen, slowest scanning SM
+                PF_MARK(2);  // D1: waited for the source's header (IB)
                 const auto idx = reinterpret_cast<const uint64_t*>(mir + kIBOffIdx);
                 const auto wts = reinterpret_cast<const uint32_t*>(mir + kIBOffW);
                 auto cnt = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
@@ -4202,8 +4355,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
 
+        PF_MARK(3);  // D1 scan + count publish + order tables (scan SMs)
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        PF_MARK(5);
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
@@ -4214,6 +4369,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
             shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
+            PF_MARK(6);  // waited for a task's accumulator (scheduler + MMA)
 
             // Now we can release the task
             scheduler.release_task_info();
@@ -4480,6 +4636,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
+                PF_MARK(task_info.is_shared() ? 9 : 7);
+                PF_HIST(task_info.is_shared() ? 5 : 1, epilogue_thread_idx == 0);
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
                 if (not task_info.is_shared()) {
@@ -4594,6 +4752,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 TT_MAX(task_info.is_shared() ? 1 : 0, epilogue_thread_idx == 0);
+                PF_MARK(task_info.is_shared() ? 9 : 8);
+                PF_HIST(task_info.is_shared() ? 7 : 3, epilogue_thread_idx == 0);
             }
         }
 
@@ -4674,6 +4834,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
         IB_TRACE(5, sm_idx == 0 and epilogue_thread_idx == 0);
+        PF_MARK(10);  // TMEM free + epilogue grid sync (every SM's L2 done) + combine-ready notify
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         if constexpr (kIBNoOvReturn) {
             if (sm_idx == 0 and epilogue_thread_idx == 0)
@@ -4712,6 +4873,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         IB_TRACE_MAX(15, epilogue_thread_idx == 0);  // source: final combine loop starts, slowest SM
+        PF_MARK(22);  // CTA barrier with the dispatch warps (their forward-combine + return puts)
         TT_MIN(8, epilogue_thread_idx == 0);
         const auto grid_idx = ptx::get_grid_idx() + 1;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -4793,6 +4955,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < 2; ++ c3_pass)
         for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + (c3_poller ? num_tokens * kNumChunks : c3_gw); token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += c3_nw) {
             TT_CLOCK(tt_c0);
+#if DG_PF
+            bool pf_rm = false;
+#endif
             const bool c3_local = not kC3Split or c3_pass == 0;
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -4902,6 +5067,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     dst[0] = make_float4(reduced[j * 4 + 0].x, reduced[j * 4 + 0].y, reduced[j * 4 + 1].x, reduced[j * 4 + 1].y);
                     dst[1] = make_float4(reduced[j * 4 + 2].x, reduced[j * 4 + 2].y, reduced[j * 4 + 3].x, reduced[j * 4 + 3].y);
                 }
+                PF_MARK(11);  // C3 pass 0: one token-chunk's node-local slots (peer-ready wait + loads)
                 continue;
             }
             } else {
@@ -4941,6 +5107,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
                     const bool tt_rmiss0 = __any_sync(0xffffffffu, qv[0] == ~0ull);
+#endif
+#if DG_PF
+                    pf_rm |= tt_rmiss0;
 #endif
                     if constexpr (kIBC3Repoll) {
                         // batch re-poll: one round trip per round for all still-sentinel pieces
@@ -4985,6 +5154,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
 #endif
                         IB_TRACE_MAX(21, lane_idx == 0 and j == 0);  // source: a return record seen, last one
+#if DG_PF
+                        PF_HIST(14, tt_rmiss and lane_idx == 0);
+#endif
                         uint32_t sbits = sv[j];
                         IB_POLL(sbits == 0xffffffffu, sbits = ptx::ld_volatile(sptr), "c3_s", n, token_idx);
                         if (hit) {
@@ -5063,6 +5235,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 TT_ADD(22, lane_idx == 0, tt_c1 - tt_c0);
                 TT_ADD(25, lane_idx == 0, tt_c1 - tt_c_loc);  // sum: local part done -> token-chunk stored
             }
+#if DG_PF
+            PF_MARK(pf_rm ? 12 : 13);  // C3 pass 1 token-chunk: 12 = a return record had not landed at the first load
+            PF_HIST(13, lane_idx == 0);
+#endif
         }
         TT_MAX(9, epilogue_thread_idx == 0);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -5174,6 +5350,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    (unsigned long long) tt[23], (unsigned long long) tt[24], pu(14), pu(15),
                    tt[21] > 0 ? static_cast<double>(tt[25]) / static_cast<double>(tt[21]) : 0.0, (unsigned long long) tt[26],
                    (int) kIBFwdJoin, (int) DG_MEGA_MOE_IB_FWD_BATCH, (int) DG_MEGA_MOE_IB_FWD_BATCH_D, (int) kIBFwdPrefetch, (int) kIBC3Early, (int) kIBDeferRearm, (int) kIBC3Repoll, (int) kIBRetGroup, (int) kIBC3Split);
+#if DG_PF
+            // Profiler: the previous launch's state sums (ns over all warps of a group; value 27 = warps) and histograms, then reset
+            for (uint32_t g = 0; g < kPfGroups; ++ g) {
+                char buf[32 * 12 + 1]; uint32_t n = 0;
+                for (uint32_t b = 0; b < 32; ++ b) {
+                    uint64_t v = ptx::ld_volatile(pf_tot + g * 32 + b);
+                    pf_tot[g * 32 + b] = 0;
+                    char tmp[11]; uint32_t m = 0;
+                    do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < 11);
+                    while (m) buf[n ++] = tmp[-- m];
+                    buf[n ++] = b == 31 ? '\0' : ',';
+                }
+                printf("OPUS_PFS rank=%u epoch=%llu g=%u nt=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, g, num_tokens, buf);
+            }
+            for (uint32_t h = 0; h < kPfHists * 2; ++ h) {
+                char buf[64 * 7 + 1]; uint32_t n = 0, any = 0;
+                for (uint32_t b = 0; b < 64; ++ b) {
+                    uint32_t v = ptx::ld_volatile(pf_hist + h * 64 + b);
+                    pf_hist[h * 64 + b] = 0;
+                    any |= v;
+                    char tmp[6]; uint32_t m = 0;
+                    do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < 6);
+                    while (m) buf[n ++] = tmp[-- m];
+                    buf[n ++] = b == 63 ? '\0' : ',';
+                }
+                if (any)
+                    printf("OPUS_PFH rank=%u epoch=%llu h=%u s=%u w=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h / 2, h % 2,
+                           static_cast<uint32_t>(pf_binw), buf);
+            }
+#endif
         }
 #endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
@@ -5189,6 +5395,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
         IB_TRACE_MAX(34, epilogue_thread_idx == 0);  // epilogue warps done, slowest SM (reported by the next launch)
+        PF_MARK(14);  // return-header wait, trace print
     }
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
     {
@@ -5202,6 +5409,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         __syncwarp(emask);
         TT_MAX(30, lane_idx == static_cast<uint32_t>(__ffs(emask) - 1));
         TT_MAX(31, eslot == 28u and lane_idx == static_cast<uint32_t>(__ffs(emask) - 1));
+#if DG_PF
+        if (lane_idx == 0) {
+            // slot 26: everything after the warp's last mark (idle until the kernel's last instruction + the fence above)
+            TT_NOW(pft_);
+            pf_row[26] += pft_ - pf_row[31];
+            const uint32_t pf_role = warp_idx < kNumDispatchWarps ? 0u : (warp_idx < kNumDispatchWarps + 4 ? warp_idx - kNumDispatchWarps + 1u : 5u);
+            const uint32_t pf_cls = sm_idx == 0 ? 0u : (sm_idx + (kIBSST ? ib_R : (kNumRanks - ib_lsa) * ib_P) >= kNumSMs ? 2u : 1u);  // 2 = SMs out of the pull rotation
+            uint64_t* const pf_g = pf_tot + (pf_cls * 6 + pf_role) * 32;
+            for (uint32_t i = 0; i < 30; ++ i) {
+                if (pf_rec)
+                    atomicAdd(reinterpret_cast<unsigned long long*>(pf_g + i), static_cast<unsigned long long>(pf_row[i]));
+                pf_row[i] = 0;
+            }
+            if (pf_rec)
+                atomicAdd(reinterpret_cast<unsigned long long*>(pf_g + 30), 1ull);  // warps in this group
+        }
+#endif
     }
 #endif
 #else

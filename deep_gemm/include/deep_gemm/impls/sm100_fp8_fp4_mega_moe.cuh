@@ -8070,10 +8070,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const bool c3f_wait = c3_pass >= 1;
                 const uint32_t c3f_R = ib_num_nodes - 1;
                 uint32_t c3f_nr = (c3f_cnt >> (4 * c3f_k)) & 15u;
-                uint64_t qa[kNumUint4PerLane], qb[kNumUint4PerLane];
-                uint32_t sa[kNumUint4PerLane], sb[kNumUint4PerLane];
+                // (=1: two nodes' record loads in flight, a second register set; =2: one record at a time as the legacy loop: the
+                // second set made the record part SLOWER at EP32 1024, 19.7 us per token-chunk against 11, traced cf32_t)
+                constexpr bool kC3fPre = DG_MEGA_MOE_IB_C3_FAST == 1;
+                uint64_t qa[kNumUint4PerLane], qb[kC3fPre ? kNumUint4PerLane : 1];
+                uint32_t sa[kNumUint4PerLane], sb[kC3fPre ? kNumUint4PerLane : 1];
                 const auto c3f_pos = [&](const uint32_t& nr_) { return ib_sc_on(num_tokens) ? ib_tab[kIBTabPos2 + nr_ * kIBTabT + token_idx] : token_idx; };
-                if (c3f_nr < c3f_R) {
+                if (kC3fPre and c3f_nr < c3f_R) {
                     const auto rbase = ib_ret(ib_parity, ib_node_of_slot(c3f_nr));
                     const uint32_t rec_pos = c3f_pos(c3f_nr);
                     #pragma unroll
@@ -8088,11 +8091,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const bool hit = (ib_nodes_hit >> n) & 1u;
                     const auto rbase = ib_ret(ib_parity, n);
                     const uint32_t rec_pos = c3f_pos(c3f_nr);
-                    if (c3f_nr + 1 < c3f_R) {  // the next node's record: in flight while this one is checked and added
+                    if constexpr (not kC3fPre) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
+                            qa[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase, rec_pos, col)));
+                            sa[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase, rec_pos, col)));
+                        }
+                    }
+                    if (kC3fPre and c3f_nr + 1 < c3f_R) {  // the next node's record: in flight while this one is checked and added
                         const auto rbase2 = ib_ret(ib_parity, ib_node_of_slot(c3f_nr + 1));
                         const uint32_t rec_pos2 = c3f_pos(c3f_nr + 1);
                         #pragma unroll
-                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        for (uint32_t j = 0; j < (kC3fPre ? kNumUint4PerLane : 0u); ++ j) {
                             const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
                             qb[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase2, rec_pos2, col)));
                             sb[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase2, rec_pos2, col)));
@@ -8148,7 +8159,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     __syncwarp();
                     #pragma unroll
-                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j)
+                    for (uint32_t j = 0; j < (kC3fPre ? kNumUint4PerLane : 0u); ++ j)
                         qa[j] = qb[j], sa[j] = sb[j];
                 }
                 c3f_cnt = (c3f_cnt & ~(15u << (4 * c3f_k))) | (c3f_nr << (4 * c3f_k));

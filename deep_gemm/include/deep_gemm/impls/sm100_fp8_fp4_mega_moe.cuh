@@ -19,6 +19,72 @@
 
 namespace deep_gemm {
 
+#if defined(DG_MEGA_MOE_IB_SPLIT) and DG_MEGA_MOE_IB_SPLIT
+// DG_MEGA_MOE_IB_SPLIT=1: the kernel body is instantiated twice; the few SMs that run the heavy SST / ORD blocks (builders,
+// poster, receivers) take the copy that contains them, every other SM runs a copy without them, so their register
+// pressure cannot spill values of the hot loops (carrying the code cost +22..+28 us at 1024, start_d1)
+template <
+    bool kIBHeavy,
+    uint32_t kNumMaxTokensPerRank,
+    uint32_t kHidden, uint32_t kIntermediateHidden,
+    uint32_t kNumExperts, uint32_t kNumSharedExperts,
+    uint32_t kNumTopk,
+    uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+    uint32_t STORE_BLOCK_M_L1, uint32_t STORE_BLOCK_M_L2,
+    uint32_t SF_BLOCK_M, uint32_t SF_BLOCK_N,
+    uint32_t kNumRingTokens,
+    uint32_t kNumSFRingTokens,
+    uint32_t kNumStages,
+    uint32_t kNumBytesPerPull,
+    uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
+    uint32_t kNumEpilogueThreads,
+    uint32_t kNumSMs, uint32_t kNumRanks,
+    float kActivationClamp,
+    bool kFastMath,
+    typename weight_dtype_t,
+    bool kHasShared = (kNumSharedExperts > 0),
+    uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+    uint32_t L1_SHAPE_K = kHidden,
+    uint32_t L2_SHAPE_N = kHidden,
+    uint32_t L2_SHAPE_K = kIntermediateHidden,
+    uint32_t SHARED_L2_SHAPE_K = L2_SHAPE_K * kNumSharedExperts,
+    uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
+    uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
+    uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
+    uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4,
+    uint32_t kNumThreads = kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
+    uint32_t kNumTokensPerWarp = 32 / kNumTopk,
+    uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
+    uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
+    uint32_t kNumSharedSFTokens = layout::get_num_max_shared_sf_tokens(kNumMaxTokensPerRank),
+    typename task_info_t = sched::TaskInfo<kHasShared>
+>
+CUTLASS_DEVICE void
+sm100_fp8_fp4_mega_moe_body(kNumThreads, 1) void
+sm100_fp8_fp4_mega_moe_impl(void* y,
+                            int* cumulative_local_expert_recv_stats,
+                            const uint32_t num_tokens,
+                            const layout::SymBuffer<kNumRanks>& sym_buffer,
+                            const cute::TmaDescriptor& tensor_map_l1_acts,
+                            const cute::TmaDescriptor& tensor_map_l1_acts_sf,
+                            const cute::TmaDescriptor& tensor_map_l1_weights,
+                            const cute::TmaDescriptor& tensor_map_l1_weights_sf,
+                            const cute::TmaDescriptor& tensor_map_l1_output,
+                            const cute::TmaDescriptor& tensor_map_l2_acts,
+                            const cute::TmaDescriptor& tensor_map_l2_acts_sf,
+                            const cute::TmaDescriptor& tensor_map_l2_weights,
+                            const cute::TmaDescriptor& tensor_map_l2_weights_sf,
+                            const cute::TmaDescriptor& tensor_map_shared_l1_acts,
+                            const cute::TmaDescriptor& tensor_map_shared_l1_acts_sf,
+                            const cute::TmaDescriptor& tensor_map_shared_l1_weights,
+                            const cute::TmaDescriptor& tensor_map_shared_l1_weights_sf,
+                            const cute::TmaDescriptor& tensor_map_shared_l1_output,
+                            const cute::TmaDescriptor& tensor_map_shared_l2_acts,
+                            const cute::TmaDescriptor& tensor_map_shared_l2_acts_sf,
+                            const cute::TmaDescriptor& tensor_map_shared_l2_weights,
+                            const cute::TmaDescriptor& tensor_map_shared_l2_weights_sf,
+                            const uint8_t* sm_locality_domains) {
+#else
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -78,6 +144,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
                             const uint8_t* sm_locality_domains) {
+    constexpr bool kIBHeavy = true;
+#endif
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -440,6 +508,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     // DG_MEGA_MOE_IB_OUTLINE=1: the SST / ORD sender and receiver blocks become non-inlined lambdas, so the code they add does
     // not take part in the register allocation of the hot (MMA / epilogue / pull) loops of the one kernel function
+    // DG_MEGA_MOE_IB_CG_DROP=mask (codegen bisect, only meaningful with SST_DEAD): compile out 1 early-weight block, 2 SST
+    // builder, 4 SST receive, 8 pull-loop waits / polls, 16 NB builder, 32 order builder + poster
+#ifndef DG_MEGA_MOE_IB_CG_DROP
+#define DG_MEGA_MOE_IB_CG_DROP 0
+#endif
+    constexpr uint32_t kCGDrop = DG_MEGA_MOE_IB_CG_DROP;
 #if defined(DG_MEGA_MOE_IB_OUTLINE) and DG_MEGA_MOE_IB_OUTLINE
 #define DG_IB_OUTLINE_BEGIN [&]() __attribute__((noinline)) {
 #define DG_IB_OUTLINE_END }();
@@ -1982,7 +2056,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            if (kIBEarlyPublish or ib_sst) {
+            if (kIBEarlyPublish or (ib_sst and not (kCGDrop & 8))) {
                 // SPLIT_SCAN: counts went out before the slot table of this remote source was written
                 if (is_remote(current_rank_in_expert_idx)) {
                     const uint32_t k_t = ib_k_of_rank(current_rank_in_expert_idx);
@@ -2106,7 +2180,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 ib_w_pre = ib_rem ?
                     *sym_buffer.map(reinterpret_cast<const float*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy) :
                     *sym_buffer.map(buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
-                if (kIBSenderTables or ib_sst) {  // rule A: no scan polled this weight
+                if (kIBSenderTables or (ib_sst and not (kCGDrop & 8))) {  // rule A: no scan polled this weight
                     if (ib_rem) {
                         const auto wp = sym_buffer.map(reinterpret_cast<const uint32_t*>(ib_mir + kIBOffW) + src_token_topk_idx, ib_proxy);
                         uint32_t wb = __float_as_uint(ib_w_pre);
@@ -2860,7 +2934,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // node (unused locally; rows >= num_tokens hold sentinels) and sent with ONE put per counterpart; then SF and
         // x chunks, one piece per SM from the end. Data-only puts; the input region is written before the launch.
         IB_TRACE(23, sm_idx == kIBMetaSM and epilogue_thread_idx == 0);
-        if (kIBSSTW and ib_sst) {
+        if (kIBHeavy and kIBSSTW and ib_sst and not (kCGDrop & 1)) {
             DG_IB_OUTLINE_BEGIN
             if (sm_idx + 2 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and (num_tokens > 0 or kIBSSTRPut)) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
@@ -2886,13 +2960,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // ORD: the order builder SM (see the knob)
         if constexpr (kIBOrd > 0) {
             DG_IB_OUTLINE_BEGIN
-            if (kIBPrewarm and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and ib_ord_on(num_tokens)) {
+            if (kIBHeavy and kIBPrewarm and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes and ib_ord_on(num_tokens)) {
                 const uint32_t nr = lane_idx, orig = 2 * ib_R + nr % ib_xnctx();
                 make_gin_site(4, ctx_piece(nr, orig), orig, ib_xbase).put_value(
                     reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, ib_node_of_slot(nr)));
             }
             __syncwarp();
-            if (not kIBSSTNB and ib_ord_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) {
+            if (kIBHeavy and not kIBSSTNB and ib_ord_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) {
                 constexpr uint32_t kOK = kNumExpertsPerRank + 1;  // buckets per node (the last: no pick on the node)
                 constexpr uint32_t kOT = math::constexpr_ceil_div(static_cast<uint32_t>(kIBT), kNumEpilogueThreads);
                 auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
@@ -2955,7 +3029,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             DG_IB_OUTLINE_END
         }
         // SST_NB: one builder SM per remote node (see the knob)
-        if (kIBSSTNB and ib_sst) {
+        if (kIBHeavy and kIBSSTNB and ib_sst and not (kCGDrop & 16)) {
             DG_IB_OUTLINE_BEGIN
             const uint32_t nb_nr = kNumSMs - (kNumRanks - ib_lsa) - 5 - sm_idx;  // wraps to a huge value on the other SMs
             if (nb_nr < ib_R) {
@@ -3154,7 +3228,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             DG_IB_OUTLINE_END
         }
-        if (kIBSST and not kIBSSTNB and ib_sst) {
+        if (kIBHeavy and kIBSST and not kIBSSTNB and ib_sst and not (kCGDrop & 2)) {
             DG_IB_OUTLINE_BEGIN
             if (sm_idx + 1 + (kNumRanks - ib_lsa) == kNumSMs) {
                 // SST build (see the knob). Counters: 16 bits per global expert, two per word (counts <= kIBT, cursors < 65536)
@@ -3750,8 +3824,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         if constexpr (kIBWSPost > 0 or kIBOrd > 0) {
             DG_IB_OUTLINE_BEGIN
-            if (((kIBWSPost > 0 and ib_ws_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) or
-                 (ib_ord_on(num_tokens) and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs)) and epilogue_warp_idx == 0 and
+            if (kIBHeavy and ((kIBWSPost > 0 and ib_ws_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) or
+                 (ib_ord_on(num_tokens) and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs))) and epilogue_warp_idx == 0 and
                 lane_idx + 1 < ib_num_nodes and num_tokens > 0) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk, num_pieces = 1 + num_x_chunks;
@@ -3880,7 +3954,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     __syncwarp();
                 }
 #endif
-                if (ib_sst) {
+                if (kIBHeavy and ib_sst and not (kCGDrop & 4)) {
                     DG_IB_OUTLINE_BEGIN
                     // SST: r's counts for this node ([node-local rank][local expert], ending at kIBOffSTab) and its entries
                     // (from kIBOffSTab) arrive in one early put. Publish our counts, copy our slice into the slot table
@@ -3894,7 +3968,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         *s_base = 0;
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     uint32_t below = 0;
-                    for (uint32_t q = epilogue_thread_idx; q < sst_n; q += kNumEpilogueThreads) {
+                    for (uint32_t q = epilogue_thread_idx; not (kCGDrop & 64) and q < sst_n; q += kNumEpilogueThreads) {
                         uint32_t v = ptx::ld_volatile(cnt_all + q);
                         IB_POLL(v == 0xffffffffu, v = ptx::ld_volatile(cnt_all + q), "sst_cnt", r, q);
                         if (q / kNumExpertsPerRank == myj)
@@ -3912,7 +3986,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t e = 0; e < kNumExpertsPerRank; ++ e)
                             s_off[e] = o, o += s_cnt[e];
                     }
-                    for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
+                    for (uint32_t i = epilogue_thread_idx; not (kCGDrop & 128) and i < kNumExpertsPerRank; i += kNumEpilogueThreads) {
                         *workspace.get_expert_recv_count_ptr(r, i) = s_cnt[i];
                         __threadfence();
                         ptx::atomic_add(workspace.get_expert_recv_count_sum_ptr(i),
@@ -3922,7 +3996,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     IB_TRACE_MAX(26, epilogue_thread_idx == 0);  // counts published, slowest source
                     const auto st_tab = reinterpret_cast<const uint32_t*>(mir + kIBOffSTab) + *s_base;
                     const uint32_t m = s_off[kNumExpertsPerRank - 1] + s_cnt[kNumExpertsPerRank - 1];
-                    for (uint32_t q = epilogue_thread_idx; q < m; q += kNumEpilogueThreads) {
+                    for (uint32_t q = epilogue_thread_idx; not (kCGDrop & 256) and q < m; q += kNumEpilogueThreads) {
                         uint32_t lo = 0, hi = kNumExpertsPerRank;  // last e with s_off[e] <= q
                         while (hi - lo > 1) { const uint32_t mid = (lo + hi) / 2; if (s_off[mid] <= q) lo = mid; else hi = mid; }
                         uint32_t v = ptx::ld_volatile(st_tab + q);
@@ -5273,5 +5347,75 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
 #endif
 }
+
+#if defined(DG_MEGA_MOE_IB_SPLIT) and DG_MEGA_MOE_IB_SPLIT
+template <
+    uint32_t kNumMaxTokensPerRank,
+    uint32_t kHidden, uint32_t kIntermediateHidden,
+    uint32_t kNumExperts, uint32_t kNumSharedExperts,
+    uint32_t kNumTopk,
+    uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+    uint32_t STORE_BLOCK_M_L1, uint32_t STORE_BLOCK_M_L2,
+    uint32_t SF_BLOCK_M, uint32_t SF_BLOCK_N,
+    uint32_t kNumRingTokens,
+    uint32_t kNumSFRingTokens,
+    uint32_t kNumStages,
+    uint32_t kNumBytesPerPull,
+    uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
+    uint32_t kNumEpilogueThreads,
+    uint32_t kNumSMs, uint32_t kNumRanks,
+    float kActivationClamp,
+    bool kFastMath,
+    typename weight_dtype_t,
+    bool kHasShared = (kNumSharedExperts > 0),
+    uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+    uint32_t L1_SHAPE_K = kHidden,
+    uint32_t L2_SHAPE_N = kHidden,
+    uint32_t L2_SHAPE_K = kIntermediateHidden,
+    uint32_t SHARED_L2_SHAPE_K = L2_SHAPE_K * kNumSharedExperts,
+    uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
+    uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
+    uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
+    uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4,
+    uint32_t kNumThreads = kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
+    uint32_t kNumTokensPerWarp = 32 / kNumTopk,
+    uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
+    uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
+    uint32_t kNumSharedSFTokens = layout::get_num_max_shared_sf_tokens(kNumMaxTokensPerRank),
+    typename task_info_t = sched::TaskInfo<kHasShared>
+>
+CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+sm100_fp8_fp4_mega_moe_impl(void* y,
+                            int* cumulative_local_expert_recv_stats,
+                            const uint32_t num_tokens,
+                            const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_output,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
+                            const uint8_t* sm_locality_domains) {
+    // heavy copy: the former scan SMs (SST receive) and the 8 SMs below them (builders, early-weight put, poster)
+    if (blockIdx.x + (kNumRanks - sym_buffer.num_lsa_ranks) + 8 >= kNumSMs)
+        sm100_fp8_fp4_mega_moe_body<true, kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumSharedExperts, kNumTopk, BLOCK_M, BLOCK_N, BLOCK_K, STORE_BLOCK_M_L1, STORE_BLOCK_M_L2, SF_BLOCK_M, SF_BLOCK_N, kNumRingTokens, kNumSFRingTokens, kNumStages, kNumBytesPerPull, kNumDispatchThreads, kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, kActivationClamp, kFastMath, weight_dtype_t>(
+            y, cumulative_local_expert_recv_stats, num_tokens, sym_buffer, tensor_map_l1_acts, tensor_map_l1_acts_sf, tensor_map_l1_weights, tensor_map_l1_weights_sf, tensor_map_l1_output, tensor_map_l2_acts, tensor_map_l2_acts_sf, tensor_map_l2_weights, tensor_map_l2_weights_sf, tensor_map_shared_l1_acts, tensor_map_shared_l1_acts_sf, tensor_map_shared_l1_weights, tensor_map_shared_l1_weights_sf, tensor_map_shared_l1_output, tensor_map_shared_l2_acts, tensor_map_shared_l2_acts_sf, tensor_map_shared_l2_weights, tensor_map_shared_l2_weights_sf, sm_locality_domains);
+    else
+        sm100_fp8_fp4_mega_moe_body<false, kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumSharedExperts, kNumTopk, BLOCK_M, BLOCK_N, BLOCK_K, STORE_BLOCK_M_L1, STORE_BLOCK_M_L2, SF_BLOCK_M, SF_BLOCK_N, kNumRingTokens, kNumSFRingTokens, kNumStages, kNumBytesPerPull, kNumDispatchThreads, kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, kActivationClamp, kFastMath, weight_dtype_t>(
+            y, cumulative_local_expert_recv_stats, num_tokens, sym_buffer, tensor_map_l1_acts, tensor_map_l1_acts_sf, tensor_map_l1_weights, tensor_map_l1_weights_sf, tensor_map_l1_output, tensor_map_l2_acts, tensor_map_l2_acts_sf, tensor_map_l2_weights, tensor_map_l2_weights_sf, tensor_map_shared_l1_acts, tensor_map_shared_l1_acts_sf, tensor_map_shared_l1_weights, tensor_map_shared_l1_weights_sf, tensor_map_shared_l1_output, tensor_map_shared_l2_acts, tensor_map_shared_l2_acts_sf, tensor_map_shared_l2_weights, tensor_map_shared_l2_weights_sf, sm_locality_domains);
+}
+#endif
 
 } // namespace deep_gemm

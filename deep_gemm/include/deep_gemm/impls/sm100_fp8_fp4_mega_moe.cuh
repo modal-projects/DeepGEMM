@@ -852,9 +852,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ff_acc = [&](const uint32_t& n) { return ib_pcomb(ib_my_node) + (2 + (n < ib_my_node ? n : n - 1)) * kFFSlot; };
     const auto ff_cnt = [&](const uint32_t& n) {
         return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + (n < ib_my_node ? n : n - 1) * kIBT; };
+    // DG_MEGA_MOE_IB_FUSED_SRC=1 (with the real FUSED_FIN): the same running sum for the SOURCE's own node. Every L2 row of a node-local
+    // source (routed and shared expert) is added into one bf16 sum per token on the source GPU (own-node pcomb slot 3 + R), and the
+    // source combine reads that sum instead of TMA-loading the K + 1 slot rows (no C3_SPLIT scratch pass). Readiness is unchanged:
+    // the per-rank combine-ready flags (each node peer's L2 grid sync). The output's local part is then accumulated in bf16.
+#if defined(DG_MEGA_MOE_IB_FUSED_SRC) and DG_MEGA_MOE_IB_FUSED_SRC
+    constexpr bool kIBFusedSrc = kIBFused and kFFData == 1 and kFFSig != 0 and kFFRead == 1;
+#else
+    constexpr bool kIBFusedSrc = false;
+#endif
+    const auto ff_self = [&]() { return ib_pcomb(ib_my_node) + (3 + (ib_num_nodes - 1)) * kFFSlot; };
     const auto ff_marker = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT; };
     if constexpr (kIBFused) {
-        if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2) {
+        if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2 + (kIBFusedSrc ? 1u : 0u)) {
             if (blockIdx.x == 0 and threadIdx.x == 0)
                 printf("DeepGEMM IB: FUSED_FIN needs <= 5 nodes and top-k >= nodes + 2 (nodes=%u, top-k=%u)\n", ib_num_nodes, kNumTopk);
             __trap();
@@ -1581,6 +1591,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (kFFClean and ptx::ld_volatile(mk + 1) != kFFMagic) {
                 const auto ab = reinterpret_cast<uint4*>(ib_pcomb(ib_my_node) + 2 * kFFSlot);
                 for (int64_t u = ff_gtid; u < ff_R * kFFSlot / 16; u += kFFG)
+                    ab[u] = uint4{0u, 0u, 0u, 0u};
+            }
+            if (kIBFusedSrc and ptx::ld_volatile(mk + 2) != kFFMagic) {
+                const auto ab = reinterpret_cast<uint4*>(ff_self());
+                for (int64_t u = ff_gtid; u < kFFSlot / 16; u += kFFG)
                     ab[u] = uint4{0u, 0u, 0u, 0u};
             }
         }
@@ -2401,6 +2416,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sm_idx == 0 and thread_idx == 0) {
                 if (kFFSig != 0) ff_marker()[0] = kFFMagic;
                 ff_marker()[1] = kFFClean ? kFFMagic : 0u;
+                if (kIBFusedSrc) ff_marker()[2] = kFFMagic;
             }
         }
         if (sm_idx == 0 and thread_idx == 0)
@@ -3918,6 +3934,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                             ib_cp(dst_rank_idx, ib_my_node)) = packed;
                             continue;
                         }
+                        if constexpr (kIBFusedSrc) {
+                            // FUSED_SRC: node-local source (or our own shared-expert row): add into the source's own running sum
+                            const auto ap = sym_buffer.map(
+                                ff_self() + static_cast<int64_t>(dst_token_idx) * (kHidden * 2) + n_idx * 2 + (lane_idx % 16) * 16, dst_rank_idx);
+                            const auto pk = reinterpret_cast<const uint4*>(&packed);
+                            asm volatile("red.relaxed.sys.global.add.noftz.v4.bf16x2 [%0], {%1, %2, %3, %4};"
+                                         : : "l"(ap), "r"(pk->x), "r"(pk->y), "r"(pk->z), "r"(pk->w) : "memory");
+                            continue;
+                        }
 #endif
                         *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
@@ -4066,11 +4091,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         TT_MIN(8, epilogue_thread_idx == 0);
         const auto grid_idx = ptx::get_grid_idx() + 1;
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        constexpr bool kC3Split = kIBC3Split;
+        constexpr bool kC3Split = kIBC3Split and not kIBFusedSrc;
+        constexpr bool kC3FusedSrc = kIBFusedSrc;
         DG_STATIC_ASSERT(not kIBC3Split or kNumTopk >= 2, "C3 split scratch");
         const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node));  // own node's slot: never used by the proxy
 #else
         constexpr bool kC3Split = false;
+        constexpr bool kC3FusedSrc = false;
         float* const c3_scratch = nullptr;
 #endif
         // C3 gate (DG_MEGA_MOE_IB_C3_HDR_GATE, defined with NO_RET_HDR): 1 = all return headers, 2 = per-chunk tail flags
@@ -4175,8 +4202,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if constexpr (kC3FusedSrc) {
+                // FUSED_SRC: every local-node row of this token (shared expert included) is already summed; read + zero this chunk
+                const auto arow = ff_self() + static_cast<int64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset;
+                uint4 fv[kNumUint4PerLane];
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j)
+                    fv[j] = ib_ldv4(arow + (j * 32 + lane_idx) * 16);
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                    *reinterpret_cast<uint4*>(arow + (j * 32 + lane_idx) * 16) = uint4{0u, 0u, 0u, 0u};
+                    const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&fv[j]);
+                    #pragma unroll
+                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                        ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                }
+            }
+#endif
             // Move mask and load
-            uint32_t mask = total_mask;
+            uint32_t mask = kC3FusedSrc ? 0u : total_mask;
             bool pair_two[2] = {false, false};
             const auto move_mask_and_load = [&](const uint32_t& i) {
                 if (mask) {

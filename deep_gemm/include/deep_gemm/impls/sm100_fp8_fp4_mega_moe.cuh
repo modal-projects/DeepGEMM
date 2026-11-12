@@ -2070,6 +2070,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // are in flight (every dispatch warp of every SM passes here on every path; nobody writes that copy before the next launch)
             if (rot_ho != ~0ull)
                 rot_rearm(rot_o);
+            TT_MAX(14, lane_idx == 0);  // trace: deferred re-arm done (OPUS_TRACE6 rearm_done), slowest warp
         }
 #endif
         // Wait token data arrival

@@ -772,6 +772,16 @@ __device__ __noinline__ void ib_fwd_drain_fn(
 // once the NEXT item's bulk round and x loads are issued, so its round trip is not serial with them (a completed chunk's put is
 // issued ~1 round trip later; flushed before the warp leaves the node).
 // Returns the mbarrier phase.
+// DG_MEGA_MOE_IB_FWD_BULK_TSPLIT=k (traced builds): fwd_item_ns counts only part k of the item (1 issue + x poll, 2 partial rounds,
+// 3 quantize + record stores, 4 fence, 5 counter atomic) instead of the whole item
+#ifndef DG_MEGA_MOE_IB_FWD_BULK_TSPLIT
+#define DG_MEGA_MOE_IB_FWD_BULK_TSPLIT 0
+#endif
+#if DG_MEGA_MOE_IB_FWD_BULK_TSPLIT
+#define BLK_TS(k) do { if (tt and lane_idx == 0) { const uint64_t n_ = now(); if ((k) == DG_MEGA_MOE_IB_FWD_BULK_TSPLIT) ts_d = n_ - ts_prev; ts_prev = n_; } } while (0)
+#else
+#define BLK_TS(k) do { } while (0)
+#endif
 template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kSlots, uint32_t kSlotsPerBuf, bool kRetHdr, bool kLA, bool kDC, bool kCP, typename barrier_t>
 __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
     const uint32_t* o_nt, uint32_t* fitem, uint32_t* fchunk, uint32_t* fdone, const uint64_t* order_ready, const uint64_t epoch, const uint32_t* tab,
@@ -901,6 +911,9 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
             const bool on = e >= 0 and static_cast<uint32_t>(e) / kEPR / lsa == my_node;
             const uint32_t on_mask = __ballot_sync(0xffffffffu, on);
             const uint64_t tt0 = tt ? now() : 0ull;
+#if DG_MEGA_MOE_IB_FWD_BULK_TSPLIT
+            uint64_t ts_prev = tt0, ts_d = 0;
+#endif
             uint32_t m = on_mask;
             issue(m, t, q);
             // lookahead: the next claim is issued now; its order lookup and top-k row follow below, under the bulk round
@@ -942,6 +955,7 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                 pend = false;
                 __syncwarp();
             }
+            BLK_TS(1);  // issue + x / SF poll (+ lookahead chain)
             bool miss = false;
             while (m) {
                 if constexpr (kCP) {
@@ -1037,6 +1051,7 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                 if (m) issue(m, t, q);
             }
             miss = __any_sync(0xffffffffu, miss);
+            BLK_TS(2);  // partial rounds: wait, smem reads, re-arm, sum
             if (tt and lane_idx == 0) atomicMax(reinterpret_cast<unsigned long long*>(tt + 2), static_cast<unsigned long long>(now()));
             const auto rec = fst + static_cast<int64_t>(p_rec) * kRec;
             #pragma unroll
@@ -1062,13 +1077,18 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
                     *reinterpret_cast<float*>(rec + kHidden + col / 128 * 4) = scale;
             }
             __syncwarp();
+            BLK_TS(3);  // quantize + record stores
             // Fence, one counter atomic for the item's chunk; the warp completing a chunk puts it
             if (lane_idx == 0) {
                 __threadfence();
+                BLK_TS(4);  // fence
                 const uint32_t c = p_rec / 32;
                 const uint32_t old = add_acq_rel(fchunk + n * kMaxUnits + c, 1u);
                 if (tt) {
-                    const uint64_t t_ = now();
+                    uint64_t t_ = now();
+#if DG_MEGA_MOE_IB_FWD_BULK_TSPLIT
+                    if (DG_MEGA_MOE_IB_FWD_BULK_TSPLIT < 5) t_ = tt0 + ts_d; else t_ = tt0 + (t_ - ts_prev);  // 5: the counter atomic
+#endif
                     atomicMax(reinterpret_cast<unsigned long long*>(tt + 3), static_cast<unsigned long long>(t_));
                     atomicAdd(reinterpret_cast<unsigned long long*>(tt + 16), 1ull);
                     if (miss) atomicAdd(reinterpret_cast<unsigned long long*>(tt + 17), 1ull);

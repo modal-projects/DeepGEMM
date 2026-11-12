@@ -3053,6 +3053,62 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         IB_TRACE_MAX(38, true);
                     }
                 }
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and defined(DG_MEGA_MOE_IB_PROBE) and DG_MEGA_MOE_IB_PROBE
+                // DG_MEGA_MOE_IB_PROBE=S (trace builds only; start-side latency study): on the scan SM of our own counterpart
+                // source (its mirror is local memory), one thread of epilogue warp 2 sends 4 put_value probes to that
+                // counterpart at 0 / S / 2S / 3S ns after it got here (x4 for >= 512 tokens), each carrying the sender's
+                // %globaltimer (48 bits) + an epoch tag; one thread of warp 1 polls the 4 words the counterpart sends us and
+                // records t_seen - t_sent (one-way latency + clock offset; the reverse direction has the opposite offset).
+                // DG_MEGA_MOE_IB_PROBE_CTX: 0 header context, 1 meta context, 2 first x context. The poller leaves when the
+                // source's header is visible, so the scan is not delayed (later probes are then reported as missing).
+                if (proxy == sym_buffer.rank_idx and scan_j == 0) {
+                    const uint32_t p_nr = k / ib_lsa, p_n = r / ib_lsa;
+                    constexpr uint64_t kPM = (1ull << 48) - 1;
+                    uint64_t* const pr = tl_tseen + 128;  // free part of the tail carve-out
+                    const uint64_t p_tag = (ib_epoch & 0xffffull) << 48;
+                    if (epilogue_warp_idx == 2 and lane_idx == 0) {
+#ifndef DG_MEGA_MOE_IB_PROBE_CTX
+#define DG_MEGA_MOE_IB_PROBE_CTX 0
+#endif
+                        const uint32_t p_ctx = DG_MEGA_MOE_IB_PROBE_CTX == 0 ? hdr_orig(p_nr) : (DG_MEGA_MOE_IB_PROBE_CTX == 1 ? p_nr : piece_orig(0));
+                        const auto p_gin = make_gin(p_ctx);
+                        const uint64_t p_step = static_cast<uint64_t>(DG_MEGA_MOE_IB_PROBE) * (num_tokens >= 512 ? 4u : 1u);
+                        uint64_t p_t0; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(p_t0));
+                        auto* const p_dst = reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64);
+                        for (uint32_t i = 0; i < 4; ++ i) {
+                            uint64_t t_; bool p_hdr = false;
+                            do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); p_hdr = (ptx::ld_volatile(hdr) >> 32) == (ib_epoch & 0xffffffffull); } while (t_ < p_t0 + i * p_step and not p_hdr);
+                            if (p_hdr and i > 0) { pr[16 + p_nr * 8 + i] = 0, pr[16 + p_nr * 8 + 4 + i] = 0; continue; }
+                            p_gin.put_value(p_dst + i, p_tag | (t_ & kPM), ib_cp(sym_buffer.rank_idx, p_n));
+                            uint64_t t1_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1_));
+                            pr[16 + p_nr * 8 + i] = t_, pr[16 + p_nr * 8 + 4 + i] = t1_;
+                        }
+                    }
+                    if (epilogue_warp_idx == 1 and lane_idx == 0) {
+                        auto* const p_src = reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, p_n) + kIBOffHdr + 64);
+                        uint64_t p_t0; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(p_t0));
+                        for (uint32_t i = 0; i < 4; ++ i)
+                            pr[p_nr * 4 + i] = 0x8000000000000000ull;
+                        uint32_t seen = 0;
+                        while (seen != 15u) {
+                            for (uint32_t i = 0; i < 4; ++ i) {
+                                if ((seen >> i) & 1u) continue;
+                                const uint64_t v = ptx::ld_volatile(p_src + i);
+                                if ((v & ~kPM) == p_tag and v != 0) {
+                                    uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
+                                    pr[p_nr * 4 + i] = static_cast<uint64_t>(static_cast<int64_t>(t_ & kPM) - static_cast<int64_t>(v & kPM));
+                                    seen |= 1u << i;
+                                }
+                            }
+                            const uint64_t h = ptx::ld_volatile(hdr);
+                            uint64_t t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));
+                            if ((h >> 32) == (ib_epoch & 0xffffffffull)) { pr[48 + p_nr] = t_; break; }
+                            if (t_ > p_t0 + 2000000ull) break;
+                        }
+                    }
+                    __syncwarp();
+                }
+#endif
                 // One thread polls the (NVLink-remote) header with a pause between polls: hundreds of threads spinning
                 // on a proxy's HBM while its NIC writes there slows the NIC down drastically on GB200
                 auto nt_smem = reinterpret_cast<uint32_t*>(&shared_storage.smem_d) + kNumExpertsPerRank;
@@ -4279,6 +4335,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 printf("OPUS_META rank=%u epoch=%llu | meta put: before=%.1f after_put=%.1f after_doorbell=%.1f | x pieces: first_issued=%.1f last_issued=%.1f | xorder=%d\n",
                        sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(24), mu(25), mu(26), mu(27), mu(28), (int) kIBXOrder);
             }
+#if defined(DG_MEGA_MOE_IB_PROBE) and DG_MEGA_MOE_IB_PROBE
+            {
+                const uint64_t* const pr = tl_tseen + 128;
+                const auto pd = [&](const uint32_t& i) { return static_cast<long long>(pr[i]) == static_cast<long long>(0x8000000000000000ull) ? -1e9 : static_cast<double>(static_cast<int64_t>(pr[i])) / 1e3; };
+                const auto pu = [&](const uint32_t& i) { return ((int64_t) pr[i] - (int64_t) t[16]) / 1e3; };
+                printf("OPUS_PROBE rank=%u epoch=%llu start48=%llu ctx=%d step=%d | seen-sent us n0: %.2f %.2f %.2f %.2f n1: %.2f %.2f %.2f %.2f n2: %.2f %.2f %.2f %.2f | hdr seen: %.1f %.1f %.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, (unsigned long long) (t[16] & ((1ull << 48) - 1)), (int) DG_MEGA_MOE_IB_PROBE_CTX, (int) DG_MEGA_MOE_IB_PROBE,
+                       pd(0), pd(1), pd(2), pd(3), pd(4), pd(5), pd(6), pd(7), pd(8), pd(9), pd(10), pd(11), pu(48), pu(49), pu(50));
+                printf("OPUS_PROBE2 rank=%u epoch=%llu | issue before/after us n0: %.2f/%.2f %.2f/%.2f %.2f/%.2f %.2f/%.2f n1: %.2f/%.2f %.2f/%.2f %.2f/%.2f %.2f/%.2f n2: %.2f/%.2f %.2f/%.2f %.2f/%.2f %.2f/%.2f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch,
+                       pu(16), pu(20), pu(17), pu(21), pu(18), pu(22), pu(19), pu(23), pu(24), pu(28), pu(25), pu(29), pu(26), pu(30), pu(27), pu(31),
+                       pu(32), pu(36), pu(33), pu(37), pu(34), pu(38), pu(35), pu(39));
+            }
+#endif
             if constexpr (kIBScanSlices > 1) {
                 const auto su = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
                 printf("OPUS_SLICES rank=%u epoch=%llu P=%u | j0 %.1f %.1f %.1f %.1f %.1f | j1 %.1f %.1f %.1f %.1f %.1f | j2 %.1f %.1f %.1f %.1f %.1f | j3 %.1f %.1f %.1f %.1f %.1f | idx_miss=%llu w_miss=%llu\n",

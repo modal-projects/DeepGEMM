@@ -3824,7 +3824,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if constexpr (kIBWSPost > 0 or kIBOrd > 0) {
             DG_IB_OUTLINE_BEGIN
             if (kIBHeavy and ((kIBWSPost > 0 and ib_ws_on(num_tokens) and sm_idx + 3 + (kNumRanks - ib_lsa) == kNumSMs) or
-                 (ib_ord_on(num_tokens) and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs))) and epilogue_warp_idx == 0 and
+                 (ib_ord_on(num_tokens) and sm_idx + 4 + (kNumRanks - ib_lsa) == kNumSMs)) and epilogue_warp_idx == 0 and
                 lane_idx + 1 < ib_num_nodes and num_tokens > 0) {
                 const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                 const uint32_t num_x_chunks = (num_tokens + kIBChunk - 1) / kIBChunk, num_pieces = 1 + num_x_chunks;

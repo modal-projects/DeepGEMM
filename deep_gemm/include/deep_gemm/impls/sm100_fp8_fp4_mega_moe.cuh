@@ -791,7 +791,7 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
     const uint32_t sc_min, const uint32_t ws_min, const bool need_order, const bool skip_xpoll, uint32_t* rot_mask0, uint32_t* rot_ntp,
     const ncclDevComm_t* dev_comm, ncclWindow_t window, const int64_t gin_base, const bool gin_active,
     uint64_t* tt, const uint64_t* trace,
-    uint8_t* sbuf, const uint32_t sbuf_stride, barrier_t* mbar, uint32_t phase) {
+    uint8_t* sbuf, const uint32_t sbuf_stride, barrier_t* mbar, uint32_t phase, const uint32_t la_pct) {
     constexpr uint32_t kMaxUnits = layout::MegaMoESignals::kIBOMaxChunks;
     constexpr int64_t kRec = kHidden + kHidden / 128 * 4;
     constexpr uint32_t kQB = kHidden * 2 / 4;      // bytes of one partial quarter-row
@@ -917,7 +917,9 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
             uint32_t m = on_mask;
             issue(m, t, q);
             // lookahead: the next claim is issued now; its order lookup and top-k row follow below, under the bulk round
-            const bool la = kLA and not prev_miss;
+            // (not for the last la_pct percent of a node's items: there every held claim delays the completion of a late chunk by
+            // one item, and the tail is the wire behind the last puts: EP32 1024 BK + LA +8 against BK with la_pct = 0)
+            const bool la = kLA and not prev_miss and (num_items - item) * 100ull > static_cast<uint64_t>(num_items) * la_pct;
             uint32_t nxt = 0, t_n = 0;
             int e_n = -1;
             if (la and lane_idx == 0) nxt = atomicAdd(fitem + n, 1u);
@@ -3275,6 +3277,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_DC
 #define DG_MEGA_MOE_IB_FWD_BULK_DC 0      // 1: the chunk-counter result is consumed under the next item's bulk round. FAILS at EP16 (launch failure in check at 513 / 1024, not root-caused): do not use
 #endif
+#ifndef DG_MEGA_MOE_IB_FWD_BULK_LA_PCT
+#define DG_MEGA_MOE_IB_FWD_BULK_LA_PCT 0  // no lookahead for the last this-many percent of a node's items
+#endif
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_LA
 #define DG_MEGA_MOE_IB_FWD_BULK_LA 0      // 1: one-item lookahead of the claim / order lookup / top-k row chain
 #endif
@@ -3325,7 +3330,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             (kIBWaveSort or kIBStreamCombine), kIBSkipXPoll, bk_rot_mask, bk_rot_nt,
             &ib_dev_comm, ib_window, sym_buffer.base, ib_gin_active, bk_tt, workspace.signals->ib_trace,
             reinterpret_cast<uint8_t*>(shared_storage.dispatch_send_buffer[warp_idx]), kNumDispatchWarps * kNumBytesPerPull,
-            &shared_storage.dispatch_barriers[warp_idx], mb_phase);
+            &shared_storage.dispatch_barriers[warp_idx], mb_phase, DG_MEGA_MOE_IB_FWD_BULK_LA_PCT);
     };
 #endif
 #endif

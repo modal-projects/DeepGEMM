@@ -19,6 +19,64 @@
 
 namespace deep_gemm {
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+// FUSED_FIN, FF_SIG=6 (expert-granular safe completion signal), out of line so that the kernel's hot warps keep their code.
+// Run by one warp of every G-th SM after its pulls; lane 0 does the work. Per finished L2 task (ring entry = local expert index,
+// appended by epilogue thread 0 after the task's CTA barrier, published with red.release.gpu on the ring head): acquire the head,
+// count the task on the GPU-local per-expert counter (atom.acq_rel.gpu); the thread that sees the expert's last task issues ONE
+// fence.release.sys and then stores the launch epoch into the expert's flag on every node rank (st.relaxed.sys). Memory model
+// (PTX ISA 8.8 / 8.9): every data write of the expert precedes its task's barrier, the head release, some releaser's head acquire
+// and that releaser's counter RMW (program order + synchronizes), the RMWs chain in observation order, so the last RMW's thread has
+// all of them in its causal past when it fences; "release fence + strong write" is a release pattern on the flag, which the
+// reader acquires. One system-scope fence per (GPU, expert) per launch instead of one per L2 task.
+template <uint32_t kG, uint32_t kSMs, uint32_t kBlockM, uint32_t kNBlocks>
+__device__ __noinline__ void ff_expert_releaser(uint32_t* ring_base, uint32_t* head_base, uint32_t* ecnt, const uint64_t* recv_count_sum,
+                                                 uint64_t* eflag_row, const int64_t o0, const int64_t o1, const int64_t o2, const int64_t o3,
+                                                 const int64_t o4, const int64_t o5, const int64_t o6, const int64_t o7,
+                                                 const uint32_t sm_idx, const uint32_t lsa, const uint64_t epoch, const uint32_t rank_idx) {
+    if ((threadIdx.x & 31u) != 0)
+        return;
+    const int64_t offs[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    uint32_t tl[kG];
+    uint32_t live = 0;
+    for (uint32_t g = 0; g < kG; ++ g) {
+        tl[g] = 0;
+        if (sm_idx + g < kSMs) live |= 1u << g;
+    }
+    const long long t0 = clock64();
+    while (live != 0) {
+        bool any = false;
+        for (uint32_t g = 0; g < kG; ++ g) {
+            if (((live >> g) & 1u) == 0) continue;
+            const uint32_t s2 = sm_idx + g;
+            uint32_t h;
+            asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(h) : "l"(head_base + s2 * 32) : "memory");
+            for (; tl[g] != h; ++ tl[g]) {
+                any = true;
+                uint32_t e;
+                asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(e) : "l"(ring_base + s2 * 256 + (tl[g] & 255)) : "memory");
+                if (e == 0xffffffffu) { live &= ~(1u << g); break; }
+                uint64_t cs;
+                asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(cs) : "l"(recv_count_sum + e) : "memory");
+                const uint32_t expected = ((static_cast<uint32_t>(cs) + kBlockM - 1) / kBlockM) * kNBlocks;
+                uint32_t old;
+                asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(ecnt + e) : "memory");
+                if (old + 1 == expected) {
+                    asm volatile("fence.release.sys;" ::: "memory");
+                    for (uint32_t i = 0; i < lsa; ++ i)
+                        asm volatile("st.relaxed.sys.global.u64 [%0], %1;" : : "l"(reinterpret_cast<const uint8_t*>(eflag_row + e) + offs[i]), "l"(epoch) : "memory");
+                }
+            }
+            head_base[s2 * 32 + 1] = tl[g];
+        }
+        if (not any and clock64() - t0 > (1ll << 36)) {
+            printf("OPUS_HANG ff_expert_releaser rank=%u sm=%u live=%x epoch=%llu\n", rank_idx, sm_idx, live, (unsigned long long) epoch);
+            asm volatile("trap;");
+        }
+    }
+}
+#endif
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -858,6 +916,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     constexpr uint32_t kFFData = DG_MEGA_MOE_IB_FF_DATA, kFFSig = DG_MEGA_MOE_IB_FF_SIG, kFFRead = DG_MEGA_MOE_IB_FF_READ;
     constexpr bool kFFWait = DG_MEGA_MOE_IB_FF_WAIT != 0;
+    // DG_MEGA_MOE_IB_FF_DEAD=1 (code-generation control): everything FUSED_FIN adds is compiled in, but a runtime condition the compiler
+    // cannot fold keeps it off, so the launch runs today's protocol (numerically right). A vs this arm = what the added code costs
+    // by merely existing in the kernel function; this arm vs the live arm = what the design itself costs.
+#if defined(DG_MEGA_MOE_IB_FF_DEAD) and DG_MEGA_MOE_IB_FF_DEAD
+    DG_STATIC_ASSERT(not kIBFused or (kFFSig == 6 and kFFData == 1 and kFFRead == 1), "FF_DEAD is the control of the FF 1/6/1 build");
+    const bool ff_rt = num_tokens > 0x7fffffffu;
+#else
+    constexpr bool ff_rt = true;
+#endif
     constexpr bool kFFClean = kFFData != 0 and kFFSig != 0 and kFFRead != 0 and kFFWait;  // the sums are zero again at the end of a launch
     constexpr int64_t kFFSlot = kIBT * kHidden * 2;
     constexpr uint32_t kFFNBlocks = L2_SHAPE_N / BLOCK_N;  // counter increments per (row, launch): one per L2 N-block task
@@ -890,6 +957,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto ff_head = [&](const uint32_t& sm) {
         return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT + 1024 + 256 * 256 + sm * 32; };
     DG_STATIC_ASSERT(kNumSMs <= 256 and BLOCK_M < 256, "FF_SIG=5 ring");
+    // FF_SIG=6: per-(node-local rank, local expert) epoch flags on every proxy, and this GPU's per-expert finished-task counters
+    constexpr bool kFFTokCnt = kFFSig == 1 or kFFSig == 2 or kFFSig == 4 or kFFSig == 5;  // per-token counters in use
+    DG_STATIC_ASSERT(kNumExpertsPerRank <= 256, "FF_SIG=6 flags");
+    const auto ff_eflag = [&](const uint32_t& local_rank, const uint32_t& e) {
+        return reinterpret_cast<uint64_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot + (8ll << 20)) + local_rank * 256 + e; };
+    const auto ff_ecnt = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot + (9ll << 20)); };
     const auto ff_marker = [&]() { return reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + (ib_num_nodes - 1)) * kFFSlot) + 16 * kIBT; };
     if constexpr (kIBFused) {
         if (ib_num_nodes - 1 > 4 or kNumTopk < ib_num_nodes + 2 + (kIBFusedSrc ? 1u : 0u)) {
@@ -1439,8 +1512,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (kIBFused) {
                     // FUSED_FIN: the node's L2 epilogues added this token's rows into one running sum; wait for the counter, then
                     // read this item's part of the sum and zero it for the next launch
-                    if (m != 0) {
-                        if constexpr (kFFSig != 0 and kFFWait) {
+                    if (m != 0 and ff_rt) {
+                        if constexpr (kFFSig == 6 and kFFWait) {
+                            // every lane acquires the flag of every on-node pick (rank, expert) of the token
+                            uint32_t mm = m;
+                            while (mm) {
+                                const uint32_t k = static_cast<uint32_t>(__ffs(mm) - 1);
+                                mm &= mm - 1;
+                                const uint32_t ek = static_cast<uint32_t>(__shfl_sync(0xffffffffu, e, k));
+                                const auto fp = ff_eflag((ek / kNumExpertsPerRank) % ib_lsa, ek % kNumExpertsPerRank);
+                                uint64_t fv = ptx::ld_acq_sys(fp);
+                                tt_miss |= fv != ib_epoch;
+                                IB_POLL(fv != ib_epoch, fv = ptx::ld_acq_sys(fp), "ff_eflag", t, ek);
+                            }
+                        }
+                        if constexpr (kFFTokCnt and kFFWait) {
                             const uint32_t expected = static_cast<uint32_t>(__popc(m)) * kFFNBlocks;
                             const auto cp = ff_cnt(n) + t;
                             uint32_t cv = ptx::ld_acq_sys(cp);
@@ -1464,7 +1550,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
                     if constexpr (not (kFFData == 3 and kFFRead != 0))
-                        m = 0;
+                        if (ff_rt) m = 0;
                 }
                 while (m) {
                     // kBatch slots at a time (top-k order kept): all their loads first, then the checks / accumulation
@@ -1503,7 +1589,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 }
                                 continue;
                             }
-                            if constexpr (kIBReduceOnArrival and not kIBFused) {
+                            if constexpr (kIBReduceOnArrival) if (not kIBFused or not ff_rt) {
                                 tt_miss |= ib_is_sentinel4(v[bb][i]);
                                 IB_POLL(ib_is_sentinel4(v[bb][i]), v[bb][i] = ib_ldv4(ptr), "c2_pcomb", t, k);
                                 if constexpr (not kIBDeferRearm and not kIBRot)
@@ -1719,9 +1805,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kFFG = kNumSMs * kNumDispatchThreads;
             const uint32_t ff_R = ib_num_nodes - 1;
             const auto mk = ff_marker();
-            if (kFFSig == 5 and thread_idx < 2)
+            if ((kFFSig == 5 or kFFSig == 6) and thread_idx < 2)
                 ff_head(sm_idx)[thread_idx] = 0;  // [0] head (epilogue thread 0), [1] tail (releaser warp)
-            if (kFFSig != 0 and ptx::ld_volatile(mk) != kFFMagic) {
+            if (kFFSig == 6 and sm_idx == 0)
+                for (uint32_t u = thread_idx; u < 256; u += kNumDispatchThreads)
+                    ff_ecnt()[u] = 0;
+            if (kFFTokCnt and ptx::ld_volatile(mk) != kFFMagic) {
                 const auto cb = reinterpret_cast<uint32_t*>(ib_pcomb(ib_my_node) + (2 + ff_R) * kFFSlot);
                 for (uint32_t u = ff_gtid; u < ff_R * static_cast<uint32_t>(kIBT); u += kFFG)
                     cb[u] = 0;
@@ -2364,7 +2453,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         IB_TRACE(4, sm_idx == 0 and thread_idx == 0);
         IB_TRACE_MAX(27, thread_idx == 0);  // pull end, slowest SM
-        if constexpr (kIBFused and kFFSig == 5) {
+        if constexpr (kIBFused and kFFSig == 6) {
+#ifndef DG_MEGA_MOE_IB_FF_REL_GROUP
+#define DG_MEGA_MOE_IB_FF_REL_GROUP 1
+#endif
+            if (ff_rt and warp_idx == kNumDispatchWarps - 1 and sm_idx % DG_MEGA_MOE_IB_FF_REL_GROUP == 0) {
+                if (ib_lsa > 8) asm volatile("trap;");
+                const uint32_t ff_r0 = ib_my_node * ib_lsa;
+                const auto ff_off = [&](const uint32_t& i) { return i < ib_lsa ? sym_buffer.offsets[ff_r0 + i] : static_cast<int64_t>(0); };
+                ff_expert_releaser<DG_MEGA_MOE_IB_FF_REL_GROUP, kNumSMs, BLOCK_M, kFFNBlocks>(
+                    ff_ring(0), ff_head(0), ff_ecnt(), workspace.get_expert_recv_count_sum_ptr(0),
+                    ff_eflag(sym_buffer.rank_idx % ib_lsa, 0),
+                    ff_off(0), ff_off(1), ff_off(2), ff_off(3), ff_off(4), ff_off(5), ff_off(6), ff_off(7),
+                    sm_idx, ib_lsa, ib_epoch, sym_buffer.rank_idx);
+            } else {
+                ib_forward_combine(warp_idx * kNumSMs + sm_idx, kNumSMs * kNumDispatchWarps, sm_idx == 0 and thread_idx == 0,
+                                   cute::Int<DG_MEGA_MOE_IB_FWD_BATCH_D>{}, false);
+            }
+            IB_TRACE(6, sm_idx == 0 and thread_idx == 0);
+            TT_MAX(6, lane_idx == 0);
+        } else if constexpr (kIBFused and kFFSig == 5) {
             // DG_MEGA_MOE_IB_FF_REL_GROUP=G: only every G-th SM runs a releaser warp, which serves the rings of G consecutive SMs (the
             // head's release / acquire is GPU scope, so any SM of the GPU may consume it); the other SMs keep all dispatch warps
             // on the forward-combine and issue no system-scope fence at all
@@ -2448,7 +2556,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kGThreads = kNumSMs * kNumDispatchThreads;
             const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
             const uint4 idx_sentinel = {0u, 0x80000000u, 0u, 0x80000000u};
-            if constexpr (kIBFused and kFFSig != 0) {
+            if constexpr (kIBFused and kFFTokCnt) {
                 // FUSED_FIN: every forward item of node n is done (fdone above), so its token counters go back to zero
                 const auto cb = ff_cnt(n);
                 for (uint32_t u = gtid; u < nt; u += kGThreads)
@@ -2629,7 +2737,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         if constexpr (kIBFused) {
             if (sm_idx == 0 and thread_idx == 0) {
-                if (kFFSig != 0) ff_marker()[0] = kFFMagic;
+                if (kFFTokCnt) ff_marker()[0] = kFFMagic;
                 ff_marker()[1] = kFFClean ? kFFMagic : 0u;
                 if (kIBFusedSrc) ff_marker()[2] = kFFMagic;
             }
@@ -4128,7 +4236,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                         // C1: rows of sources on other nodes go to the proxy's combine buffer (same layout), over NVLink
                         if (is_remote(dst_rank_idx)) {
-                            if constexpr (kIBFused and kFFData != 3) {
+                            if constexpr (kIBFused and kFFData != 3) if (ff_rt) {
                                 // FUSED_FIN: add this 16-byte unit into the token's running sum on the proxy
                                 const auto ap = sym_buffer.map(
                                     ff_acc(dst_rank_idx / ib_lsa) + static_cast<int64_t>(dst_token_idx) * (kHidden * 2) +
@@ -4155,7 +4263,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 reinterpret_cast<const uint8_t*>(buffer.combine_token_buffer.get_base_ptr());
                             if constexpr (kIBSafeCeil) {
                                 // flag unit (first of the row's 16 units in this N-block) to the real buffer, the rest to the junk area
+                                // SAFE_CEIL=1: junk address by a 64-bit modulo per store (measured +19 / +48: the modulo itself slows the
+                                // epilogue); =2: junk = the token's FUSED_FIN sum row (same cheap address arithmetic as the P1 arm)
+#if DG_MEGA_MOE_IB_SAFE_CEIL >= 2
+                                const auto junk = ff_acc(dst_rank_idx / ib_lsa) + static_cast<int64_t>(dst_token_idx) * (kHidden * 2) +
+                                                  n_idx * 2 + (lane_idx % 16) * 16;
+#else
                                 const auto junk = ib_pcomb(ib_my_node) + 2 * kFFSlot + off % (kIBPCombStride - 4 * kFFSlot);
+#endif
                                 *sym_buffer.map(reinterpret_cast<float4*>(lane_idx % 16 == 0 ? ib_pcomb(dst_rank_idx / ib_lsa) + off : junk),
                                                 ib_cp(dst_rank_idx, ib_my_node)) = packed;
                                 continue;
@@ -4194,6 +4309,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                if constexpr (kIBFused and kFFSig == 6) {
+                    if (ff_rt and epilogue_thread_idx == 0 and not task_info.is_shared()) {
+                        if (ff_h >= 256)
+                            IB_POLL(ff_h - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring6", ff_h, 0);
+                        ff_ring(sm_idx)[ff_h & 255] = task_info.local_expert_idx;
+                        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" : : "l"(ff_head(sm_idx)) : "memory");
+                        ++ ff_h;
+                    }
+                }
                 if constexpr (kIBFused and kFFSig == 5) {
                     if (epilogue_thread_idx == 0 and not task_info.is_shared()) {
                         if (ff_h >= 256)  // ring full: wait for the releaser (never in practice: ~40 routed L2 tasks per SM per launch)
@@ -4225,8 +4349,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        if constexpr (kIBFused and kFFSig == 5) {
-            if (epilogue_thread_idx == 0) {  // end marker: this SM issues no more L2 rows
+        if constexpr (kIBFused and (kFFSig == 5 or kFFSig == 6)) {
+            if (ff_rt and epilogue_thread_idx == 0) {  // end marker: this SM issues no more L2 rows
                 if (ff_h >= 256)
                     IB_POLL(ff_h - ptx::ld_volatile(ff_head(sm_idx) + 1) >= 256, (void) 0, "ff_ring_end", ff_h, 0);
                 ff_ring(sm_idx)[ff_h & 255] = 0xffffffffu;

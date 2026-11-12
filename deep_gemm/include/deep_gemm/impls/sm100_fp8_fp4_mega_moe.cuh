@@ -567,8 +567,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // buckets per warp (match_any) instead of atomics on <= 39 hot shared-memory words
 #if defined(DG_MEGA_MOE_IB_SST_FAST) and DG_MEGA_MOE_IB_SST_FAST
     constexpr bool kIBSSTFast = true;
+    constexpr bool kIBSSTFastB = DG_MEGA_MOE_IB_SST_FAST == 1;  // SST_FAST=2: order pass only, the SST builder stays as it was
 #else
     constexpr bool kIBSSTFast = false;
+    constexpr bool kIBSSTFastB = false;
 #endif
     // DG_MEGA_MOE_IB_ORD_COAL=1: COALESCED order pass. The per-token order pass (one thread per token, its top-k loads in
     // flight) spent 28 of its 37 us at 1024 in the key pass: each warp-level load touched 32 different cache lines (lanes
@@ -3555,7 +3557,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t sst_ne = num_tokens * kNumTopk;
                 // No runtime divisions per entry (ib_lsa is not a constant): own-node range test, node slot by compares
                 const uint32_t sst_lo = ib_my_node * sst_node_experts, sst_hi = sst_lo + sst_node_experts;
-                const bool sst_cmp = kIBSSTFast and ib_num_nodes <= 4;
+                const bool sst_cmp = kIBSSTFastB and ib_num_nodes <= 4;
                 const auto sst_remote = [&](const uint32_t& e) { return sst_cmp ? (e < sst_lo or e >= sst_hi) : e / sst_node_experts != ib_my_node; };
                 const auto sst_nr_of = [&](const uint32_t& e) {
                     if (not sst_cmp) return ib_nr_of_node(e / sst_node_experts);
@@ -3563,7 +3565,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     return n - (n > ib_my_node ? 1u : 0u);
                 };
                 const auto stg = ib_mirror(ib_parity, ib_my_node) + kIBOffCnt;  // our own node's slot: unused locally
-                constexpr uint32_t kSSTB = kIBSSTFast ? 16 : 8;  // loads in flight per thread
+                constexpr uint32_t kSSTB = kIBSSTFastB ? 16 : 8;  // loads in flight per thread
                 const auto in_idx32 = reinterpret_cast<const uint32_t*>(ib_input_base + kIBOffIdx);  // low halves (little endian)
                 SL_TR(0, 33, epilogue_thread_idx == 0);  // SST build entered
                 for (uint32_t w = epilogue_thread_idx; w < kSSTWords; w += kNumEpilogueThreads)
@@ -3575,7 +3577,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFast ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
+                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFastB ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
@@ -3651,7 +3653,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFast ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
+                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFastB ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {

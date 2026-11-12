@@ -30,7 +30,7 @@ namespace deep_gemm {
 // all of them in its causal past when it fences; "release fence + strong write" is a release pattern on the flag, which the
 // reader acquires. One system-scope fence per (GPU, expert) per launch instead of one per L2 task.
 template <uint32_t kG, uint32_t kSMs, uint32_t kBlockM, uint32_t kNBlocks>
-__device__ __noinline__ void ff_expert_releaser(uint32_t* ring_base, uint32_t* head_base, uint32_t* ecnt, const uint64_t* recv_count_sum,
+__device__ __noinline__ void ff_expert_releaser(uint32_t* ring_base, uint32_t* head_base, uint32_t* ecnt, const uint32_t* expected_tasks,
                                                  uint64_t* eflag_row, const int64_t o0, const int64_t o1, const int64_t o2, const int64_t o3,
                                                  const int64_t o4, const int64_t o5, const int64_t o6, const int64_t o7,
                                                  const uint32_t sm_idx, const uint32_t lsa, const uint64_t epoch, const uint32_t rank_idx) {
@@ -56,9 +56,10 @@ __device__ __noinline__ void ff_expert_releaser(uint32_t* ring_base, uint32_t* h
                 uint32_t e;
                 asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(e) : "l"(ring_base + s2 * 256 + (tl[g] & 255)) : "memory");
                 if (e == 0xffffffffu) { live &= ~(1u << g); break; }
-                uint64_t cs;
-                asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(cs) : "l"(recv_count_sum + e) : "memory");
-                const uint32_t expected = ((static_cast<uint32_t>(cs) + kBlockM - 1) / kBlockM) * kNBlocks;
+                // expected tasks of the expert: snapshot taken by SM 0 right after the counts were final (the live receive counts are
+                // zeroed by each SM's own cleanup, which can run while another SM's releaser is still counting)
+                uint32_t expected;
+                asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(expected) : "l"(expected_tasks + e) : "memory");
                 uint32_t old;
                 asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(ecnt + e) : "memory");
                 if (old + 1 == expected) {
@@ -1564,9 +1565,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         if (clock64() - dt0 > (1ll << 34)) {
                                             const uint32_t hr = ek / kNumExpertsPerRank, he = ek % kNumExpertsPerRank;
                                             if (lane_idx == 0)
-                                                printf("OPUS_HANG ff_eflag_dbg rank=%u token=%u host=%u e=%u ecnt=%u tokens=%llu flag=%llx epoch=%llu\n",
+                                                printf("OPUS_HANG ff_eflag_dbg rank=%u token=%u host=%u e=%u ecnt=%u expected=%llu flag=%llx epoch=%llu\n",
                                                        sym_buffer.rank_idx, t, hr, he, ptx::ld_volatile(sym_buffer.map(ff_ecnt() + he, hr)),
-                                                       (unsigned long long) (ptx::ld_volatile(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(he), hr)) & 0xffffffffull),
+                                                       (unsigned long long) ptx::ld_volatile(sym_buffer.map(ff_ecnt() + 256 + he, hr)),
                                                        (unsigned long long) fv, (unsigned long long) ib_epoch);
                                             asm volatile("trap;");
                                         }
@@ -2037,6 +2038,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Wait token data arrival
         IB_TRACE_MAX(12, thread_idx == 0);  // dispatch warps reach the count wait, slowest SM
         scheduler.fetch_expert_recv_count();
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if constexpr (kIBFused and kFFSig == 6) {
+            // FF_SIG=6: the counts are final here; snapshot every local expert's L2 task count (m-blocks x N-blocks) for the releasers
+            if (sm_idx == 0)
+                for (uint32_t u = thread_idx; u < kNumExpertsPerRank; u += kNumDispatchThreads)
+                    ff_st(ff_ecnt() + 256 + u, math::ceil_div(static_cast<uint32_t>(ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(u))), BLOCK_M) * kFFNBlocks);
+        }
+#endif
         IB_TRACE_MAX(13, thread_idx == 0);  // all counts seen (before the IB system fence), slowest SM
 #if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
         IB_TRACE_MAX(28, thread_idx == 0);  // NVLink build (DG_MEGA_MOE_NVL_TRACE): counts, slowest SM
@@ -2527,7 +2536,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t ff_r0 = ib_my_node * ib_lsa;
                 const auto ff_off = [&](const uint32_t& i) { return i < ib_lsa ? sym_buffer.offsets[ff_r0 + i] : static_cast<int64_t>(0); };
                 ff_expert_releaser<DG_MEGA_MOE_IB_FF_REL_GROUP, kNumSMs, BLOCK_M, kFFNBlocks>(
-                    ff_ring(0), ff_head(0), ff_ecnt(), workspace.get_expert_recv_count_sum_ptr(0),
+                    ff_ring(0), ff_head(0), ff_ecnt(), ff_ecnt() + 256,
                     ff_eflag(sym_buffer.rank_idx % ib_lsa, 0),
                     ff_off(0), ff_off(1), ff_off(2), ff_off(3), ff_off(4), ff_off(5), ff_off(6), ff_off(7),
                     sm_idx, ib_lsa, ib_epoch, sym_buffer.rank_idx);

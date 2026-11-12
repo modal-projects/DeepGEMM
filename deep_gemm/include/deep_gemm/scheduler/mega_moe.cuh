@@ -400,8 +400,16 @@ struct MegaMoEScheduler {
                 // Create task
                 return create_task(BlockPhase::Linear1, m_block_idx, n_cluster_idx, L1_SHAPE_N, L1_SHAPE_K);
             } else {
-                if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx))
+                if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx)) {
+#if defined(DG_MEGA_MOE_L2_PRIO) and DG_MEGA_MOE_L2_PRIO
+                    // L2_PRIO: this scheduler may be in "L2 only" mode while L1 tasks are still unissued; never leave before L1 is exhausted
+                    if (num_sched_l1_waves != kNumSchedL1WavesDone) {
+                        num_sched_l1_waves = 1;
+                        continue;
+                    }
+#endif
                     break;
+                }
 #if defined(DG_MEGA_MOE_L2_COLMAJOR) and DG_MEGA_MOE_L2_COLMAJOR
                 {
                     // DG_MEGA_MOE_L2_COLMAJOR=1: the same task set, column-major within each locality domain (all M blocks
@@ -415,8 +423,24 @@ struct MegaMoEScheduler {
 #endif
 
                 // The next task should be L1
+#if defined(DG_MEGA_MOE_L2_PRIO) and DG_MEGA_MOE_L2_PRIO
+                // DG_MEGA_MOE_L2_PRIO=C (tail: routed L2 completions linear to the end). The 1:1 L1 / L2 alternation advances L1 faster in
+                // block space (L1 has fewer N clusters per block than L2 when inter * 2 < hidden), so L1's lead grows from the warm-up
+                // waves to ~17% of the blocks and the last L2 tasks run in a burst after the last L1 (EP32 MegaSeek 1024: 21% of the
+                // routed L2 tasks in the last 80 us). Here the next task is L1 only while L1 leads L2 by at most C pool blocks (claimed
+                // tasks of this locality domain), else L2 again. C must exceed the worst claim overshoot (kNumSMs / 2 schedulers each
+                // one L2 task = kNumSMs / 2 / kNumL2Clusters blocks) so that an L2 claim never waits for unissued L1 tasks.
+                if (num_sched_l1_waves != kNumSchedL1WavesDone) {
+                    constexpr uint64_t kL1Loc = kNumL1Clusters / kNumLocalityDomains, kL2Loc = kNumL2Clusters / kNumLocalityDomains;
+                    DG_STATIC_ASSERT(static_cast<uint64_t>(DG_MEGA_MOE_L2_PRIO) * kNumL2Clusters > kNumSMs / 2 + kNumL2Clusters, "L2_PRIO lead cap too small");
+                    const uint64_t l1c = ptx::ld_volatile(workspace.get_l1_task_count_ptr() + sm_locality_domain_idx);
+                    const uint64_t l2c = ptx::ld_volatile(workspace.get_l2_task_count_ptr() + sm_locality_domain_idx);
+                    num_sched_l1_waves = l1c * kL2Loc <= l2c * kL1Loc + static_cast<uint64_t>(DG_MEGA_MOE_L2_PRIO) * kL1Loc * kL2Loc ? 1 : 0;
+                }
+#else
                 if (num_sched_l1_waves != kNumSchedL1WavesDone)
                     num_sched_l1_waves = 1;
+#endif
 
                 // Create task
                 auto task_info = create_task(BlockPhase::Linear2, m_block_idx, n_cluster_idx, L2_SHAPE_N, L2_SHAPE_K);

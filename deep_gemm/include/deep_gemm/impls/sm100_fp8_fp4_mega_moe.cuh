@@ -1247,7 +1247,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kIBOrd = kIBSST ? DG_MEGA_MOE_IB_ORD : 0;
     DG_STATIC_ASSERT(kIBOrd % 32 == 0 and not (kIBOrd > 0 and kIBWaveSort) and (kIBOrd == 0 or kIBXPiece == kIBChunk),
                      "ORD: a multiple of 32 rows per put, no WAVE_SORT, X_PIECE = 32");
-    DG_STATIC_ASSERT(kIBOrd == 0 or layout::MegaMoESignals::kIBOMaxNodes * (kNumExpertsPerRank + 1) * 4 <= sizeof(SharedStorage::smem_d), "ORD bucket counters in smem_d");
+    DG_STATIC_ASSERT(kIBOrd == 0 or 4 * (kNumExpertsPerRank + 1) * 4 <= sizeof(SharedStorage::smem_d), "ORD bucket counters in smem_d (<= 4 remote nodes, trapped at run time)");
 #else
     constexpr uint32_t kIBOrd = 0;
 #endif

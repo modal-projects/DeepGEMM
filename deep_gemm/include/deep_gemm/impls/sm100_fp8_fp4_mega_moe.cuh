@@ -2347,7 +2347,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 #if DG_PF
-            PF_MARK(__any_sync(0xffffffffu, pf_sfm) ? 14 : 12);  // 14: the row's SF had not landed (polled until it did)
+            const bool pf_sfa = __any_sync(0xffffffffu, pf_sfm);  // every lane votes (never inside PF_MARK: lane 0 only)
+            PF_MARK(pf_sfa ? 14 : 12);  // 14: the row's SF had not landed (polled until it did)
 #endif
 
             // Store weights and metadata
@@ -5309,6 +5310,43 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                        su(10), su(11), su(12), su(13), su(14), su(15), su(16), su(17), su(18), su(19),
                        (unsigned long long) ib_sl_tr[20], (unsigned long long) ib_sl_tr[21]);
             }
+#if DG_PF
+            // Existing 8-us histograms (h < 4), then the profiler's state sums of the previous launch (OPUS_PFS: 32 values per
+            // (SM class, role) group, units of 128 ns summed over the group's warps, value 30 = warps) and its histograms / chunk
+            // arrays (OPUS_PFH: 64 bins per line, empty lines skipped), all reset here. ONE string buffer for all of them: a
+            // second buffer took the per-thread stack frame past 1 KB (prof_s2 died with an illegal address).
+            for (uint32_t h = 0; h < 4 + kPfGroups + kPfHists * 2; ++ h) {
+                char buf[64 * 6 + 1]; uint32_t n = 0, any = 0;
+                const bool is_s = h >= 4 and h < 4 + kPfGroups;
+                const uint32_t nv = is_s ? 32u : 64u, maxd = is_s ? 10u : 5u;
+                for (uint32_t b = 0; b < nv; ++ b) {
+                    uint32_t v = 0;
+                    if (h < 4) {
+                        v = ptx::ld_volatile(&workspace.signals->ib_hist[h][b]);
+                        workspace.signals->ib_hist[h][b] = 0;
+                    } else if (is_s) {
+                        const uint64_t w = ptx::ld_volatile(pf_tot + (h - 4) * 32 + b);
+                        pf_tot[(h - 4) * 32 + b] = 0;
+                        v = b == 30 ? static_cast<uint32_t>(w) : static_cast<uint32_t>(w >> 7);
+                    } else {
+                        v = ptx::ld_volatile(pf_hist + (h - 4 - kPfGroups) * 64 + b);
+                        pf_hist[(h - 4 - kPfGroups) * 64 + b] = 0;
+                    }
+                    any |= v;
+                    char tmp[10]; uint32_t m = 0;
+                    do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < maxd);
+                    while (m) buf[n ++] = tmp[-- m];
+                    buf[n ++] = b == nv - 1 ? '\0' : ',';
+                }
+                if (h < 4)
+                    printf("OPUS_HIST rank=%u epoch=%llu h=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h, buf);
+                else if (is_s)
+                    printf("OPUS_PFS rank=%u epoch=%llu g=%u nt=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h - 4, num_tokens, buf);
+                else if (any)
+                    printf("OPUS_PFH rank=%u epoch=%llu h=%u s=%u w=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch,
+                           (h - 4 - kPfGroups) / 2, (h - 4 - kPfGroups) % 2, static_cast<uint32_t>(pf_binw), buf);
+            }
+#else
             // 8-us histograms (bucket i = [8i, 8i+8) us from kernel start), then reset for the next printed launch
             for (uint32_t h = 0; h < 4; ++ h) {
                 char buf[64 * 6 + 1]; uint32_t n = 0;
@@ -5322,6 +5360,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 printf("OPUS_HIST rank=%u epoch=%llu h=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h, buf);
             }
+#endif
             const auto* tt = tl_ttrace + 32;  // previous launch
             const auto pu = [&](const uint32_t& i) { return static_cast<double>(static_cast<int64_t>(tt[i])) / 1e3; };
             printf("OPUS_TRACE5 rank=%u epoch=%llu | prev launch tail: l2r_last=%.1f l2s_last=%.1f fwd_part_last=%.1f fwd_item_last=%.1f put_pre_last=%.1f put_post_last=%.1f fwd_exit=%.1f epi_presync_min=%.1f epi_presync=%.1f c3_start_min=%.1f c3_end=%.1f hdr_done=%.1f clean_start=%.1f clean_bar=%.1f prev_disp_end=%.1f prev_epi_end=%.1f\n",
@@ -5350,36 +5389,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                    (unsigned long long) tt[23], (unsigned long long) tt[24], pu(14), pu(15),
                    tt[21] > 0 ? static_cast<double>(tt[25]) / static_cast<double>(tt[21]) : 0.0, (unsigned long long) tt[26],
                    (int) kIBFwdJoin, (int) DG_MEGA_MOE_IB_FWD_BATCH, (int) DG_MEGA_MOE_IB_FWD_BATCH_D, (int) kIBFwdPrefetch, (int) kIBC3Early, (int) kIBDeferRearm, (int) kIBC3Repoll, (int) kIBRetGroup, (int) kIBC3Split);
-#if DG_PF
-            // Profiler: the previous launch's state sums (ns over all warps of a group; value 27 = warps) and histograms, then reset
-            for (uint32_t g = 0; g < kPfGroups; ++ g) {
-                char buf[32 * 12 + 1]; uint32_t n = 0;
-                for (uint32_t b = 0; b < 32; ++ b) {
-                    uint64_t v = ptx::ld_volatile(pf_tot + g * 32 + b);
-                    pf_tot[g * 32 + b] = 0;
-                    char tmp[11]; uint32_t m = 0;
-                    do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < 11);
-                    while (m) buf[n ++] = tmp[-- m];
-                    buf[n ++] = b == 31 ? '\0' : ',';
-                }
-                printf("OPUS_PFS rank=%u epoch=%llu g=%u nt=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, g, num_tokens, buf);
-            }
-            for (uint32_t h = 0; h < kPfHists * 2; ++ h) {
-                char buf[64 * 7 + 1]; uint32_t n = 0, any = 0;
-                for (uint32_t b = 0; b < 64; ++ b) {
-                    uint32_t v = ptx::ld_volatile(pf_hist + h * 64 + b);
-                    pf_hist[h * 64 + b] = 0;
-                    any |= v;
-                    char tmp[6]; uint32_t m = 0;
-                    do { tmp[m ++] = static_cast<char>('0' + v % 10); v /= 10; } while (v and m < 6);
-                    while (m) buf[n ++] = tmp[-- m];
-                    buf[n ++] = b == 63 ? '\0' : ',';
-                }
-                if (any)
-                    printf("OPUS_PFH rank=%u epoch=%llu h=%u s=%u w=%u %s\n", sym_buffer.rank_idx, (unsigned long long) ib_epoch, h / 2, h % 2,
-                           static_cast<uint32_t>(pf_binw), buf);
-            }
-#endif
         }
 #endif
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE and not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)

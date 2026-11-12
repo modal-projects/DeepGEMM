@@ -772,7 +772,7 @@ __device__ __noinline__ void ib_fwd_drain_fn(
 // once the NEXT item's bulk round and x loads are issued, so its round trip is not serial with them (a completed chunk's put is
 // issued ~1 round trip later; flushed before the warp leaves the node).
 // Returns the mbarrier phase.
-template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kSlots, uint32_t kSlotsPerBuf, bool kRetHdr, bool kLA, bool kDC, typename barrier_t>
+template <uint32_t kHidden, uint32_t kNumTopk, uint32_t kEPR, uint32_t kT, uint32_t kSlots, uint32_t kSlotsPerBuf, bool kRetHdr, bool kLA, bool kDC, bool kCP, typename barrier_t>
 __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
     const uint32_t* o_nt, uint32_t* fitem, uint32_t* fchunk, uint32_t* fdone, const uint64_t* order_ready, const uint64_t epoch, const uint32_t* tab,
     uint8_t* mir0, const int64_t node_stride, const int64_t off_idx, const int64_t off_sf, uint8_t* pc0, const int64_t pc_stride, uint8_t* fst0,
@@ -833,6 +833,25 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
         };
         // lane 0: the next (at most kSlots) node-local slots' quarter-rows, one transaction on the warp's mbarrier
         const auto issue = [&](uint32_t mm, const uint32_t& t_, const uint32_t& q_) {
+            if constexpr (kCP) {
+                // FWD_BULK_CP: no TMA: every lane copies its own 16-byte units of the round's quarter-rows with cp.async (a plain
+                // load whose destination is the pull buffer instead of a register, so the number of loads in flight is not bound
+                // by registers), one commit group per round
+                #pragma unroll
+                for (uint32_t j = 0; j < kSlots; ++ j) {
+                    if (mm == 0) break;
+                    const uint32_t k = __ffs(mm) - 1;
+                    mm &= mm - 1;
+                    const auto sp = sbuf + (j / kSlotsPerBuf) * sbuf_stride + (j % kSlotsPerBuf) * kQB;
+                    const auto row = pc + (static_cast<int64_t>(k) * kT + t_) * kHidden * 2 + static_cast<int64_t>(q_) * kQB;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kPPI; ++ i)
+                        asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
+                                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(sp + (i * 32 + lane_idx) * 16))), "l"(row + (i * 32 + lane_idx) * 16) : "memory");
+                }
+                asm volatile("cp.async.commit_group;" ::: "memory");
+                return;
+            }
             // (never with an empty mask: an arrive without bytes completes the phase at once and no lane waits for it)
             if (lane_idx == 0 and mm != 0) {
                 ptx::mbarrier_arrive_and_set_tx(mbar, cute::min(static_cast<uint32_t>(__popc(mm)), kSlots) * kQB);
@@ -925,6 +944,9 @@ __device__ __noinline__ uint32_t ib_fwd_bulk_fn(
             }
             bool miss = false;
             while (m) {
+                if constexpr (kCP) {
+                    asm volatile("cp.async.wait_group 0;" ::: "memory");
+                } else
 #if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
                 ptx::mbarrier_wait_and_flip_phase(mbar, phase);
 #else
@@ -3227,8 +3249,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_SLOTS
 #define DG_MEGA_MOE_IB_FWD_BULK_SLOTS 32  // cap on the quarter-rows per bulk round (default: all the warp's pull buffers hold)
 #endif
+#ifndef DG_MEGA_MOE_IB_FWD_BULK_CP
+#define DG_MEGA_MOE_IB_FWD_BULK_CP 0      // 1: per-lane cp.async of the 16-byte units instead of cp.async.bulk (no TMA, no mbarrier)
+#endif
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_DC
-#define DG_MEGA_MOE_IB_FWD_BULK_DC 0      // 1: the chunk-counter result is consumed under the next item's bulk round
+#define DG_MEGA_MOE_IB_FWD_BULK_DC 0      // 1: the chunk-counter result is consumed under the next item's bulk round. FAILS at EP16 (launch failure in check at 513 / 1024, not root-caused): do not use
 #endif
 #ifndef DG_MEGA_MOE_IB_FWD_BULK_LA
 #define DG_MEGA_MOE_IB_FWD_BULK_LA 0      // 1: one-item lookahead of the claim / order lookup / top-k row chain
@@ -3270,7 +3295,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
         uint64_t* const bk_tt = nullptr;
 #endif
-        return ib_fwd_bulk_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), kBkSlots, kBkPerBuf, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_BULK_LA != 0, DG_MEGA_MOE_IB_FWD_BULK_DC != 0, Barrier>(
+        return ib_fwd_bulk_fn<kHidden, kNumTopk, kNumExpertsPerRank, static_cast<uint32_t>(kIBT), kBkSlots, kBkPerBuf, kIBRetHdrPut, DG_MEGA_MOE_IB_FWD_BULK_LA != 0, DG_MEGA_MOE_IB_FWD_BULK_DC != 0, DG_MEGA_MOE_IB_FWD_BULK_CP != 0, Barrier>(
             workspace.signals->ib_o_nt, &workspace.signals->ib_o_fitem[ib_parity][0], &workspace.signals->ib_o_fchunk[ib_parity][0][0],
             &workspace.signals->ib_o_fdone[ib_parity][0], workspace.signals->ib_o_order_ready, ib_epoch, ib_tab,
             ib_mirror(ib_parity, 0), kIBNodeStride, kIBOffIdx, kIBOffSF, bk_pc0, bk_pc_stride, ib_fstage(0), ib_ret(ib_parity, ib_my_node), kIBRetHdr,

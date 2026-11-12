@@ -7875,8 +7875,56 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
         if (not kC3Split) c3_gate_wait();
-        for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < 2; ++ c3_pass)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_C3_FAST) and DG_MEGA_MOE_IB_C3_FAST
+        // DG_MEGA_MOE_IB_C3_FAST=1 (>= 512 tail, 2026-11-12; measured: pass 1 costs ~11 us per token-chunk with nothing missing = the
+        // scratch reload and the three records one round trip after the other, and a warp blocked on a missing record keeps its
+        // other token-chunk waiting behind it):
+        //  - the record loads of two nodes are in flight at once (the next node's loads are issued before this node's are consumed);
+        //  - pass 0 tries the records right after the local sum WITHOUT waiting: a token-chunk whose records have all landed is
+        //    finished there and then (no fp32 scratch, no pass 1); otherwise the sum SO FAR is parked and the number of records
+        //    already added is kept per item in a register (records are always added in node-slot order: the fp32 sum order is
+        //    today's);
+        //  - pass 1 is a landed-first sweep (a token-chunk whose next record has not landed is skipped), pass 2 the blocking rest.
+        // Rule A unchanged: every 8-byte fp8 unit and every 4-byte scale is sentinel-checked before use, re-armed after.
+        // DG_MEGA_MOE_IB_C3_FAST_MIN=T: only from T tokens on (above every batch = dead control, legacy flow at run time).
+#ifndef DG_MEGA_MOE_IB_C3_FAST_MIN
+#define DG_MEGA_MOE_IB_C3_FAST_MIN 512
+#endif
+        DG_STATIC_ASSERT(kC3Split and kIBFp8Combine and kIBC3Gate == 0 and kIBC3Repoll, "C3_FAST needs C3_SPLIT + C3_REPOLL + fp8 records, no C3 gate");
+        // per item k of this warp (at most 8 here, else the legacy flow): 4 bits = records already added, bit 31 - k... (c3f_fin): finished
+        const bool c3f_on = num_tokens >= DG_MEGA_MOE_IB_C3_FAST_MIN and ib_num_nodes > 1 and ib_num_nodes - 1 <= 15 and
+                            num_tokens * kNumChunks <= 8 * c3_nw;
+        uint32_t c3f_cnt = 0, c3f_fin = 0;
+        const uint32_t c3_npass = c3f_on ? 3u : 2u;
+#else
+        constexpr bool c3f_on = false;
+        constexpr uint32_t c3_npass = 2;
+#endif
+        for (uint32_t c3_pass = kC3Split ? 0u : 1u; c3_pass < c3_npass; ++ c3_pass)
         for (uint32_t token_chunk_idx = (c3_pass == 1 and kC3Split ? (c3_gate_wait(), 0u) : 0u) + (c3_poller ? num_tokens * kNumChunks : c3_gw); token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += c3_nw) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_C3_FAST) and DG_MEGA_MOE_IB_C3_FAST
+            const uint32_t c3f_k = (token_chunk_idx - c3_gw) / c3_nw;
+            if (c3f_on and c3_pass >= 1) {
+                if ((c3f_fin >> c3f_k) & 1u)
+                    continue;  // finished in pass 0 or in the landed-first sweep
+                if (c3_pass == 1) {
+                    // landed-first sweep: one probe of the next record this token-chunk needs (each lane its first unit + scale);
+                    // not there -> leave the item to the blocking sweep
+                    const uint32_t pr_nr = (c3f_cnt >> (4 * c3f_k)) & 15u;
+                    bool pr_miss = false;
+                    if (pr_nr + 1 < ib_num_nodes) {
+                        const uint32_t pr_n = ib_node_of_slot(pr_nr);
+                        const uint32_t pr_tok = token_chunk_idx / kNumChunks;
+                        const uint32_t pr_pos = ib_sc_on(num_tokens) ? ib_tab[kIBTabPos2 + pr_nr * kIBTabT + pr_tok] : pr_tok;
+                        const uint32_t pr_col = (token_chunk_idx % kNumChunks) * kNumChunkBytes / 2 + lane_idx * 8;
+                        pr_miss = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(ib_ret(ib_parity, pr_n), pr_pos, pr_col))) == ~0ull or
+                                  ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(ib_ret(ib_parity, pr_n), pr_pos, pr_col))) == 0xffffffffu;
+                    }
+                    if (__any_sync(0xffffffffu, pr_miss))
+                        continue;
+                }
+            }
+#endif
 #if defined(DG_MEGA_MOE_IB_DBG_XLATE) and DG_MEGA_MOE_IB_DBG_XLATE
             // Debug proof knob, second half: the first lane to get here in pass 1 on rank 0 waits DBG_XLATE ns (every SM has
             // parked its pass-0 sums by then) and only then issues the withheld last ordered x put to node slot 0
@@ -7995,7 +8043,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             TT_MAX(15, lane_idx == 0);  // source combine: a token-chunk's local part done, last one
-            if (kC3Split) {
+            if (kC3Split and not c3f_on) {
                 // C3_SPLIT pass 0: park the fp32 local sum (lane-private layout, read back by the same lane in pass 1)
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
@@ -8016,6 +8064,107 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             TT_CLOCK(tt_c_loc);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_C3_FAST) and DG_MEGA_MOE_IB_C3_FAST
+            if (c3f_on) {
+                // Records from the first one not yet added, two nodes' loads in flight; pass 0: without waiting
+                const bool c3f_wait = c3_pass >= 1;
+                const uint32_t c3f_R = ib_num_nodes - 1;
+                uint32_t c3f_nr = (c3f_cnt >> (4 * c3f_k)) & 15u;
+                uint64_t qa[kNumUint4PerLane], qb[kNumUint4PerLane];
+                uint32_t sa[kNumUint4PerLane], sb[kNumUint4PerLane];
+                const auto c3f_pos = [&](const uint32_t& nr_) { return ib_sc_on(num_tokens) ? ib_tab[kIBTabPos2 + nr_ * kIBTabT + token_idx] : token_idx; };
+                if (c3f_nr < c3f_R) {
+                    const auto rbase = ib_ret(ib_parity, ib_node_of_slot(c3f_nr));
+                    const uint32_t rec_pos = c3f_pos(c3f_nr);
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
+                        qa[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase, rec_pos, col)));
+                        sa[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase, rec_pos, col)));
+                    }
+                }
+                for (; c3f_nr < c3f_R; ++ c3f_nr) {
+                    const uint32_t n = ib_node_of_slot(c3f_nr);
+                    const bool hit = (ib_nodes_hit >> n) & 1u;
+                    const auto rbase = ib_ret(ib_parity, n);
+                    const uint32_t rec_pos = c3f_pos(c3f_nr);
+                    if (c3f_nr + 1 < c3f_R) {  // the next node's record: in flight while this one is checked and added
+                        const auto rbase2 = ib_ret(ib_parity, ib_node_of_slot(c3f_nr + 1));
+                        const uint32_t rec_pos2 = c3f_pos(c3f_nr + 1);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
+                            qb[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase2, rec_pos2, col)));
+                            sb[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase2, rec_pos2, col)));
+                        }
+                    }
+                    // Rule A: every unit and scale of this record; batch re-poll while waiting is allowed
+                    bool c3f_missed = false;
+                    const long long rp_t0 = clock64();
+                    while (true) {
+                        bool miss = false;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j)
+                            miss |= (qa[j] == ~0ull) or (sa[j] == 0xffffffffu);
+                        if (not __any_sync(0xffffffffu, miss))
+                            break;
+                        c3f_missed = true;
+                        if (not c3f_wait)
+                            break;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
+                            if (qa[j] == ~0ull) qa[j] = ptx::ld_volatile(reinterpret_cast<uint64_t*>(ib_rec_q(rbase, rec_pos, col)));
+                            if (sa[j] == 0xffffffffu) sa[j] = ptx::ld_volatile(reinterpret_cast<uint32_t*>(ib_rec_s(rbase, rec_pos, col)));
+                        }
+                        if (clock64() - rp_t0 > (1ll << 34)) {
+                            printf("OPUS_HANG c3f_repoll rank=%u sm=%u warp=%u n=%u token=%u epoch=%llu\n", sym_buffer.rank_idx, sm_idx, warp_idx, n, token_idx, (unsigned long long) ib_epoch);
+                            asm volatile("trap;");
+                        }
+                    }
+                    if (c3f_missed and not c3f_wait)
+                        break;  // pass 0: not landed: nothing of this record was used or re-armed
+                    TT_ADD(18, c3f_missed and lane_idx == 0, 1);
+                    IB_TRACE_MAX(21, lane_idx == 0);  // source: a return record seen, last one
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const uint32_t col = chunk_byte_offset / 2 + (j * 32 + lane_idx) * 8;
+                        if (hit) {
+                            const float scale = __uint_as_float(sa[j]);
+                            const uint64_t q = qa[j];
+                            const auto qs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&q);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                                const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(qs[l], __NV_E4M3)));
+                                reduced[j * kNumElemsPerUint4 + l].x += f.x * scale;
+                                reduced[j * kNumElemsPerUint4 + l].y += f.y * scale;
+                            }
+                        }
+                        if constexpr (not kIBOracle) {
+                            *reinterpret_cast<uint64_t*>(ib_rec_q(rbase, rec_pos, col)) = ~0ull;
+                            if (col % 128 == 0)
+                                *reinterpret_cast<uint32_t*>(ib_rec_s(rbase, rec_pos, col)) = 0xffffffffu;
+                        }
+                    }
+                    __syncwarp();
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j)
+                        qa[j] = qb[j], sa[j] = sb[j];
+                }
+                c3f_cnt = (c3f_cnt & ~(15u << (4 * c3f_k))) | (c3f_nr << (4 * c3f_k));
+                if (c3f_nr < c3f_R) {
+                    // (pass 0 only) park the sum so far; the item comes back in pass 1 / 2
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        auto dst = reinterpret_cast<float4*>(c3_scr + (j * 32 + lane_idx) * 8);
+                        dst[0] = make_float4(reduced[j * 4 + 0].x, reduced[j * 4 + 0].y, reduced[j * 4 + 1].x, reduced[j * 4 + 1].y);
+                        dst[1] = make_float4(reduced[j * 4 + 2].x, reduced[j * 4 + 2].y, reduced[j * 4 + 3].x, reduced[j * 4 + 3].y);
+                    }
+                    continue;
+                }
+                c3f_fin |= 1u << c3f_k;
+            } else
+#endif
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
             // C3: one record per remote node; every record of every remote node is polled (rule A: the proxy writes
             // all of them), added if this token has experts there, then re-armed for the launch after next

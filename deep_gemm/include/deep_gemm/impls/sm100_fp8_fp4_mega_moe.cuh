@@ -1390,7 +1390,7 @@ __device__ __noinline__ uint32_t ib_fwd_ahead_fn(
     const uint32_t my_node, const uint32_t lsa, const uint32_t num_r, const uint32_t rank_idx, const uint32_t rot0,
     const uint32_t sc_min, const uint32_t ws_min, const bool need_order, const bool skip_xpoll, uint32_t* rot_mask0, uint32_t* rot_ntp,
     const ncclDevComm_t* dev_comm, ncclWindow_t window, const int64_t gin_base, const bool gin_active,
-    uint64_t* tt, const uint64_t* trace, uint8_t* sbuf, const uint32_t pend, const bool block) {
+    uint64_t* tt, const uint64_t* trace, uint8_t* sbuf, const uint32_t pend, const bool block, const uint32_t allow256) {
     constexpr uint32_t kMaxUnits = layout::MegaMoESignals::kIBOMaxChunks;
     constexpr int64_t kRec = kHidden + kHidden / 128 * 4;
     constexpr uint32_t kQB = kHidden * 2 / 4;
@@ -1417,8 +1417,12 @@ __device__ __noinline__ uint32_t ib_fwd_ahead_fn(
     // The item: a pending one, or a new claim from the first node (rotated) that has its order tables and an unclaimed item
     uint32_t nr = 0, item = 0;
     bool have = false;
+    // allow256 / 256 = the share of a node's items (wave order = expected completion order) the caller estimates complete from the
+    // L2 progress; nothing above it is claimed or retried (an attempt on an item that has not landed is a wasted load round)
     if (pend != kNone) {
         nr = pend >> 28, item = pend & 0x0fffffffu, have = true;
+        if (not block and static_cast<uint64_t>(item) * 256 >= static_cast<uint64_t>(allow256) * ptx::ld_volatile(o_nt + (nr < my_node ? nr : nr + 1)) * 4)
+            return pend;
     } else {
         for (uint32_t it = 0; it < num_r and not have; ++ it) {
             nr = it + rot0;
@@ -1427,7 +1431,7 @@ __device__ __noinline__ uint32_t ib_fwd_ahead_fn(
             const uint32_t nt_ = ptx::ld_volatile(o_nt + n_);
             uint32_t got = kNone;
             if (lane_idx == 0 and nt_ != 0 and (not need_order or ptx::ld_acq_sys(order_ready + nr * lsa + rank_idx % lsa) == epoch) and
-                ptx::ld_volatile(fitem + n_) < nt_ * 4) {
+                static_cast<uint64_t>(ptx::ld_volatile(fitem + n_)) * 256 < static_cast<uint64_t>(block ? 256u : allow256) * nt_ * 4) {
                 got = atomicAdd(fitem + n_, 1u);
                 if (got >= nt_ * 4) got = kNone;
             }
@@ -3760,6 +3764,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_FWD_AHEAD_LEAD
 #define DG_MEGA_MOE_IB_FWD_AHEAD_LEAD 8     // ... when its next pool row is more than this many blocks ahead of the L1 blocks handed out
 #endif
+#ifndef DG_MEGA_MOE_IB_FWD_AHEAD_GATE
+#define DG_MEGA_MOE_IB_FWD_AHEAD_GATE 70    // ... and only items below this percent of the completion estimate are attempted (1000: no gate)
+#endif
 #ifndef DG_MEGA_MOE_IB_FWD_AHEAD_RETRY
 #define DG_MEGA_MOE_IB_FWD_AHEAD_RETRY 8    // ... and a pending (not yet landed) item is retried on every this-many-th row
 #endif
@@ -3768,7 +3775,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
     // FWD_AHEAD (ib_fwd_ahead_fn): one non-blocking reduce item of a dispatch warp inside its pull
     const bool fa_on = num_tokens >= DG_MEGA_MOE_IB_FWD_AHEAD_MIN and ib_num_nodes > 1;
-    const auto ib_forward_ahead = [&](const uint32_t& fa_pend_in, const bool& fa_block) -> uint32_t {
+    const auto ib_forward_ahead = [&](const uint32_t& fa_pend_in, const bool& fa_block, const uint32_t& fa_allow) -> uint32_t {
         DG_STATIC_ASSERT(kIBFwdDyn and kIBReduceOnArrival and kIBFp8Combine and kIBRetGroups == 0 and kIBRetGroup == 1 and not kIBFwdInterleave and
                          not kIBDeferRearm and not kIBNoOvReturn and not kIBFwdPrefetch, "FWD_AHEAD needs FWD_JOIN + fp8 records, no RET_GROUP / INTERLEAVE / DEFER_REARM / PREFETCH");
         DG_STATIC_ASSERT(kIBTabSlot == 0 and kIBTabPerm2 == 64 * kIBTabT and kIBTabT == kIBT and kIBTokBytes == kHidden and kIBSFBytes == kHidden / 32 and
@@ -3808,7 +3815,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             kIBWaveSort ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
             (kIBWaveSort or kIBStreamCombine), kIBSkipXPoll, fa_rot_mask, fa_rot_nt,
             &ib_dev_comm, ib_window, sym_buffer.base, ib_gin_active, fa_tt, workspace.signals->ib_trace,
-            reinterpret_cast<uint8_t*>(shared_storage.dispatch_send_buffer[warp_idx]), fa_pend_in, fa_block);
+            reinterpret_cast<uint8_t*>(shared_storage.dispatch_send_buffer[warp_idx]), fa_pend_in, fa_block, fa_allow);
     };
 #endif
 #if defined(DG_MEGA_MOE_IB_FWD_FINAL) and DG_MEGA_MOE_IB_FWD_FINAL
@@ -4179,7 +4186,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Pull token data and SF from remote ranks into local L1 buffer
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_FWD_AHEAD) and DG_MEGA_MOE_IB_FWD_AHEAD
-        uint32_t fa_pend = 0xffffffffu, fa_rows = 0;  // FWD_AHEAD: this warp's claimed-but-not-landed item; its row counter
+        uint32_t fa_pend = 0xffffffffu, fa_rows = 0, fa_blocks = 0;  // FWD_AHEAD: this warp's claimed-but-not-landed item; its row counter; pool blocks
 #endif
         uint32_t pull_mbarrier_phase = 0;
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
@@ -4444,8 +4451,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t fa_l1c = ptx::ld_volatile(workspace.get_l1_task_count_ptr());
                 if constexpr (kNumLocalityDomains > 1)
                     fa_l1c = cute::max(fa_l1c, ptx::ld_volatile(workspace.get_l1_task_count_ptr() + 1));
-                if (pool_block_idx > fa_l1c / kFaLocalClusters + DG_MEGA_MOE_IB_FWD_AHEAD_LEAD)
-                    fa_pend = ib_forward_ahead(fa_pend, false);
+                if (pool_block_idx > fa_l1c / kFaLocalClusters + DG_MEGA_MOE_IB_FWD_AHEAD_LEAD) {
+                    // records complete ~ (routed L2 share done)^4.75 (a record needs the last of its ~4.75 node-local picks):
+                    // GATE percent of F^5 of the L2 tasks HANDED OUT (the slower locality domain) is what may be attempted
+                    constexpr uint32_t kFaL2Local = (L2_SHAPE_N / BLOCK_N / 2) / kNumLocalityDomains;
+                    uint32_t fa_l2c = ptx::ld_volatile(workspace.get_l2_task_count_ptr());
+                    if constexpr (kNumLocalityDomains > 1)
+                        fa_l2c = cute::min(fa_l2c, ptx::ld_volatile(workspace.get_l2_task_count_ptr() + 1));
+                    if (fa_blocks == 0) fa_blocks = scheduler.get_num_total_pool_blocks();
+                    const uint64_t fa_tot = static_cast<uint64_t>(fa_blocks) * kFaL2Local;
+                    const uint64_t fa_f = fa_tot ? cute::min(static_cast<uint64_t>(256), static_cast<uint64_t>(fa_l2c) * 256 / fa_tot) : 0ull;
+                    const uint32_t fa_allow = static_cast<uint32_t>(((fa_f * fa_f * fa_f * fa_f * fa_f) >> 32) * DG_MEGA_MOE_IB_FWD_AHEAD_GATE / 100);
+                    if (fa_allow > 0)
+                        fa_pend = ib_forward_ahead(fa_pend, false, fa_allow);
+                }
             }
 #endif
 
@@ -4763,7 +4782,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // The dispatch warps are idle until the cleanup: reduce forwarded tokens as their partials land
 #if defined(DG_MEGA_MOE_IB_FWD_AHEAD) and DG_MEGA_MOE_IB_FWD_AHEAD
             if (fa_pend != 0xffffffffu)  // FWD_AHEAD: the item this warp claimed inside the pull and found not landed
-                fa_pend = ib_forward_ahead(fa_pend, true);
+                fa_pend = ib_forward_ahead(fa_pend, true, 256u);
 #endif
 #if defined(DG_MEGA_MOE_IB_FWD_PACE) and DG_MEGA_MOE_IB_FWD_PACE
             // DG_MEGA_MOE_IB_FWD_PACE=k (inverse lever: the GEMMs are memory-load-bound and every more eager reduce made the layer

@@ -593,6 +593,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr uint32_t kIBMSO = 0;
 #endif
+    // DG_MEGA_MOE_IB_SST_MSB=S: MULTI-SM SST builder (counting sort over S idle SMs, kNumSMs - remote - 5 - MSO - s). SM s takes
+    // the s-th contiguous slice of the top-k entries: count into its own smem counters, publish them as a global row (plain
+    // stores + GPU-scope flag), read all S rows for its cursors (prefix over the experts of the totals + the lower SMs'
+    // share), scatter its slice into the common staging, raise a second flag; SM 0 writes the counts and issues the puts
+    // when all S are done. Same wire layout, receivers unchanged; without it the one-SM builder is staged at 16 / 40 us.
+#if defined(DG_MEGA_MOE_IB_SST_MSB) and DG_MEGA_MOE_IB_SST_MSB
+    constexpr uint32_t kIBMSB = DG_MEGA_MOE_IB_SST_MSB;
+    DG_STATIC_ASSERT(kIBMSB <= 8 and not kIBSSTRPut, "SST_MSB: at most 8 SMs (flag slots 184.. / 192..), no SST_RPUT");
+#else
+    constexpr uint32_t kIBMSB = 0;
+#endif
     // DG_MEGA_MOE_IB_PUT_FN=1: the SST / ORD blocks issue their puts through ONE shared non-inlined function (comm::gin_put_fn,
     // scalars and pointers by value) instead of inlining the Gin put at each site
 #if defined(DG_MEGA_MOE_IB_PUT_FN) and DG_MEGA_MOE_IB_PUT_FN
@@ -3547,7 +3558,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         if (kIBHeavy and kIBSST and not kIBSSTNB and ib_sst and not (kCGDrop & 2)) {
             DG_IB_OUTLINE_BEGIN
-            if (sm_idx + 1 + (kNumRanks - ib_lsa) == kNumSMs) {
+            const uint32_t msb_s = kIBMSB > 0 ? kNumSMs - (kNumRanks - ib_lsa) - 5 - kIBMSO - sm_idx
+                                              : (sm_idx + 1 + (kNumRanks - ib_lsa) == kNumSMs ? 0u : 0xffffffffu);
+            if (msb_s < (kIBMSB > 0 ? kIBMSB : 1u)) {
                 // SST build (see the knob). Counters: 16 bits per global expert, two per word (counts <= kIBT, cursors < 65536)
                 const auto in_idx = reinterpret_cast<const unsigned long long*>(ib_input_base + kIBOffIdx);
                 auto* const c16 = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
@@ -3555,6 +3568,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto* const sst_nstart = sst_wsum + kNumEpilogueWarps;  // [node] first entry of the node's experts, [nodes] total
                 const uint32_t sst_node_experts = kNumExpertsPerRank * ib_lsa;
                 const uint32_t sst_ne = num_tokens * kNumTopk;
+                const uint32_t sl_lo = kIBMSB > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(sst_ne) * msb_s / kIBMSB) : 0u;
+                const uint32_t sl_hi = kIBMSB > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(sst_ne) * (msb_s + 1) / kIBMSB) : sst_ne;
+                auto* const msb_g = reinterpret_cast<uint32_t*>(ib_mirror(ib_parity, ib_my_node)) + 52 * kIBT;  // MSB rows [s][kSSTWords]
                 // No runtime divisions per entry (ib_lsa is not a constant): own-node range test, node slot by compares
                 const uint32_t sst_lo = ib_my_node * sst_node_experts, sst_hi = sst_lo + sst_node_experts;
                 const bool sst_cmp = kIBSSTFastB and ib_num_nodes <= 4;
@@ -3572,18 +3588,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     c16[w] = 0;
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 34, epilogue_thread_idx == 0);  // counters zeroed
-                for (uint32_t i0 = 0; i0 < sst_ne; i0 += kNumEpilogueThreads * kSSTB) {
+                for (uint32_t i0 = sl_lo; i0 < sl_hi; i0 += kNumEpilogueThreads * kSSTB) {
                     uint32_t v[kSSTB];
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFastB ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
+                        v[u] = i >= sl_hi ? 0xffffffffu : kIBSSTFastB ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                         const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                        if (i < sst_ne and e >= 0 and sst_remote(static_cast<uint32_t>(e)))
+                        if (i < sl_hi and e >= 0 and sst_remote(static_cast<uint32_t>(e)))
                             atomicAdd_block(c16 + static_cast<uint32_t>(e) / 2, 1u << (16 * (static_cast<uint32_t>(e) & 1u)));
                     }
                 }
@@ -3593,13 +3609,45 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // consecutive experts = whole counter words
                 constexpr uint32_t kSSTPer = 2 * math::constexpr_ceil_div(kNumExperts, 2 * kNumEpilogueThreads);
                 const uint32_t g0 = epilogue_thread_idx * kSSTPer;
-                uint32_t sst_c[kSSTPer];
+                uint32_t sst_c[kSSTPer];   // total count of expert g (all SMs)
+                uint32_t sst_b[kSSTPer];   // MSB: the lower SMs' share of it
                 uint32_t mine = 0;
+                if constexpr (kIBMSB > 0) {
+                    for (uint32_t w = epilogue_thread_idx; w < kSSTWords; w += kNumEpilogueThreads)
+                        msb_g[msb_s * kSSTWords + w] = c16[w];
+                    __threadfence();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_thread_idx == 0)
+                        ptx::st_rel(ib_xo_flag + 184 + msb_s, ib_epoch);
+                    if (epilogue_thread_idx < kIBMSB)
+                        while (ptx::ld_acq_gpu(ib_xo_flag + 184 + epilogue_thread_idx) != ib_epoch);
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    uint32_t row[kIBMSB > 0 ? kIBMSB : 1][kSSTPer / 2];
+                    #pragma unroll
+                    for (uint32_t s2 = 0; s2 < kIBMSB; ++ s2) {
+                        #pragma unroll
+                        for (uint32_t u = 0; u < kSSTPer; u += 2)
+                            row[s2][u / 2] = g0 + u < kNumExperts ? __ldcg(msb_g + s2 * kSSTWords + (g0 + u) / 2) : 0u;
+                    }
+                    #pragma unroll
+                    for (uint32_t u = 0; u < kSSTPer; ++ u) {
+                        sst_c[u] = 0, sst_b[u] = 0;
+                        #pragma unroll
+                        for (uint32_t s2 = 0; s2 < kIBMSB; ++ s2) {
+                            const uint32_t c = (row[s2][u / 2] >> (16 * (u & 1u))) & 0xffffu;
+                            sst_c[u] += c;
+                            if (s2 < msb_s) sst_b[u] += c;
+                        }
+                        mine += sst_c[u];
+                    }
+                } else {
                 #pragma unroll
                 for (uint32_t u = 0; u < kSSTPer; ++ u) {
                     const uint32_t g = g0 + u;
                     sst_c[u] = g < kNumExperts ? (c16[g / 2] >> (16 * (g & 1u))) & 0xffffu : 0u;
+                    sst_b[u] = 0;
                     mine += sst_c[u];
+                }
                 }
                 const uint32_t inc = math::warp_inclusive_sum(mine, lane_idx);
                 if (lane_idx == 31)
@@ -3612,16 +3660,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t u = 0; u < kSSTPer; u += 2) {
                     const uint32_t g = g0 + u;
                     if (g < kNumExperts)
-                        c16[g / 2] = run | ((run + sst_c[u]) << 16);  // cursors of g and g + 1
+                        c16[g / 2] = (run + sst_b[u]) | ((run + sst_c[u] + sst_b[u + 1]) << 16);  // cursors of g and g + 1
+                    // node starts = the total prefix at the node's first expert (written by the thread that owns it)
+                    if (g < kNumExperts and g % sst_node_experts == 0)
+                        sst_nstart[g / sst_node_experts] = run;
+                    if (g + 1 < kNumExperts and (g + 1) % sst_node_experts == 0)
+                        sst_nstart[(g + 1) / sst_node_experts] = run + sst_c[u];
                     run += sst_c[u] + sst_c[u + 1];
                 }
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                if (epilogue_thread_idx <= ib_num_nodes) {
+                if (epilogue_thread_idx == 0) {
                     uint32_t total = 0;
                     for (uint32_t w = 0; w < kNumEpilogueWarps; ++ w)
                         total += sst_wsum[w];
-                    const uint32_t g = epilogue_thread_idx * sst_node_experts;
-                    sst_nstart[epilogue_thread_idx] = g < kNumExperts ? (c16[g / 2] >> (16 * (g & 1u))) & 0xffffu : total;
+                    sst_nstart[ib_num_nodes] = total;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 36, epilogue_thread_idx == 0);  // prefix + node starts done
@@ -3631,7 +3682,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll
                 for (uint32_t u = 0; u < kSSTPer; ++ u) {
                     const uint32_t g = g0 + u;
-                    if (g < kNumExperts and g / sst_node_experts != ib_my_node) {
+                    if (msb_s == 0 and g < kNumExperts and g / sst_node_experts != ib_my_node) {
                         const uint32_t n = g / sst_node_experts, nr = ib_nr_of_node(n);
                         reinterpret_cast<uint32_t*>(stg + static_cast<int64_t>(nr) * sst_cb)[sst_nstart[n] + g % sst_node_experts] = sst_c[u];
                     }
@@ -3647,19 +3698,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (kIBPacked)
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 SL_TR(0, 41, epilogue_thread_idx == 0);  // wave order seen by the SST builder
-                for (uint32_t i0 = 0; i0 < sst_ne; i0 += kNumEpilogueThreads * kSSTB) {
+                for (uint32_t i0 = sl_lo; i0 < sl_hi; i0 += kNumEpilogueThreads * kSSTB) {
                     uint32_t v[kSSTB];
                     uint32_t xr[kSSTB];
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
-                        v[u] = i >= sst_ne ? 0xffffffffu : kIBSSTFastB ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
+                        v[u] = i >= sl_hi ? 0xffffffffu : kIBSSTFastB ? __ldcg(in_idx32 + 2 * i) : static_cast<uint32_t>(__ldcg(in_idx + i));
                     }
                     #pragma unroll
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                         const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                        const bool ok = i < sst_ne and e >= 0 and sst_remote(static_cast<uint32_t>(e));
+                        const bool ok = i < sl_hi and e >= 0 and sst_remote(static_cast<uint32_t>(e));
                         xr[u] = i / kNumTopk;
                         if (sst_wave and ok)
                             xr[u] = __ldcg(sst_pos_g + static_cast<int64_t>(sst_nr_of(static_cast<uint32_t>(e))) * kIBT + i / kNumTopk);
@@ -3668,7 +3719,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t u = 0; u < kSSTB; ++ u) {
                         const uint32_t i = i0 + u * kNumEpilogueThreads + epilogue_thread_idx;
                         const int e = static_cast<int>(static_cast<int64_t>(v[u]));
-                        if (i < sst_ne and e >= 0 and sst_remote(static_cast<uint32_t>(e))) {
+                        if (i < sl_hi and e >= 0 and sst_remote(static_cast<uint32_t>(e))) {
                             const uint32_t sh = 16 * (static_cast<uint32_t>(e) & 1u);
                             const uint32_t pos = (atomicAdd_block(c16 + static_cast<uint32_t>(e) / 2, 1u << sh) >> sh) & 0xffffu;
                             const uint32_t nr = sst_nr_of(static_cast<uint32_t>(e));
@@ -3679,7 +3730,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 SL_TR(0, 37, epilogue_thread_idx == 0);  // scatter pass done (before the fence)
                 __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                SL_TR(0, 29, epilogue_thread_idx == 0);  // SST staged
+                if constexpr (kIBMSB > 0) {
+                    if (epilogue_thread_idx == 0)
+                        ptx::st_rel(ib_xo_flag + 192 + msb_s, ib_epoch);
+                    if (msb_s == 0 and epilogue_thread_idx < kIBMSB)
+                        while (ptx::ld_acq_gpu(ib_xo_flag + 192 + epilogue_thread_idx) != ib_epoch);
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+                SL_TR(0, 29, epilogue_thread_idx == 0 and msb_s == 0);  // SST staged
                 if constexpr (kIBSSTRPut) {  // hand the node starts to the SM below (it issues the put)
                     if (epilogue_thread_idx + 1 < ib_num_nodes) {
                         const uint32_t n = ib_node_of_slot(epilogue_thread_idx);
@@ -3690,7 +3748,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (epilogue_thread_idx == 0)
                         ptx::st_rel(ib_xo_flag + 250, ib_epoch);
                 }
-                if (not kIBSSTRPut and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+                if (not kIBSSTRPut and msb_s == 0 and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
                     const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                     const uint32_t a = sst_nstart[n], b = sst_nstart[n + 1];
 #if defined(DG_MEGA_MOE_IB_SST_CTX) and DG_MEGA_MOE_IB_SST_CTX == 1

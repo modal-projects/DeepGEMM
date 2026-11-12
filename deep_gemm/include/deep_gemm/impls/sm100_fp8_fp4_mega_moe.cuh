@@ -647,9 +647,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
 #define IB_BACKOFF(n) do {} while (0)
 #endif
+// DG_MEGA_MOE_IB_NO_DIAG=1: poll loops without the timeout diagnostics (no clock64, no printf argument set-up, no trap path):
+// ~40 sites, several inside hot loops (codegen budget; the diagnostics stay the default)
+#if defined(DG_MEGA_MOE_IB_NO_DIAG) and DG_MEGA_MOE_IB_NO_DIAG
+#define IB_POLL(cond, reload, tag, a, b) do { uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; } } while (0)
+#else
 #define IB_POLL(cond, reload, tag, a, b) do { const long long t0_ = clock64(); uint32_t n_ = 0; while (cond) { IB_BACKOFF(++ n_); reload; \
         if (clock64() - t0_ > (1ll << 34)) { printf("OPUS_HANG %s rank=%u sm=%u warp=%u lane=%u a=%u b=%u epoch=%llu\n", tag, \
             sym_buffer.rank_idx, sm_idx, warp_idx, lane_idx, (unsigned) (a), (unsigned) (b), (unsigned long long) ib_epoch); asm volatile("trap;"); } } } while (0)
+#endif
 #endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;

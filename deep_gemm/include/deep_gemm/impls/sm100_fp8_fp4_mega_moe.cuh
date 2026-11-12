@@ -2455,7 +2455,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 workspace.signals->ib_o_nt, &workspace.signals->ib_o_fitem[ib_parity][ib_my_node], &workspace.signals->ib_o_fchunk[ib_parity][0][0],
                 &workspace.signals->ib_o_fdone[ib_parity][0], workspace.signals->ib_o_order_ready, ib_epoch, ib_tab,
                 ib_mirror(ib_parity, 0), kIBNodeStride, kIBOffIdx, kIBOffSF, tok_pc0, tok_pc_stride, ib_fstage(0), ib_ret(ib_parity, ib_my_node), kIBRetHdr,
-                ib_pcomb(ib_my_node) + kTScrOff, kIBPCombStride - kTScrOff,
+                ib_pcomb(ib_my_node) + kTScrOff, kIBPCombStride - 2 * kTScrOff,  // between the x staging and the C3_SPLIT scratch
                 ib_my_node, ib_lsa, fi_R, sym_buffer.rank_idx,
                 kIBStreamCombine ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
                 kIBWaveSort ? static_cast<uint32_t>(DG_MEGA_MOE_IB_OVERLAP_MIN_TOKENS) : 0xffffffffu,
@@ -6516,7 +6516,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         constexpr bool kC3Split = kIBC3Split;
         DG_STATIC_ASSERT(not kIBC3Split or kNumTopk >= 2, "C3 split scratch");
-        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node));  // own node's slot: never used by the proxy
+        // C3_SPLIT scratch: our own node's proxy-combine region (never used by the proxy). It must NOT be the START of that region:
+        // the ordered / wave-sorted x sender stages its rows there (x_stage = ib_pcomb(ib_my_node) + nr * kIBT * kIBTokBytes) and the NIC
+        // reads them asynchronously after the put is issued. With the scratch at offset 0, pass 0 of the source combine (which only
+        // needs the NODE-LOCAL peers' L2) overwrote staged x rows of node slot 0 (and the first rows of slot 1) with fp32 sums; whenever
+        // an x put was still unsent at that time (a stalled / retransmitting QP: the > 1.5x launches), the remote node received garbage
+        // x rows = finite wrong values on one counterpart pair, no hang, stats matching (gf_soak 2026-11-12: plain OMB @512, ranks 2 and
+        // 10 = node 0 <-> node 1 = each other's node slot 0; about once per 1000+ launches). Only strings with ORD / WAVE_SORT stage x.
+        // Fix: the scratch is the LAST 2 slot regions of the own-node region. DG_MEGA_MOE_IB_C3_SCRATCH_OLD=1: the old place (A/B only).
+#if defined(DG_MEGA_MOE_IB_C3_SCRATCH_OLD) and DG_MEGA_MOE_IB_C3_SCRATCH_OLD
+        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node));
+#else
+        DG_STATIC_ASSERT(static_cast<int64_t>(kNumRanks / 4) * kIBT * kIBTokBytes + kIBT * static_cast<int64_t>(kHidden) * 4 <= kIBPCombStride,
+                         "C3_SPLIT scratch (last 2 slot regions of the own-node proxy-combine region) must not reach the x staging at its start");
+        const auto c3_scratch = reinterpret_cast<float*>(ib_pcomb(ib_my_node) + kIBPCombStride - kIBT * static_cast<int64_t>(kHidden) * 4);
+#endif
 #else
         constexpr bool kC3Split = false;
         float* const c3_scratch = nullptr;

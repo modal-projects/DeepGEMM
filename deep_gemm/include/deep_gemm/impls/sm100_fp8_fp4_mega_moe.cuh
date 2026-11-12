@@ -3095,7 +3095,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (ib_R > (kIBSSTFast ? 3u : 4u)) __trap();  // keys are packed 8 bits per remote node
                 for (uint32_t i = epilogue_thread_idx; i < (kIBSSTFast ? kOWStride + (kNumEpilogueWarps * kOWStride + 1) / 2 : ib_R * kOK); i += kNumEpilogueThreads)
                     oh[i] = 0;
+                SL_TR(0, 43, epilogue_thread_idx == 0);  // order pass entered
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 44, epilogue_thread_idx == 0);  // zeroed
                 uint32_t kk[kOT];
                 for (uint32_t j = 0; j < kOT; ++ j) {
                     const uint32_t t = j * kNumEpilogueThreads + epilogue_thread_idx;
@@ -3135,6 +3137,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     kk[j] = packed;
                 }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 45, epilogue_thread_idx == 0);  // keys + histogram done
                 if constexpr (kIBSSTFast) {  // per (node, key): per-warp counts -> per-warp bases, total into oh
                     for (uint32_t q = epilogue_thread_idx; q < ib_R * kOK; q += kNumEpilogueThreads) {
                         uint32_t tot = 0;
@@ -3184,8 +3187,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
                 }
+                SL_TR(0, 46, epilogue_thread_idx == 0);  // positions written (before the fence)
                 __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                SL_TR(0, 47, epilogue_thread_idx == 0);  // fenced
                 if (epilogue_thread_idx < ib_R)
                     ptx::st_rel(ib_xo_flag + 240 + epilogue_thread_idx, ib_epoch);
                 SL_TR(0, 40, epilogue_thread_idx == 0);  // order published
@@ -5464,8 +5469,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
             if constexpr (kIBWSPost > 0 or kIBOrd > 0) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };
-                printf("OPUS_TRACEW rank=%u epoch=%llu | ws_post: first_piece_issued=%.1f last_chunk_staged=%.1f last_piece_issued=%.1f order_published=%.1f w_put=%.1f\n",
-                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(38), mu(39), mu(28), mu(40), mu(42));
+                printf("OPUS_TRACEW rank=%u epoch=%llu | ws_post: first_piece_issued=%.1f last_chunk_staged=%.1f last_piece_issued=%.1f order_published=%.1f w_put=%.1f | order: enter=%.1f zeroed=%.1f keyed=%.1f placed=%.1f fenced=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, mu(38), mu(39), mu(28), mu(40), mu(42), mu(43), mu(44), mu(45), mu(46), mu(47));
             }
             if constexpr (kIBSST) {
                 const auto mu = [&](const uint32_t& i) { return ((int64_t) ib_sl_tr[i] - (int64_t) t[16]) / 1e3; };

@@ -4265,7 +4265,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         make_gin_site(4, ctx_piece(q, piece_orig(q)), piece_orig(q), ib_xbase).put_value(
                             reinterpret_cast<uint64_t*>(ib_mirror(ib_parity, ib_my_node) + kIBOffHdr + 64), ib_epoch, ib_cp(sym_buffer.rank_idx, q_n));
                     SL_TR(0, 29, true);  // SB: poster warm (slowest)
-                    for (uint32_t w = 0; w < 3; ++ w)
+                    // SB & 128: no hold at all (x issue starts at t = 0 as in the legacy path; the meta puts race it)
+                    for (uint32_t w = 0; (kIBSB & 128) == 0 and w < 3; ++ w)
                         while (ptx::ld_acq_gpu(ib_xo_flag + 232 + w) != ib_epoch);
                     SL_TR(0, 41, true);  // SB: meta flags seen (slowest poster)
                 }

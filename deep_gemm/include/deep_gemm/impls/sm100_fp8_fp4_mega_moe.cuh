@@ -910,7 +910,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_FF_WAIT 1
 #endif
 #if defined(DG_MEGA_MOE_IB_FUSED_FIN) and DG_MEGA_MOE_IB_FUSED_FIN
+    // compiled for EP > 16 by default; DG_MEGA_MOE_IB_FF_EP16=1 also at 16 ranks or fewer (2 nodes: mechanism runs on the 2x8 dev server)
+#if defined(DG_MEGA_MOE_IB_FF_EP16) and DG_MEGA_MOE_IB_FF_EP16
+    constexpr bool kIBFused = kIBReduceOnArrival;
+#else
     constexpr bool kIBFused = kIBReduceOnArrival and kNumRanks > 16;
+#endif
 #else
     constexpr bool kIBFused = false;
 #endif

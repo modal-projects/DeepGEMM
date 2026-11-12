@@ -1599,7 +1599,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     TT_MAX(5, true);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+#if defined(DG_MEGA_MOE_IB_TRACE_STREAMS) and DG_MEGA_MOE_IB_TRACE_STREAMS
+                    // per node stream: slot nr * 16 + chunk / 2 (three streams x 16 chunk pairs)
+                    if (nr < 3 and pc0 < 32) { TT_NOW(t_); atomicMax(reinterpret_cast<unsigned long long*>(tl_tchunk + nr * 16 + pc0 / 2), static_cast<unsigned long long>(t_)); }
+#else
                     if (nr == 0 and pc0 < 64) { TT_NOW(t_); tl_tchunk[pc0] = t_; }
+#endif
 #endif
                     IB_TRACE_MAX(14, true);  // proxy: return record chunk put issued, last one
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
@@ -4613,10 +4618,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         TT_ADD(18, tt_rmiss and lane_idx == 0, 1);
                         IB_POLL(q == ~0ull, q = ptx::ld_volatile(qptr), "c3_q", n, token_idx);
 #if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+#if defined(DG_MEGA_MOE_IB_TRACE_STREAMS) and DG_MEGA_MOE_IB_TRACE_STREAMS
+                        if (tt_rmiss and nr < 3 and rec_pos / kIBChunk < 32) {
+                            __syncwarp();
+                            if (lane_idx == 0) { TT_NOW(t_); atomicMax(reinterpret_cast<unsigned long long*>(tl_tseen + nr * 16 + rec_pos / kIBChunk / 2), static_cast<unsigned long long>(t_)); }
+                        }
+#else
                         if (tt_rmiss and nr == 0 and rec_pos / kIBChunk < 64) {
                             __syncwarp();
                             if (lane_idx == 0) { TT_NOW(t_); atomicMax(reinterpret_cast<unsigned long long*>(tl_tseen + rec_pos / kIBChunk), static_cast<unsigned long long>(t_)); }
                         }
+#endif
 #endif
                         IB_TRACE_MAX(21, lane_idx == 0 and j == 0);  // source: a return record seen, last one
                         uint32_t sbits = sv[j];
@@ -4775,6 +4787,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 printf("OPUS_TRACE8 rank=%u epoch=%llu | prev launch chunk puts 16-31: c16=%.1f c17=%.1f c18=%.1f c19=%.1f c20=%.1f c21=%.1f c22=%.1f c23=%.1f c24=%.1f c25=%.1f c26=%.1f c27=%.1f c28=%.1f c29=%.1f c30=%.1f c31=%.1f\n",
                        sym_buffer.rank_idx, (unsigned long long) ib_epoch, cu(16), cu(17), cu(18), cu(19), cu(20), cu(21), cu(22), cu(23), cu(24), cu(25), cu(26), cu(27), cu(28), cu(29), cu(30), cu(31));
             }
+#if defined(DG_MEGA_MOE_IB_TRACE_STREAMS) and DG_MEGA_MOE_IB_TRACE_STREAMS
+            {
+                // TRACE_STREAMS: TRACE7 / 8 / 9 / A columns 0-15 = node stream 0, 16-31 = stream 1 (chunk pairs); stream 2 here
+                const auto* tc = tl_tchunk + 64;
+                const auto* tsn = tl_tseen + 64;
+                const auto cu = [&](const uint32_t& i) { return static_cast<double>(static_cast<int64_t>(tc[i])) / 1e3; };
+                const auto su = [&](const uint32_t& i) { return static_cast<double>(static_cast<int64_t>(tsn[i])) / 1e3; };
+                printf("OPUS_TRACEC rank=%u epoch=%llu | prev launch stream 2 chunk-pair puts: c32=%.1f c33=%.1f c34=%.1f c35=%.1f c36=%.1f c37=%.1f c38=%.1f c39=%.1f c40=%.1f c41=%.1f c42=%.1f c43=%.1f c44=%.1f c45=%.1f c46=%.1f c47=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, cu(32), cu(33), cu(34), cu(35), cu(36), cu(37), cu(38), cu(39), cu(40), cu(41), cu(42), cu(43), cu(44), cu(45), cu(46), cu(47));
+                printf("OPUS_TRACED rank=%u epoch=%llu | prev launch stream 2 chunk-pair landed (missed records): s32=%.1f s33=%.1f s34=%.1f s35=%.1f s36=%.1f s37=%.1f s38=%.1f s39=%.1f s40=%.1f s41=%.1f s42=%.1f s43=%.1f s44=%.1f s45=%.1f s46=%.1f s47=%.1f\n",
+                       sym_buffer.rank_idx, (unsigned long long) ib_epoch, su(32), su(33), su(34), su(35), su(36), su(37), su(38), su(39), su(40), su(41), su(42), su(43), su(44), su(45), su(46), su(47));
+            }
+#endif
             printf("OPUS_TRACEB rank=%u epoch=%llu | prev launch end: dispatch_last=%.1f epilogue_last=%.1f other_last=%.1f after_sysfence=%.1f epi_after_sysfence=%.1f\n",
                    sym_buffer.rank_idx, (unsigned long long) ib_epoch, pu(27), pu(28), pu(29), pu(30), pu(31));
             printf("OPUS_TRACE6 rank=%u epoch=%llu | prev launch tail counts: fwd_items=%llu fwd_part_miss=%llu fwd_x_miss=%llu fwd_item_ns=%.0f c3_rec_miss=%llu c3_tokens=%llu c3_token_ns=%.0f ret_puts=%llu fwd_items_epi=%llu rearm_done=%.1f c3_loc_last=%.1f c3_after_loc_ns=%.0f puts_after_l2=%llu | knobs join=%d batch=%d batch_d=%d pf=%d c3e=%d defer=%d repoll=%d retg=%d split=%d\n",

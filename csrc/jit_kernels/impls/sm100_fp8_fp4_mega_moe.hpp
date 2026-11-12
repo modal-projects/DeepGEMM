@@ -57,6 +57,10 @@ static const std::set<std::string> kMegaMoEHandledEnv = {
     // read only by Python (deep_gemm/mega, tests) or the host
     "DG_MEGA_MOE_IB_EXCLUSIVE", "DG_MEGA_MOE_IB_FORCE", "DG_MEGA_MOE_IB_GIN_TYPE", "DG_MEGA_MOE_IB_NVL_REF",
     "DG_MEGA_MOE_IB_RAIL", "DG_MEGA_MOE_IB_TOLERANCE", "DG_MEGA_MOE_IB_VIRTUAL_LSA",
+    // host layout overrides (csrc/jit_kernels/heuristics/mega_moe.hpp) and the resolved values the host defines itself
+    "DG_MEGA_MOE_HOST_DISPATCH_THREADS", "DG_MEGA_MOE_HOST_EPILOGUE_THREADS", "DG_MEGA_MOE_HOST_PULL_BUFS",
+    "DG_MEGA_MOE_HOST_PULL_BYTES", "DG_MEGA_MOE_HOST_STAGES", "DG_MEGA_MOE_HOST_SMEM_EXTRA",
+    "DG_MEGA_MOE_HOSTCFG_SMEM_BYTES", "DG_MEGA_MOE_HOSTCFG_PULL_BUFS", "DG_MEGA_MOE_HOSTCFG_SMEM_EXTRA",
 };
 
 static std::string get_mega_moe_passthrough_defines() {
@@ -315,6 +319,12 @@ static void __instantiate_kernel() {{
         to_string(l1_weights.scalar_type()));
     if (is_ib)
         code = get_mega_moe_passthrough_defines() + code;
+    // Resolved host layout (see DG_MEGA_MOE_HOST_* in heuristics/mega_moe.hpp): the launch's dynamic smem bytes, pull
+    // buffers per dispatch warp and reserved extra bytes, so the kernel header can size its shared storage from them
+    // and static-assert that it fits what the host launches with
+    code = std::format("#define DG_MEGA_MOE_HOSTCFG_SMEM_BYTES {}\n#define DG_MEGA_MOE_HOSTCFG_PULL_BUFS {}\n"
+                       "#define DG_MEGA_MOE_HOSTCFG_SMEM_EXTRA {}\n",
+                       config.smem_size, config.num_pull_bufs, config.smem_extra) + code;
 
     // DG_DEV_COMPILE_ONLY=<file> (dev server's parallel precompile): compile into the JIT disk cache, write the cache
     // entry's path to <file>, and return without loading or launching (no communication, safe on any subset of ranks)

@@ -29,7 +29,7 @@ namespace deep_gemm {
 // and that releaser's counter RMW (program order + synchronizes), the RMWs chain in observation order, so the last RMW's thread has
 // all of them in its causal past when it fences; "release fence + strong write" is a release pattern on the flag, which the
 // reader acquires. One system-scope fence per (GPU, expert) per launch instead of one per L2 task.
-template <uint32_t kG, uint32_t kSMs, uint32_t kBlockM, uint32_t kNBlocks>
+template <uint32_t kG, uint32_t kSMs, uint32_t kBlockM, uint32_t kNBlocks, bool kFence = true>
 __device__ __noinline__ void ff_expert_releaser(uint32_t* ring_base, uint32_t* head_base, uint32_t* ecnt, const uint32_t* expected_tasks,
                                                  uint64_t* eflag_row, const int64_t o0, const int64_t o1, const int64_t o2, const int64_t o3,
                                                  const int64_t o4, const int64_t o5, const int64_t o6, const int64_t o7,
@@ -63,7 +63,8 @@ __device__ __noinline__ void ff_expert_releaser(uint32_t* ring_base, uint32_t* h
                 uint32_t old;
                 asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(ecnt + e) : "memory");
                 if (old + 1 == expected) {
-                    asm volatile("fence.release.sys;" ::: "memory");
+                    if constexpr (kFence)  // kFence = false: mechanism arm only (FF_BISECT & 8), NOT safe
+                        asm volatile("fence.release.sys;" ::: "memory");
                     for (uint32_t i = 0; i < lsa; ++ i)
                         asm volatile("st.relaxed.sys.global.u64 [%0], %1;" : : "l"(reinterpret_cast<const uint8_t*>(eflag_row + e) + offs[i]), "l"(epoch) : "memory");
                 }
@@ -955,7 +956,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr bool ff_rt = true;
 #endif
-    constexpr bool kFFClean = kFFData != 0 and kFFSig != 0 and kFFRead != 0 and kFFWait;  // the sums are zero again at the end of a launch
+    constexpr bool kFFClean = kFFData != 0 and kFFSig != 0 and kFFRead != 0 and kFFWait and not (DG_MEGA_MOE_IB_FF_BISECT & 8);  // the sums are zero again at the end of a launch
     constexpr int64_t kFFSlot = kIBT * kHidden * 2;
     constexpr uint32_t kFFNBlocks = L2_SHAPE_N / BLOCK_N;  // counter increments per (row, launch): one per L2 N-block task
     constexpr uint32_t kFFMagic = 0x46464e31u;
@@ -1555,8 +1556,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // read this item's part of the sum and zero it for the next launch
                     if (m != 0 and ff_rt) {
                         if constexpr (kFFSig == 6 and kFFWait and not (DG_MEGA_MOE_IB_FF_BISECT & 4)) {
-                            // every lane acquires the flag of every on-node pick (rank, expert) of the token
+                            // every lane acquires the flag of every on-node pick (rank, expert) of the token.
+                            // First all the acquires as one batch of independent loads (the usual case: every flag is set);
+                            // the per-flag poll loops below only run when something was missing
                             uint32_t mm = m;
+                            bool ff_pend = false;
+                            while (mm) {
+                                const uint32_t k = static_cast<uint32_t>(__ffs(mm) - 1);
+                                mm &= mm - 1;
+                                const uint32_t ek = static_cast<uint32_t>(__shfl_sync(0xffffffffu, e, k));
+                                ff_pend |= ptx::ld_acq_sys(ff_eflag((ek / kNumExpertsPerRank) % ib_lsa, ek % kNumExpertsPerRank)) != ib_epoch;
+                            }
+                            tt_miss |= ff_pend;
+                            mm = __any_sync(0xffffffffu, ff_pend) ? m : 0u;
                             while (mm) {
                                 const uint32_t k = static_cast<uint32_t>(__ffs(mm) - 1);
                                 mm &= mm - 1;
@@ -2543,7 +2555,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (not (DG_MEGA_MOE_IB_FF_BISECT & 1) and ff_rt and warp_idx == kNumDispatchWarps - 1 and sm_idx % DG_MEGA_MOE_IB_FF_REL_GROUP == 0) {
                 const uint32_t ff_r0 = ib_my_node * ib_lsa;
                 const auto ff_off = [&](const uint32_t& i) { return i < ib_lsa ? sym_buffer.offsets[ff_r0 + i] : static_cast<int64_t>(0); };
-                ff_expert_releaser<DG_MEGA_MOE_IB_FF_REL_GROUP, kNumSMs, BLOCK_M, kFFNBlocks>(
+                ff_expert_releaser<DG_MEGA_MOE_IB_FF_REL_GROUP, kNumSMs, BLOCK_M, kFFNBlocks, not (DG_MEGA_MOE_IB_FF_BISECT & 8)>(
                     ff_ring(0), ff_head(0), ff_ecnt(), ff_ecnt() + 256,
                     ff_eflag(sym_buffer.rank_idx % ib_lsa, 0),
                     ff_off(0), ff_off(1), ff_off(2), ff_off(3), ff_off(4), ff_off(5), ff_off(6), ff_off(7),

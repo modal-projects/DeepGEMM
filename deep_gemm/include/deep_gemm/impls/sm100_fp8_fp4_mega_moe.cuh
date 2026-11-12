@@ -1183,6 +1183,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
     };
+    // PCOMB_ROT=3 (re-arm throughput by the copy engine): the dispatch warps re-arm at their count wait as with =1, but each row
+    // is written by TMA bulk stores (cp.async.bulk shared -> global) from the warp's pull buffer filled with 0xFF (free until the
+    // pulls start), instead of 640 sixteen-byte stores per row from the warp's lanes (~0.9 TB/s over the whole GPU, traced at
+    // EP16: the per-lane stores are latency-bound). The warp waits for its last store before the pull buffer is reused.
+    const auto rot_rearm_tma = [&](const uint32_t& c, void* ones_buf, const uint32_t& ones_bytes) {
+        const uint32_t gw = warp_idx * kNumSMs + sm_idx;
+        constexpr uint32_t kGW = kNumSMs * kNumDispatchWarps;
+        constexpr uint32_t kRowBytes = kHidden * 2;
+        constexpr uint32_t kSlotMask = kNumTopk >= 32 ? 0xffffffffu : (1u << kNumTopk) - 1u;
+        for (uint32_t u = lane_idx; u < ones_bytes / 16; u += 32)
+            ptx::st_shared(reinterpret_cast<uint4*>(ones_buf) + u, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+        __syncwarp();
+        if (lane_idx == 0) {
+            cute::tma_store_fence();
+            for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
+                const uint32_t nt_prev = cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr));
+                const auto pc_prev = ib_pcomb_c(ib_node_of_slot(nr), c);
+                const auto tab = rot_mask(c, nr);
+                for (uint32_t t = gw; t < nt_prev; t += kGW) {
+                    uint32_t m = ptx::ld_volatile(tab + t) & kSlotMask;
+                    while (m) {
+                        const uint32_t k = __ffs(m) - 1;
+                        m &= m - 1;
+                        const auto row = pc_prev + (static_cast<int64_t>(k) * kIBT + t) * kRowBytes;
+                        for (uint32_t off = 0; off < kRowBytes; off += ones_bytes)
+                            ptx::tma_store_1d(row + off, ones_buf, cute::min(ones_bytes, kRowBytes - off));
+                        cute::tma_store_arrive();
+                        ptx::tma_store_wait<2>();
+                    }
+                }
+            }
+            ptx::tma_store_wait<0>();
+        }
+        __syncwarp();
+    };
     // DG_MEGA_MOE_IB_EARLY_REARM=1 (tail 3, end of kernel): the dispatch warps re-arm the mirrors BEFORE the cleanup barrier, as
     // soon as every node-local rank has published its combine-ready flag (= its L2 grid sync, so all its L1 pulls from our
     // mirrors are done) and our forward-combine polled every row, instead of after the cleanup barrier at the very end
@@ -2119,7 +2154,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // PCOMB_ROT: the previous rotating launch's rows sit in the copy this launch does not use: re-arm them while the counts
             // are in flight (every dispatch warp of every SM passes here on every path; nobody writes that copy before the next launch)
             if (rot_rt and rot_ho != ~0ull) {
-                if constexpr (kIBRotMode >= 2) rot_work(rot_o);  // whatever the epilogue warps have not claimed yet
+                if constexpr (kIBRotMode == 3) rot_rearm_tma(rot_o, pull_buffer.get_base_ptr(), (kNumBytesPerPull / 16) * 16);
+                else if constexpr (kIBRotMode == 2) rot_work(rot_o);  // whatever the epilogue warps have not claimed yet
                 else rot_rearm(rot_o);
             }
             TT_MAX(14, lane_idx == 0);  // trace: deferred re-arm done (OPUS_TRACE6 rearm_done), slowest warp
@@ -4691,7 +4727,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #endif
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        if constexpr (kIBRot and kIBRotMode >= 2) {
+        if constexpr (kIBRot and kIBRotMode == 2) {
             // PCOMB_ROT=2: no D0 / D1 work left on this SM and no task yet: help re-arm the copy the previous rotating launch wrote
             // (its header stays "dirty" until SM 0 stamps it clean at the end of this kernel; the queue is its claim counter)
             if (rot_rt and ptx::ld_volatile(rot_hdr(rot_o)) != ~0ull)

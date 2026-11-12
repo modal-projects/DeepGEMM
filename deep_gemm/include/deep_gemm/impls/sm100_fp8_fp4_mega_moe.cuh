@@ -1126,10 +1126,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // SST_NB=2: counters in global memory (red / atomics with their results in flight) instead of shared-memory atomics
     // (which retry under contention: the one-SM passes measured ~10x slower than their load latency, start_o2t), and two
     // tokens per round
-    constexpr bool kNBG = DG_MEGA_MOE_IB_SST_NB >= 2;
+    constexpr bool kNBG = DG_MEGA_MOE_IB_SST_NB == 2;
+    // SST_NB=3: no atomics on the (hot) key buckets: each warp keeps its own bucket counts in shared memory and resolves
+    // equal keys inside the warp with match_any (shared-memory atomics are CAS spin loops: ATOMS.CAST.SPIN in the SASS)
+    constexpr bool kNBW = DG_MEGA_MOE_IB_SST_NB == 3;
 #else
     constexpr bool kIBSSTNB = false;
     constexpr bool kNBG = false;
+    constexpr bool kNBW = false;
 #endif
     // DG_MEGA_MOE_IB_ORD_GFENCE=1: the ORD chunk stagers fence at GPU scope (like the meta staging) instead of system scope
 #if defined(DG_MEGA_MOE_IB_ORD_GFENCE) and DG_MEGA_MOE_IB_ORD_GFENCE
@@ -1160,7 +1164,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr int64_t kNBHdr = kIBWmark ? 8 : 0;
     constexpr uint32_t kNBCap = kNumExperts / 2;  // experts per node (>= 2 nodes)
     constexpr uint32_t kNBKeys = kNumExpertsPerRank + 1;
-    DG_STATIC_ASSERT(not kIBSSTNB or (kNBCap + kNumEpilogueWarps + 1 + kNBKeys) * 4 <= sizeof(SharedStorage::smem_d), "SST_NB counters in smem_d");
+    DG_STATIC_ASSERT(not kIBSSTNB or (kNBCap + kNumEpilogueWarps + 1 + kNBKeys + (kNBW ? kNumEpilogueWarps * kNBKeys : 0u)) * 4 <= sizeof(SharedStorage::smem_d), "SST_NB counters in smem_d");
     DG_STATIC_ASSERT(not kIBSSTNB or kNumExpertsPerRank < 255, "SST_NB keys");
     constexpr int64_t kNBStgStride = static_cast<int64_t>(kNumExperts) * 4 + kIBT * kNumTopk * 4;
     DG_STATIC_ASSERT(not kIBSSTNB or 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride <= kIBT * kIBTokBytes, "SST_NB staging fits in the x region");
@@ -2964,6 +2968,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto* const nb_wsum = nb_smem + kNBCap;
                 auto* const nb_tot = nb_wsum + kNumEpilogueWarps;
                 auto* const oh = kNBG ? ib_nb_g(nr) + kNBCap : nb_tot + 1;
+                auto* const nb_wh = nb_tot + 1 + kNBKeys + epilogue_warp_idx * kNBKeys;  // NB=3: this warp's bucket counts / bases
                 const auto in_idx = reinterpret_cast<const long long*>(ib_input_base + kIBOffIdx);
                 const bool ord = ib_ord_on(num_tokens);
                 auto* const stg_cnt = reinterpret_cast<uint32_t*>(ib_nb_stg(nr) + kNBHdr);
@@ -2973,7 +2978,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto nb_add = [&](uint32_t* const ptr) { if (kNBG) ptx::red_add(ptr, 1u); else atomicAdd_block(ptr, 1u); };
                 const auto nb_take = [&](uint32_t* const ptr) { return kNBG ? ptx::atomic_add(ptr, 1u) : atomicAdd_block(ptr, 1u); };
                 SL_TR(0, 33, epilogue_thread_idx == 0);
-                for (uint32_t i = epilogue_thread_idx; i < kNBCap + kNumEpilogueWarps + 1 + kNBKeys; i += kNumEpilogueThreads)
+                for (uint32_t i = epilogue_thread_idx; i < kNBCap + kNumEpilogueWarps + 1 + kNBKeys + (kNBW ? kNumEpilogueWarps * kNBKeys : 0u); i += kNumEpilogueThreads)
                     nb_smem[i] = 0;
                 if constexpr (kNBG) {
                     for (uint32_t i = epilogue_thread_idx; i < kNBCap + 64; i += kNumEpilogueThreads)
@@ -3005,8 +3010,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 key = cute::min(key, static_cast<uint32_t>(e) % kNumExpertsPerRank);
                             }
                         }
-                        if (t < num_tokens)
+                        if constexpr (kNBW) {
+                            const uint32_t peers = __match_any_sync(0xffffffffu, t < num_tokens ? key : 0xffffffffu);
+                            if (t < num_tokens and (peers & ((1u << lane_idx) - 1u)) == 0)
+                                nb_wh[key] += __popc(peers);
+                            __syncwarp();
+                        } else if (t < num_tokens) {
                             nb_add(oh + key);
+                        }
                         kk[j + h] = key;
                     }
                 }
@@ -3034,7 +3045,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     nb_wsum[epilogue_warp_idx] = inc;
                 if (epilogue_warp_idx == 0) {
                     const uint32_t k0 = lane_idx, k1 = lane_idx + 32;
-                    const uint32_t v0 = k0 < kNBKeys ? oh[k0] : 0u, v1 = k1 < kNBKeys ? oh[k1] : 0u;
+                    uint32_t v0 = k0 < kNBKeys ? oh[k0] : 0u, v1 = k1 < kNBKeys ? oh[k1] : 0u;
+                    if constexpr (kNBW) {  // per-warp counts -> per-warp exclusive bases, totals per key
+                        auto* const wh0 = nb_tot + 1 + kNBKeys;
+                        v0 = 0, v1 = 0;
+                        #pragma unroll
+                        for (uint32_t w = 0; w < kNumEpilogueWarps; ++ w) {
+                            if (k0 < kNBKeys) { const uint32_t c = wh0[w * kNBKeys + k0]; wh0[w * kNBKeys + k0] = v0; v0 += c; }
+                            if (k1 < kNBKeys) { const uint32_t c = wh0[w * kNBKeys + k1]; wh0[w * kNBKeys + k1] = v1; v1 += c; }
+                        }
+                    }
                     const uint32_t i0 = math::warp_inclusive_sum(v0, lane_idx);
                     const uint32_t t0 = __shfl_sync(0xffffffffu, i0, 31);
                     const uint32_t i1 = math::warp_inclusive_sum(v1, lane_idx);
@@ -3066,8 +3086,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t h = 0; h < 2; ++ h) {
                         const uint32_t t = (j + h) * kNumEpilogueThreads + epilogue_thread_idx;
                         row[h] = t;
-                        if (ord and t < num_tokens)
+                        if constexpr (kNBW) {
+                            const bool val = ord and t < num_tokens;
+                            const uint32_t key = kk[j + h];
+                            const uint32_t peers = __match_any_sync(0xffffffffu, val ? key : 0xffffffffu);
+                            const uint32_t rank = __popc(peers & ((1u << lane_idx) - 1u));
+                            if (val) row[h] = oh[key] + nb_wh[key] + rank;
+                            __syncwarp();
+                            if (val and rank == 0) nb_wh[key] += __popc(peers);
+                            __syncwarp();
+                        } else if (ord and t < num_tokens) {
                             row[h] = nb_take(oh + kk[j + h]);
+                        }
                         #pragma unroll
                         for (uint32_t k = 0; k < kNumTopk; ++ k)
                             v[h][k] = t < num_tokens ? __ldcg(in_idx + t * kNumTopk + k) : -1ll;

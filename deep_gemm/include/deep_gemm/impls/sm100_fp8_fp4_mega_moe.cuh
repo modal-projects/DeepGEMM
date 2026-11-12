@@ -362,8 +362,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_XSITES
 #define DG_MEGA_MOE_IB_XSITES 63
 #endif
+    // DG_MEGA_MOE_IB_XLAST=1 (small-batch build, with DG_MEGA_MOE_IB_SB & (8 | 32): the meta header contexts [R, 2R) carry
+    // nothing then): the LAST return chunk a proxy completes for a node (the tail-critical put; exactly one warp per node
+    // and launch gets it) is issued in THREAD mode on context R + nr; every other return put stays GPU-shared on the
+    // remaining contexts, so no index is used in two modes within a launch (XCTX, TAIL_LOG 2026-11-06: ~1 us per put)
+#if defined(DG_MEGA_MOE_IB_XLAST) and DG_MEGA_MOE_IB_XLAST
+    constexpr bool kIBXLast = true;
+#else
+    constexpr bool kIBXLast = false;
+#endif
+#if defined(DG_MEGA_MOE_IB_SB_DEAD) and DG_MEGA_MOE_IB_SB_DEAD
+    const bool ib_xl = kIBXLast and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) == ~0ull;
+#else
+    const bool ib_xl = kIBXLast and ptx::ld_volatile(workspace.get_ib_epoch_ptr()) != ~0ull;
+#endif
     const auto make_gin_site = [&](const uint32_t& site, const uint32_t& xctx, const uint32_t& orig, const uint32_t& xbase) {
         const auto build = [&]() {
+            if (kIBXLast and ib_xl and (site & (8u | 16u | 32u))) {  // return puts keep off [R, 2R)
+                const uint32_t xl_R = ib_num_nodes - 1;
+                const uint32_t i = orig % (static_cast<uint32_t>(DG_MEGA_MOE_IB_CONTEXTS) - xl_R);
+                return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, i < xl_R ? i : i + xl_R);
+            }
             if (DG_MEGA_MOE_IB_SHARING >= 1 and (DG_MEGA_MOE_IB_XSITES & site))
                 return comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, xctx);
             if (DG_MEGA_MOE_IB_SHARING >= 1)  // shared pool above the exclusive range
@@ -1176,6 +1195,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #define DG_MEGA_MOE_IB_SB_MAX 0x7fffffff
 #endif
     constexpr uint32_t kIBSB = DG_MEGA_MOE_IB_SB;
+    DG_STATIC_ASSERT(not kIBXLast or ((kIBSB & (8u | 32u)) != 0 and DG_MEGA_MOE_IB_SB_MAX == 0x7fffffff and kIBRetGroup == 1 and kIBRetGroups == 0
+                                      and DG_MEGA_MOE_IB_CONTEXTS >= 8),
+                     "DG_MEGA_MOE_IB_XLAST needs SB with the header on the meta QP (bit 8 or 32), no SB_MAX, no RET_GROUP(S)");
     DG_STATIC_ASSERT(kIBSB == 0 or (kIBFront and kIBHdrCtx and not kIBCountsInMeta and not kIBSenderTables and not kIBCountsEarly and not kIBSST and not kIBThreadCtx),
                      "DG_MEGA_MOE_IB_SB needs FRONT + HDR_CTX, shared contexts, and no COUNTS_IN_META / SENDER_TABLES / COUNTS_EARLY / SST");
 #if defined(DG_MEGA_MOE_IB_SB_DEAD) and DG_MEGA_MOE_IB_SB_DEAD
@@ -1780,7 +1802,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     TT_MAX(4, true);
                     TT_ADD(23, true, 1);
                     TT_ADD(26, workspace.signals->ib_trace[5] > workspace.signals->ib_trace[16], 1);  // put after our L2 grid sync
-                    {
+                    if (kIBXLast and ib_xl and state == 2) {
+                        auto gin_t = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, fi_R + nr, 2);  // THREAD mode
+                        gin_t.active = ib_gin_active;
+                        gin_t.put(ret_dst + off, fst + off, static_cast<uint64_t>(precs) * kIBRecBytes, s);
+                    } else {
                         const auto gin_c = make_gin_site(8, ctx_chunk(nr, pc0, pc0 + nr), pc0 + nr, ib_xbase);
                         gin_c.put(ret_dst + off, fst + off, static_cast<uint64_t>(precs) * kIBRecBytes, s);
                         // DG_MEGA_MOE_IB_RET_CHUNK_DB=1: a trailing 8-byte put on the same context after the LAST chunk of
@@ -2051,6 +2077,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Wait token data arrival
         IB_TRACE_MAX(12, thread_idx == 0);  // dispatch warps reach the count wait, slowest SM
+        // DG_MEGA_MOE_IB_FETCH_GATE=1: only warp 0 of each SM polls the per-expert count sums; the other dispatch warps wait
+        // at the CTA barrier and then read them once. (Every dispatch thread of every SM spinning on the same 38 words while
+        // the D1 SMs add to them: SM 0 saw the counts ~7 us after the last scan had published, B300 EP16 128 tokens.)
+#if defined(DG_MEGA_MOE_IB_FETCH_GATE) and DG_MEGA_MOE_IB_FETCH_GATE
+        if (warp_idx == 0)
+            scheduler.fetch_expert_recv_count();
+        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+#endif
         scheduler.fetch_expert_recv_count();
         IB_TRACE_MAX(13, thread_idx == 0);  // all counts seen (before the IB system fence), slowest SM
 #if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)

@@ -74,10 +74,11 @@ struct Geometry {
     // Buffer geometry (shared with the host) and the units of the two transfers
     // (a function: device code cannot take the address of a static constexpr object)
     CUTLASS_HOST_DEVICE static constexpr layout::IBBufferLayout buf() { return {kNumMaxTokens, kHidden, kNumTopk, kNumExperts}; }
-    static constexpr uint32_t kNumRecordsPerPut = 32;   // records per return put
+    static constexpr uint32_t kNumRecordsPerPut = 8;    // records per return put
     static constexpr uint32_t kNumRowsPerPut = 128;     // token rows per forward put
     static constexpr uint32_t kNumMaxChunks = math::constexpr_ceil_div(kNumMaxTokens, kNumRecordsPerPut);
-    DG_STATIC_ASSERT(kNumMaxChunks <= layout::MegaMoEIBSignals::kMaxFwdChunks, "Too many return chunks");
+    DG_STATIC_ASSERT(kNumMaxChunks <= layout::MegaMoEIBSignals::kMaxReturnChunks and
+                     kNumNodes <= layout::MegaMoEIBSignals::kMaxReturnNodes, "Too many return chunks or nodes");
     DG_STATIC_ASSERT(buf().record_bytes() % 16 == 0 and kHidden % 512 == 0, "Rows and records are read in 16-byte units, a warp at a time");
 
     // Which SM does what before the first GEMM task (epilogue warps; they are idle until then).
@@ -106,7 +107,7 @@ struct Geometry {
     static constexpr uint32_t kNumRowsPerStage = 32;
     static constexpr uint32_t kNumStageSMs = kFirstOrderSM - kFirstPullSM;
     DG_STATIC_ASSERT(not kOrdered or (kFirstOrderSM > kFirstPullSM and kNumRowsPerPut % kNumRowsPerStage == 0 and
-                     math::constexpr_ceil_div(kNumMaxTokens, kNumRowsPerStage) <= layout::MegaMoEIBSignals::kMaxFwdChunks),
+                     math::constexpr_ceil_div(kNumMaxTokens, kNumRowsPerStage) <= layout::MegaMoEIBSignals::kMaxStageChunks),
                      "Invalid first-need order plan");
     DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs and kFirstBuildSM >= kFirstPullSM, "Not enough SMs for the start roles");
 

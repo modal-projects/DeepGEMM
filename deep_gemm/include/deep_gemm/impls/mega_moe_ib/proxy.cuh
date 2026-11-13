@@ -5,7 +5,7 @@
 // Hosts on this node write the L2 output rows of a remote source's tokens to this GPU, the source's counterpart
 // (`store_partial`, same [top-k slot][token][hidden] bf16 layout as the stock combine buffer). The proxy sums a
 // token's partials of this node in fp32, quantizes the sum to fp8 with one scale per 128 columns, and returns one
-// record per token, 32 records per put (`reduce`). Summing here turns ~top-k / nodes bf16 rows per token into
+// record per token, a few records per put (`reduce`). Summing here turns ~top-k / nodes bf16 rows per token into
 // one fp8 record on the wire.
 
 #include <cuda_fp8.h>
@@ -41,8 +41,9 @@ CUTLASS_DEVICE void store_partial(const Launch& launch, const layout::SymBuffer<
 template <typename G>
 CUTLASS_DEVICE void reset_counters(const Launch& launch, const uint32_t& thread_idx, const uint32_t& num_threads) {
     constexpr uint32_t kNumNodes = layout::MegaMoEIBSignals::kMaxNodes;
-    for (uint32_t i = thread_idx; i < 2 * kNumNodes * layout::MegaMoEIBSignals::kMaxFwdChunks; i += num_threads)
-        launch.signals->fwd_chunk_done[0][0][i] = 0;
+    constexpr uint32_t kNumWords = G::kNumNodes * layout::MegaMoEIBSignals::kMaxReturnChunks;   // this group's rows, per parity
+    for (uint32_t i = thread_idx; i < 2 * kNumWords; i += num_threads)
+        launch.signals->fwd_chunk_done[i / kNumWords][0][i % kNumWords] = 0;
     if (thread_idx < 2 * kNumNodes) {
         launch.signals->fwd_item_claim[0][thread_idx] = 0;
         launch.signals->fwd_chunks_returned[0][thread_idx] = 0;
@@ -56,7 +57,9 @@ CUTLASS_DEVICE void reset_counters(const Launch& launch, const uint32_t& thread_
 //      forward path, for every token whether or not it has an expert on this node;
 //   2. for each of the token's experts on this node, in top-k order: poll that partial row, re-arm it, add;
 //   3. quantize, store the record into the staging buffer;
-//   4. count the item; whoever completes a 32-record chunk puts it.
+//   4. count the item; whoever completes a chunk of kNumRecordsPerPut records puts it. (A chunk leaves with its
+//      slowest record: 8 against 32 is -4 .. -9 us at 512 / 1024 tokens with top-25, below 8 the puts' issue
+//      time costs the reducing warps more than the earlier chunks give.)
 // `first_slot` rotates the node order per warp so that all return streams advance together.
 template <typename G, typename sched_t>
 CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, const bool& is_leader, const uint32_t& lane_idx) {

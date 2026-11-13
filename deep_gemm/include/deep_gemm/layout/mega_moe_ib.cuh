@@ -107,7 +107,9 @@ using MegaMoEIBSignals = ib_compat::OldIBSignals;  // TEMPORARY
 #else
 struct alignas(128) MegaMoEIBSignals {
     static constexpr uint32_t kMaxNodes = 16;
-    static constexpr uint32_t kMaxFwdChunks = 64;    // forward-combine chunks per remote node (32 tokens each)
+    static constexpr uint32_t kMaxReturnNodes = kMaxNodes;  // nodes with return-chunk counters
+    static constexpr uint32_t kMaxReturnChunks = 256;       // return puts per remote node
+    static constexpr uint32_t kMaxStageChunks = 64;         // staged row chunks per remote node (first-need order)
     static constexpr uint32_t kMaxSources = 64;      // remote source ranks
     static constexpr uint32_t kNumTableWords = 1u << 20;
     static constexpr uint32_t kNumSorts = 3, kMaxSortParts = 8;
@@ -120,14 +122,14 @@ struct alignas(128) MegaMoEIBSignals {
     alignas(128) uint32_t src_num_tokens[kMaxNodes];
     // Forward-combine bookkeeping, by parity and remote node: items claimed, records done per chunk, chunks returned
     alignas(128) uint32_t fwd_item_claim[2][kMaxNodes];
-    alignas(128) uint32_t fwd_chunk_done[2][kMaxNodes][kMaxFwdChunks];
+    alignas(128) uint32_t fwd_chunk_done[2][kMaxReturnNodes][kMaxReturnChunks];
     alignas(128) uint32_t fwd_chunks_returned[2][kMaxNodes];
     // Receiver: epoch once the slot table of remote source k is complete on this GPU (read by its pull warps)
     alignas(128) uint64_t tables_ready[kMaxSources];
     // Proxy: epoch once the return order of remote source node n is written (read by the forward-combine)
     alignas(128) uint64_t order_ready[kMaxNodes];
     // Sender, first-need order: epoch once chunk c of the rows for remote node slot nr is staged
-    alignas(128) uint64_t rows_staged[kMaxNodes][kMaxFwdChunks];
+    alignas(128) uint64_t rows_staged[kMaxNodes][kMaxStageChunks];
     // Multi-SM counting sorts (token sort, table builder, sliced scan): part p published its histogram row / is done
     alignas(128) uint64_t sort_shared[kNumSorts][kMaxSortParts];
     alignas(128) uint64_t sort_done[kNumSorts][kMaxSortParts];

@@ -36,7 +36,10 @@ DG_STATIC_ASSERT(sizeof(OldSymBuffer<kNumMaxRanks>) == 616, "Old SymBuffer layou
 // first old IB field, which sits where the stock signals end)
 struct OldIBSignals {
     static constexpr uint32_t kMaxNodes = 16;
-    static constexpr uint32_t kMaxFwdChunks = 64;
+    // The old struct's 2 x 16 x 64 counter words, shaped for up to 4 nodes (all the old-host servers have)
+    static constexpr uint32_t kMaxReturnNodes = 4;
+    static constexpr uint32_t kMaxReturnChunks = 256;
+    static constexpr uint32_t kMaxStageChunks = 64;
     static constexpr uint32_t kMaxSources = 64;
     static constexpr uint32_t kNumTableWords = 1u << 20;
     static constexpr uint32_t kNumSorts = 3, kMaxSortParts = 8;
@@ -57,13 +60,13 @@ struct OldIBSignals {
     uint8_t pad2[5583744 - 865152 - 4 * (1u << 20)];
     uint32_t src_num_tokens[kMaxNodes];
     uint8_t pad3[5583872 - 5583744 - 4 * 16];
-    uint32_t fwd_chunk_done[2][kMaxNodes][kMaxFwdChunks];
+    uint32_t fwd_chunk_done[2][kMaxReturnNodes][kMaxReturnChunks];
     uint32_t fwd_chunks_returned[2][kMaxNodes];
     uint8_t pad4[5592576 - 5592192];                 // old meta-posted words (written by old kernels)
     uint32_t fwd_item_claim[2][kMaxNodes];
     uint64_t tables_ready[kMaxSources];
     uint64_t order_ready[kMaxSources];               // indexed by node here
-    uint64_t rows_staged[kMaxNodes][kMaxFwdChunks];  // the old landed flags (dead in every frozen old build)
+    uint64_t rows_staged[kMaxNodes][kMaxStageChunks];  // the old landed flags (dead in every frozen old build)
 };
 DG_STATIC_ASSERT(offsetof(OldIBSignals, trace) == 3328 and offsetof(OldIBSignals, hist) == 3712 and
                  offsetof(OldIBSignals, sm_stage) == 4736 and offsetof(OldIBSignals, stage_dumped) == 6784 and

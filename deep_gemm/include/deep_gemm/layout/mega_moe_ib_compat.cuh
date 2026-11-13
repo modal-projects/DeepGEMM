@@ -115,11 +115,21 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #ifndef DG_MEGA_MOE_IBP_DIAGNOSTICS
 #define DG_MEGA_MOE_IBP_DIAGNOSTICS 0
 #endif
+// The old servers know two measurement switches by their old names (they isolate a zero-network request and
+// collect trace lines by them): DG_MEGA_MOE_IB_TRACE=1 and DG_MEGA_MOE_IB_ORACLE=2
 #ifndef DG_MEGA_MOE_IBP_TRACE
+#if defined(DG_MEGA_MOE_IB_TRACE) and DG_MEGA_MOE_IB_TRACE
+#define DG_MEGA_MOE_IBP_TRACE 1
+#else
 #define DG_MEGA_MOE_IBP_TRACE 0
 #endif
+#endif
 #ifndef DG_MEGA_MOE_IBP_ZERO_NETWORK
+#if defined(DG_MEGA_MOE_IB_ORACLE) and DG_MEGA_MOE_IB_ORACLE >= 2
+#define DG_MEGA_MOE_IBP_ZERO_NETWORK 1
+#else
 #define DG_MEGA_MOE_IBP_ZERO_NETWORK 0
+#endif
 #endif
 #define DG_MEGA_MOE_IB_PLAN { \
     .ranks_per_node = DG_MEGA_MOE_IBP_RANKS_PER_NODE, .routing = deep_gemm::layout::IBRouting(DG_MEGA_MOE_IBP_ROUTING), \

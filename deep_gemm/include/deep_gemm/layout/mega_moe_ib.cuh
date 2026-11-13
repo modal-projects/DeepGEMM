@@ -21,9 +21,10 @@
 namespace deep_gemm::layout {
 
 // `sym_buffer_ptrs` from Python is [per-rank load/store pointers (0 for ranks of other nodes)], followed, for an IB
-// group, by [kIBMagic, device pointer to ncclDevComm_t, ncclWindow_t, ranks per NVLink domain].
+// group, by [kIBMagic, device pointer to ncclDevComm_t, ncclWindow_t, ranks per NVLink domain, Gin backend of the
+// communicator (ncclGinType_t)].
 constexpr static int64_t kIBMagic = 0x1B1B1B1B1B1B1B1Bll;
-constexpr static uint32_t kNumIBExtraPtrs = 4;
+constexpr static uint32_t kNumIBExtraPtrs = 5;
 
 // Gin contexts the kernel spreads its puts over; Python requests as many when it creates the device communicator
 constexpr static uint32_t kNumIBGinContexts = 8;
@@ -80,7 +81,14 @@ struct IBHandles {
     // Ranks per NVLink domain of an IB pointer list (a compile-time constant of the kernel, through the plan)
     template <typename Container>
     static uint32_t ranks_per_node_of(const Container& c) {
-        DG_UNIFIED_ASSERT(present(c) and c[c.size() - 1] > 0);
+        DG_UNIFIED_ASSERT(present(c) and c[c.size() - 2] > 0);
+        return static_cast<uint32_t>(c[c.size() - 2]);
+    }
+
+    // Gin backend of the communicator behind an IB pointer list (a compile-time constant too: `IBPlan::gin_backend`)
+    template <typename Container>
+    static uint32_t gin_backend_of(const Container& c) {
+        DG_UNIFIED_ASSERT(present(c) and c[c.size() - 1] >= 0);
         return static_cast<uint32_t>(c[c.size() - 1]);
     }
 
@@ -88,8 +96,8 @@ struct IBHandles {
     explicit IBHandles(const Container& c) {
         DG_UNIFIED_ASSERT(present(c));
         const auto size = static_cast<uint32_t>(c.size());
-        gin_dev_comm = c[size - 3];
-        gin_window = c[size - 2];
+        gin_dev_comm = c[size - 4];
+        gin_window = c[size - 3];
     }
 };
 

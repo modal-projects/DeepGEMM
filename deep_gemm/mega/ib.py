@@ -53,8 +53,9 @@ std::vector<int64_t> nccl_unique_id() {
     return out;
 }
 
-// Returns (state handle, buffer ptr, per-rank LSA ptrs (0 for other nodes), dev_comm device ptr, window, lsa nranks)
-std::tuple<int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t, int64_t>
+// Returns (state handle, buffer ptr, per-rank LSA ptrs (0 for other nodes), dev_comm device ptr, window, lsa nranks,
+// the Gin backend the device communicator got (ncclGinType_t; 0 without Gin))
+std::tuple<int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t, int64_t, int64_t>
 create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num_bytes, int64_t num_contexts, int64_t gin_type,
        int64_t virtual_lsa) {
     auto* st = new IBState();
@@ -73,6 +74,7 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     // other groups (even on this node) are reached with Gin; single-node bitwise checks of every IB path
     const int64_t num_lsa = virtual_lsa > 0 ? virtual_lsa : lsa.nRanks;
     const bool need_gin = num_lsa < world;
+    int64_t gin_backend = 0;
     TORCH_CHECK(not need_gin or props.ginType != NCCL_GIN_TYPE_NONE,
                 "NCCL Gin is unavailable on this communicator (ginType=", props.ginType, ")");
     if (need_gin) {
@@ -100,6 +102,8 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
         TORCH_CHECK(have >= num_contexts, "NCCL Gin granted ", have, " context indices (ginContextCount ",
                     dc->ginContextCount, " x connections ", (int) dc->ginConnectionCount, "), fewer than the ", num_contexts,
                     " the kernel uses");
+        // What a device-side ncclGin dispatches on (connection 0; all connections of a communicator share it)
+        gin_backend = static_cast<int64_t>(dc->ginNetDeviceTypes[0]);
     }
     CHECK_CUDA(cudaMalloc(&st->dev_comm_dev, dev_comm_size));
     CHECK_CUDA(cudaMemcpy(st->dev_comm_dev, st->dev_comm_host, dev_comm_size, cudaMemcpyHostToDevice));
@@ -117,7 +121,7 @@ create(const std::vector<int64_t>& uid, int64_t rank, int64_t world, int64_t num
     }
     TORCH_CHECK(ptrs[static_cast<size_t>(rank)] == reinterpret_cast<int64_t>(st->ptr) or ptrs[static_cast<size_t>(rank)] != 0);
     return {reinterpret_cast<int64_t>(st), reinterpret_cast<int64_t>(st->ptr), ptrs,
-            reinterpret_cast<int64_t>(st->dev_comm_dev), reinterpret_cast<int64_t>(st->window), num_lsa};
+            reinterpret_cast<int64_t>(st->dev_comm_dev), reinterpret_cast<int64_t>(st->window), num_lsa, gin_backend};
 }
 
 torch::Tensor as_tensor(int64_t ptr, int64_t num_bytes, int64_t device) {
@@ -185,10 +189,10 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
     dist.broadcast_object_list(uid, src=dist.get_global_rank(group, 0), group=group)
     gin_type = int(os.environ.get('DG_MEGA_MOE_IB_GIN_TYPE', '0'))
     virtual_lsa = int(os.environ.get('DG_MEGA_MOE_IB_VIRTUAL_LSA', '0'))
-    state, ptr, lsa_ptrs, dev_comm, window, num_lsa = ext.create(
+    state, ptr, lsa_ptrs, dev_comm, window, num_lsa, gin_backend = ext.create(
         uid[0], rank, world, num_bytes, _C.get_ib_num_gin_contexts_for_mega_moe(), gin_type, virtual_lsa)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
     force = os.environ.get('DG_MEGA_MOE_IB_FORCE', '0') == '1'
-    buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa] if (num_lsa < world or force) else [])
+    buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa, gin_backend] if (num_lsa < world or force) else [])
     handle = types.SimpleNamespace(buffer_ptrs=buffer_ptrs, ib_state=state, num_lsa_ranks=num_lsa)
     return tensor, handle

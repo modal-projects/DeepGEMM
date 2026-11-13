@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <format>
@@ -266,11 +267,11 @@ static MegaMoEConfig get_mega_moe_config(
 
 // The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
 // Everything fitted is in the table below, each row with the measurement that set it (B300, 800G InfiniBand, 8
-// ranks per node; same-request A/B in both arm orders). `DG_MEGA_MOE_IB_PLAN="field=value,..."` overrides fields
-// for development (e.g. "ordered=1,diagnostics=1").
+// ranks per node; same-request A/B in both arm orders).
 static layout::IBPlan get_mega_moe_ib_plan(
     const int& num_ranks, const int& num_ranks_per_node,
-    const int& num_tokens, const int& num_topk) {
+    const int& num_tokens, const int& num_topk,
+    const int& gin_backend = 0) {
     DG_HOST_ASSERT(num_ranks_per_node > 0 and num_ranks % num_ranks_per_node == 0 and num_ranks >= num_ranks_per_node);
     const int num_nodes = num_ranks / num_ranks_per_node;
 
@@ -299,6 +300,7 @@ static layout::IBPlan get_mega_moe_ib_plan(
 
     layout::IBPlan plan;
     plan.ranks_per_node = num_ranks_per_node;
+    plan.gin_backend = static_cast<uint32_t>(gin_backend);  // the communicator's (0: unknown, generic dispatch)
     const bool is_ordered = num_nodes >= 2 and num_tokens >= fitted.min_ordered_tokens;
     plan.ordered = is_ordered;
     if (is_ordered) {
@@ -315,29 +317,32 @@ static layout::IBPlan get_mega_moe_ib_plan(
         plan.shared_l2_early = plan.retire_percent > 0 and num_topk > 8 and num_topk < 24;
     }
 
-    // Development overrides
-    if (const char* overrides = std::getenv("DG_MEGA_MOE_IB_PLAN"); overrides != nullptr) {
-        std::string text(overrides);
-        size_t begin = 0;
-        while (begin < text.size()) {
-            const size_t end = std::min(text.find(',', begin), text.size());
-            const size_t eq = text.find('=', begin);
-            DG_HOST_ASSERT(eq != std::string::npos and eq < end);
-            const std::string name = text.substr(begin, eq - begin);
-            const auto value = static_cast<uint32_t>(std::stoul(text.substr(eq + 1, end - eq - 1)));
-            if (name == "ordered") plan.ordered = value;
-            else if (name == "gin_backend") plan.gin_backend = value;
-            else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
-            else if (name == "retire_percent") plan.retire_percent = value;
-            else if (name == "retire_at_percent") plan.retire_at_percent = value;
-            else if (name == "shared_l2_early") plan.shared_l2_early = value;
-            else if (name == "diagnostics") plan.diagnostics = value;
-            else if (name == "trace") plan.trace = value;
-            else if (name == "zero_network") plan.zero_network = value;
-            else DG_HOST_ASSERT(false and "Unknown DG_MEGA_MOE_IB_PLAN field");
-            begin = end + 1;
-        }
+    // Development overrides, one variable per field: DG_MEGA_MOE_IBP_<FIELD>=value (what the development servers
+    // pass per arm). Their switch names for a trace and a zero-network run also apply.
+    const auto set_field = [&](const std::string& name, const uint32_t& value) {
+        if (name == "ordered") plan.ordered = value;
+        else if (name == "gin_backend") plan.gin_backend = value;
+        else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
+        else if (name == "retire_percent") plan.retire_percent = value;
+        else if (name == "retire_at_percent") plan.retire_at_percent = value;
+        else if (name == "shared_l2_early") plan.shared_l2_early = value;
+        else if (name == "diagnostics") plan.diagnostics = value;
+        else if (name == "trace") plan.trace = value;
+        else if (name == "zero_network") plan.zero_network = value;
+    };
+    for (const char* field: {"ordered", "gin_backend", "l1_lead_cap", "retire_percent", "retire_at_percent",
+                             "shared_l2_early", "diagnostics", "trace", "zero_network"}) {
+        std::string variable = std::string("DG_MEGA_MOE_IBP_") + field;
+        std::transform(variable.begin(), variable.end(), variable.begin(), [](unsigned char ch) { return std::toupper(ch); });
+        if (const char* value = std::getenv(variable.c_str()); value != nullptr)
+            set_field(field, static_cast<uint32_t>(std::stoul(value)));
     }
+    if (const char* value = std::getenv("DG_MEGA_MOE_IB_TRACE"); value != nullptr and std::stoul(value) != 0)
+        plan.trace = true;
+    if (const char* value = std::getenv("DG_MEGA_MOE_IB_ORACLE"); value != nullptr and std::stoul(value) >= 2)
+        plan.zero_network = true;
+    // The kernel compiles the plan's backend only and cannot check it before its puts run
+    DG_HOST_ASSERT(plan.gin_backend == 0 or gin_backend == 0 or plan.gin_backend == static_cast<uint32_t>(gin_backend));
     return plan;
 }
 

@@ -167,7 +167,8 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Compile
     const auto ib_defines = not is_ib ? std::string() : get_mega_moe_ib_defines(get_mega_moe_ib_plan(
-        num_ranks, static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs)), num_tokens, num_topk));
+        num_ranks, static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs)), num_tokens, num_topk,
+        static_cast<int>(layout::IBHandles::gin_backend_of(sym_buffer_ptrs))));
     const auto code = ib_defines + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 

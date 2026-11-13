@@ -19,6 +19,7 @@ enum Stamp : uint32_t {
     kFirstHeaderSeen,      // receiver: earliest SM that saw a remote header
     kHeadersSeen,          // receiver: latest
     kCountsPublished,      // receiver: latest remote source handed to the scheduler
+    kTablesDone,           // receiver, sender tables: latest slot table copied (`tables_ready` raised)
     kIntakeDone,           // proxy: latest return order written
     kFirstRemoteRow,       // pull: earliest remote row copied
     kLastRow,              // pull: latest row copied
@@ -63,10 +64,10 @@ CUTLASS_DEVICE void begin(const Launch& launch, const uint32_t& num_tokens, cons
                 return t[i] == 0 or t[i] == ~0ull ? -1.0 : static_cast<double>(static_cast<int64_t>(t[i] - t[kBegin])) / 1e3;
             };
             printf("OPUS_IB_TRACE rank=%u epoch=%llu tokens=%u | meta_posted=%.1f rows_posted=%.1f need_order=%.1f tables_posted=%.1f first_header=%.1f headers=%.1f "
-                   "counts=%.1f intake=%.1f first_remote_row=%.1f last_row=%.1f first_reduce=%.1f last_task=%.1f "
+                   "counts=%.1f tables_done=%.1f intake=%.1f first_remote_row=%.1f last_row=%.1f first_reduce=%.1f last_task=%.1f "
                    "last_chunk_put=%.1f first_records=%.1f end=%.1f\n",
                    launch.rank, static_cast<unsigned long long>(launch.epoch - 1), num_tokens,
-                   us(kMetaPosted), us(kRowsPosted), us(kNeedOrderDone), us(kTablesPosted), us(kFirstHeaderSeen), us(kHeadersSeen), us(kCountsPublished), us(kIntakeDone),
+                   us(kMetaPosted), us(kRowsPosted), us(kNeedOrderDone), us(kTablesPosted), us(kFirstHeaderSeen), us(kHeadersSeen), us(kCountsPublished), us(kTablesDone), us(kIntakeDone),
                    us(kFirstRemoteRow), us(kLastRow), us(kFirstReduce), us(kLastTask), us(kLastChunkPut), us(kFirstRecords), us(kEnd));
         }
         #pragma unroll

@@ -198,8 +198,11 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         // header and the top-k rows (token count, landing proof, return order)
         if constexpr (G::kSenderTables) {
             receive_tables<G, kNumThreads, kBarrierIdx>(launch, workspace, mirror, k, src_rank, counts, thread_idx,
-                [&]() { publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads); });
-            trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
+                [&]() {
+                    publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
+                    trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
+                });
+            trace::stamp<G>(launch, trace::kTablesDone, thread_idx == 0);
             if (not is_proxy)
                 return;
         }

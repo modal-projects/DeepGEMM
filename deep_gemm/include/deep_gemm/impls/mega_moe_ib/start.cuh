@@ -157,7 +157,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             for (uint32_t u = 0; u < kNumLoads; ++ u)
                 entries[u] = 0, entry_weights[u] = 0;
             reload(true);
-            landing::spin<G::kDiag>([&]() {
+            landing::spin<true>([&]() {
                 bool blank = false;
                 #pragma unroll
                 for (uint32_t u = 0; u < kNumLoads; ++ u)

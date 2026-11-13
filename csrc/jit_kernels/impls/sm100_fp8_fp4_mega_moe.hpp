@@ -1,9 +1,15 @@
 #pragma once
 
+#include <cstdlib>
 #include <format>
+#include <fstream>
+#include <string>
+#include <unordered_set>
+#include <vector>
 #include <torch/python.h>
 
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_ib.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 #include "../../runtime/runtime.hpp"
@@ -12,6 +18,32 @@
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
+
+// Set when the last sm100_fp8_fp4_mega_moe call skipped its launch for the first-launch rendezvous
+static bool& mega_moe_launch_skipped() {
+    static bool skipped = false;
+    return skipped;
+}
+
+// Build macros of the IB kernel. These three and DG_MEGA_MOE_IB itself are the only macros its headers read
+// (impls/mega_moe_ib/config.cuh derives everything else from the template arguments):
+//   DG_MEGA_MOE_IB_REGIME       start path, see config.cuh. Until the host picks it from (ranks, ranks per
+//                               domain, top-k, tokens), the environment variable of the same name does.
+//   DG_MEGA_MOE_IB_DIAGNOSTICS  0 removes the protocol diagnostics from the polls (default 1)
+//   DG_MEGA_MOE_IB_TRACE        1 builds the per-stage time stamps (default 0)
+static std::string get_mega_moe_ib_defines() {
+    std::string defines = "#define DG_MEGA_MOE_IB 1\n";
+    for (const char* name: {"DG_MEGA_MOE_IB_REGIME", "DG_MEGA_MOE_IB_DIAGNOSTICS", "DG_MEGA_MOE_IB_TRACE"}) {
+        const char* value = std::getenv(name);
+        if (value == nullptr or *value == '\0')
+            continue;
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        DG_HOST_ASSERT(*end == '\0' and parsed >= 0);
+        defines += std::format("#define {} {}\n", name, parsed);
+    }
+    return defines;
+}
 
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
@@ -34,7 +66,10 @@ static void sm100_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math
 ) {
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    // Ranks of other NVLink domains: the Gin handles ride behind the per-rank pointers (layout/mega_moe_ib.cuh)
+    const bool is_ib = layout::IBHandles::present(sym_buffer_ptrs);
+    const auto num_ranks = static_cast<int>(layout::IBHandles::num_ranks_of(sym_buffer_ptrs));
+    const std::vector<int64_t> rank_ptrs(sym_buffer_ptrs.begin(), sym_buffer_ptrs.begin() + num_ranks);
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
@@ -146,7 +181,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = get_num_sms_for_mega_moe();
 
     // Compile
-    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::format(R"(
+    const auto code = (is_ib ? get_mega_moe_ib_defines() : std::string()) + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -186,9 +221,38 @@ static void __instantiate_kernel() {{
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
-        to_string(l1_weights.scalar_type())));
+        to_string(l1_weights.scalar_type()));
 
-    // Launch
+    // DG_DEV_COMPILE_ONLY=<file> (development servers precompile variants in parallel): compile into the JIT
+    // disk cache, write the cache entry's path to <file>, and return without loading or launching
+    if (const char* compile_only_out = std::getenv("DG_DEV_COMPILE_ONLY"); compile_only_out != nullptr) {
+        std::ofstream(compile_only_out) << jit->compile_without_load("sm100_fp8_fp4_mega_moe", code).string();
+        return;
+    }
+    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", code);
+
+    // First-launch rendezvous. Ranks JIT-compile on their own and finish tens of seconds apart, while the
+    // kernel's waits on its peers time out after 60 s. So the first time a multi-rank call meets a kernel object
+    // this process has not launched (and the stream is not capturing), nothing is launched and
+    // mega_moe_launch_skipped() is set: the Python wrapper barriers the group and calls again.
+    // Steady state: one hash-set lookup. DG_MOE_NO_RENDEZVOUS=1 disables it.
+    mega_moe_launch_skipped() = false;
+    if (num_ranks > 1) {
+        const char* no_rendezvous = std::getenv("DG_MOE_NO_RENDEZVOUS");
+        static std::unordered_set<const void*> launched_kernels;
+        if ((no_rendezvous == nullptr or std::string(no_rendezvous) == "0") and not launched_kernels.contains(kernel.get())) {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            DG_CUDA_RUNTIME_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream().stream(), &capture_status));
+            launched_kernels.insert(kernel.get());
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                mega_moe_launch_skipped() = true;
+                return;
+            }
+        }
+    }
+
+    // Launch. The IB kernel takes the Gin handles as one more argument.
+    const auto launch = [&](const auto&... ib_args) {
     jit->launch(
         kernel, {
             .num_smem_bytes = config.smem_size,
@@ -199,7 +263,7 @@ static void __instantiate_kernel() {{
         y.data_ptr(),
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
-        layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        layout::SymBuffer<>(rank_ptrs, rank_idx),
         tensor_map_l1_acts,
         tensor_map_l1_acts_sf,
         tensor_map_l1_weights,
@@ -218,7 +282,13 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf,
-        sm_locality_domains.data_ptr<uint8_t>());
+        sm_locality_domains.data_ptr<uint8_t>(),
+        ib_args...);
+    };
+    if (is_ib)
+        launch(layout::IBHandles(sym_buffer_ptrs, rank_idx));
+    else
+        launch();
 }
 
 } // namespace deep_gemm

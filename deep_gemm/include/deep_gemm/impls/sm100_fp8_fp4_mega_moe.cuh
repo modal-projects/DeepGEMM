@@ -10,6 +10,9 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+#include <deep_gemm/layout/mega_moe_ib.cuh>
+#endif
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
@@ -76,7 +79,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
-                            const uint8_t* sm_locality_domains) {
+                            const uint8_t* sm_locality_domains
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                            , const __grid_constant__ layout::IBHandles ib_handles
+#endif
+                            ) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;

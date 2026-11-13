@@ -312,9 +312,10 @@ static layout::IBPlan get_mega_moe_ib_plan(
         // against 90 is -9 us at top-25, 1024 tokens, and -3 at 768; 71 against 90 is -5 at top-6, 1024 tokens).
         if (plan.retire_percent > 0)
             plan.retire_at_percent = static_cast<uint32_t>(std::lround(100.0 * std::pow(0.6, static_cast<double>(num_nodes) / num_topk)));
-        // FITTED: the shared expert's L2 before the routed tasks: -6 .. -7 us at 512 .. 768 with top-19, +9 at
-        // 1024 with top-25 (four nodes); +8 with one remote node
-        plan.shared_l2_early = plan.retire_percent > 0 and num_topk > 8 and num_topk < 24;
+        // The shared expert's L2 before the routed tasks, wherever clusters retire. On four nodes, on minus off:
+        // top-19 -1.4 .. -3.2 us at 256 .. 768 tokens and 0 .. -2.7 at 1024; top-25 -4 at 512, 0 at 1024; top-6 0.
+        // (With one remote node it cost 8 us at top-19, 1024 tokens: no retire there, so it is off.)
+        plan.shared_l2_early = plan.retire_percent > 0;
     }
 
     // Development overrides, one variable per field: DG_MEGA_MOE_IBP_<FIELD>=value (what the development servers

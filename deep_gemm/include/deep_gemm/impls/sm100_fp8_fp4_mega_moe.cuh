@@ -560,9 +560,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
             uint32_t slot_idx = token_idx_in_expert;
             uint32_t token_idx_in_rank;
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-            ib::local_first<IB, kNumRanks>(remaining, slot_idx, stored_rank_count, ib_launch.my_node, lane_idx);
-#endif
             while (true) {
                 // Compute active count and min across all ranks
                 // NOTES: reduce within each lane first, then warp-reduce once

@@ -3,8 +3,7 @@
 // Mega MoE across NVLink domains: the row pull of the dispatch warps.
 //
 // The stock pull loop stays in the kernel (expert cursor, slot -> (source rank, index), ring wait, bookkeeping).
-// Three things differ when sources can be on other nodes:
-//   * slot order: an expert's node-local sources take its first slots, so its first block needs no remote row;
+// Two things differ when sources can be on other nodes:
 //   * a remote source's slot table is written by this GPU's receiver SMs, after its counts: wait for its flag;
 //   * a remote source's row is read from its counterpart's mirror on this node, and the load is the poll.
 
@@ -12,29 +11,6 @@
 #include <deep_gemm/impls/mega_moe_ib/trace.cuh>
 
 namespace deep_gemm::ib {
-
-// Split an expert's slots into [node-local sources | remote sources], round-robin inside each part: on return
-// `remaining` holds the per-rank counts of the part `slot_idx` falls into and `slot_idx` is relative to that part.
-template <typename G, uint32_t kNumRanks, uint32_t kNumRanksPerLane>
-CUTLASS_DEVICE void local_first(uint32_t (&remaining)[kNumRanksPerLane], uint32_t& slot_idx,
-                                const uint32_t (&stored_rank_count)[kNumRanksPerLane],
-                                const uint32_t& my_node, const uint32_t& lane_idx) {
-    uint32_t num_local_in_lane = 0;
-    #pragma unroll
-    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-        const uint32_t rank = i * 32 + lane_idx;
-        num_local_in_lane += (rank < kNumRanks and G::node_of(rank) == my_node) ? stored_rank_count[i] : 0u;
-    }
-    const uint32_t num_local = __reduce_add_sync(0xffffffff, num_local_in_lane);
-    const bool is_local_part = slot_idx < num_local;
-    if (not is_local_part)
-        slot_idx -= num_local;
-    #pragma unroll
-    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-        const uint32_t rank = i * 32 + lane_idx;
-        remaining[i] = (rank < kNumRanks and (G::node_of(rank) == my_node) == is_local_part) ? stored_rank_count[i] : 0u;
-    }
-}
 
 // The slot table entry of (local expert, source rank, index in rank). An entry is `token * top-k + k` in its low
 // 16 bits; a remote source's entry carries the mirror row of the token in its high 16 bits.

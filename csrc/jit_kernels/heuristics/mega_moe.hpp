@@ -277,28 +277,29 @@ static layout::IBPlan get_mega_moe_ib_plan(
     struct Fitted {
         // The ordered regime (the sender routes and posts rows in first-need order) from this many tokens per rank
         int min_ordered_tokens;
-        // ... and from this top-k
-        int min_ordered_topk;
         // L1 leads L2 by at most this many pool blocks in the ordered regime
         int l1_lead_cap;
         // Share of the clusters that stop claiming tasks near the end of the routed L2 (0: none)
         int retire_percent;
     };
-    //                                 tokens  top-k  cap  retire
-    constexpr Fitted kOneRemoteNode  = {512,    1,     9,   0};
-    constexpr Fitted kMoreNodes      = {256,    8,     9,   50};
-    // kOneRemoteNode (16 GPUs), ordered + cap against the receiver scan: top-19 +5 us at 256, -13 at 512, -29 at
-    //   1024; top-25 -3 at 512, -23 at 768; top-6 -1 at 256, -7 at 512, -24 at 1024. The cap alone is -5 .. -8 of
-    //   that from 512 tokens. Retiring clusters loses at every trigger (+9 .. +25 at top-19, 1024 tokens): its
-    //   prize is a loaded return wire, which one remote node does not have.
-    // kMoreNodes (32 GPUs): ordered against the scan -9 .. -46 us at 256 .. 1024 (top-19 / top-25); cap and
-    //   retire together -14 (top-19) / -10 (top-25) at 512 and -29 / -24 at 1024. Top-k below 8 is checked but
-    //   not timed there, and stays on the scan.
+    //                                 tokens  cap  retire
+    constexpr Fitted kOneRemoteNode  = {512,    9,   0};
+    constexpr Fitted kMoreNodes      = {256,    9,   50};
+    // kOneRemoteNode (16 GPUs), ordered + cap against the receiver scan: top-19 +5 us at 256, -13 at 512, -17 at
+    //   1024; top-25 -3 at 512, -15 at 768, 0 at 1024 (25,600 rows per GPU: the GEMM is the bound, the last task
+    //   ends 390 us after the last row either way); top-6 -1 at 256, -7 at 512, -23 at 1024. The cap alone is
+    //   -4 .. -8 of that from 512 tokens. Retiring clusters loses at every trigger (+9 .. +25 at top-19, 1024
+    //   tokens): its prize is a loaded return wire, which one remote node does not have.
+    // kMoreNodes (32 GPUs), ordered against the scan: top-19 -8 / -36 / -88 us at 256 / 512 / 1024 (all of it is
+    //   the order of the rows: sender tables with rows in token order equal the scan); top-6 +1 at 128, -10 / -40 /
+    //   -40 at 256 / 512 / 1024. Cap and retire together -14 (top-19) / -10 (top-25) at 512 and -29 / -24 at
+    //   1024; -1 / -6 with top-6. Below 256 the scan wins at 160 on every model and the crossover is near 190
+    //   tokens (top-19) / 210 (top-25); not moved: the tail policy changes sign between the two there.
     const Fitted& fitted = num_nodes == 2 ? kOneRemoteNode : kMoreNodes;
 
     layout::IBPlan plan;
     plan.ranks_per_node = num_ranks_per_node;
-    const bool is_ordered = num_nodes >= 2 and num_tokens >= fitted.min_ordered_tokens and num_topk >= fitted.min_ordered_topk;
+    const bool is_ordered = num_nodes >= 2 and num_tokens >= fitted.min_ordered_tokens;
     plan.routing = is_ordered ? layout::IBRouting::SenderTables : layout::IBRouting::ReceiverScan;
     plan.first_need_order = is_ordered;
     if (is_ordered) {
@@ -306,8 +307,8 @@ static layout::IBPlan get_mega_moe_ib_plan(
         plan.retire_percent = fitted.retire_percent;
         // The trigger: the share of the routed L2 after which a retiring cluster stops. The later, the more
         // nodes share a token's experts (fewer of its partial sums are still missing near the end):
-        // 100 x 0.6^(nodes / top-k) = 90 at top-19 and 92 at top-25 on four nodes (measured: 92 against 90 is
-        // -9 us at top-25, 1024 tokens, and -3 at 768).
+        // 100 x 0.6^(nodes / top-k) = 90 at top-19, 92 at top-25 and 71 at top-6 on four nodes (measured: 92
+        // against 90 is -9 us at top-25, 1024 tokens, and -3 at 768; 71 against 90 is -5 at top-6, 1024 tokens).
         if (plan.retire_percent > 0)
             plan.retire_at_percent = static_cast<uint32_t>(std::lround(100.0 * std::pow(0.6, static_cast<double>(num_nodes) / num_topk)));
         // FITTED: the shared expert's L2 before the routed tasks: -6 .. -7 us at 512 .. 768 with top-19, +9 at

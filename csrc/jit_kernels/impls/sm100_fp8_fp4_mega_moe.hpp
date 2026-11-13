@@ -238,7 +238,7 @@ static void __instantiate_kernel() {{
         }
     }
 
-    // Launch. The IB kernel takes the Gin handles as one more argument.
+    // Launch. The IB kernel takes the Gin handles as one more argument, before the last one.
     const auto launch = [&](const auto&... ib_args) {
     jit->launch(
         kernel, {
@@ -269,8 +269,8 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf,
-        sm_locality_domains.data_ptr<uint8_t>(),
-        ib_args...);
+        ib_args...,
+        sm_locality_domains.data_ptr<uint8_t>());
     };
     if (is_ib)
         launch(layout::IBHandles(sym_buffer_ptrs));

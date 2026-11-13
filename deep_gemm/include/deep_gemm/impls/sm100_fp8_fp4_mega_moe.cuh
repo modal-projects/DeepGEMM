@@ -86,11 +86,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
-                            const uint8_t* sm_locality_domains
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and not (defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI)
-                            , const __grid_constant__ layout::IBHandles ib_handles
+                            const __grid_constant__ layout::IBHandles ib_handles,
 #endif
-                            ) {
+                            const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
     // TEMPORARY (layout/mega_moe_ib_compat.cuh): the old host passes the Gin handles inside its SymBuffer

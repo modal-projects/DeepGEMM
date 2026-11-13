@@ -280,7 +280,9 @@ static layout::IBPlan get_mega_moe_ib_plan(
 
     // FITTED: the sender routes and posts rows in first-need order from 256 tokens with two or more remote nodes
     // (EP32: -9 .. -46 us against the receiver scan at 256 .. 1024); with one remote node it loses 17-55 us
-    const bool is_ordered = num_remote_nodes >= 2 and num_tokens >= 256;
+    // Small top-k (top-6: 18% of tokens have no expert on a given remote node) stays on the receiver scan until
+    // the ordered regime is validated for it
+    const bool is_ordered = num_remote_nodes >= 2 and num_tokens >= 256 and num_topk >= 8;
     plan.routing = is_ordered ? layout::IBRouting::SenderTables : layout::IBRouting::ReceiverScan;
     plan.first_need_order = is_ordered;
 

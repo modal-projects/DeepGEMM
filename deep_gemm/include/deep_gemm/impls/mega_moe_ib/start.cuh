@@ -59,7 +59,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         if (warp_idx < 2 and lane_idx < G::kR) {
             const uint32_t node = G::node_of_slot(lane_idx, launch.my_node), peer = G::counterpart(launch.rank, node);
             const auto dst = Slots<G>::outbox_mirror(launch);
-            const Gin gin(launch.handles, launch.base, Stream::Meta, 0, launch.network);
+            const Gin gin = make_gin<G>(launch, Stream::Meta, lane_idx);
             const uint64_t num_entries = static_cast<uint64_t>(num_tokens) * G::kK;
             if (warp_idx == 0) {
                 if (num_tokens > 0)
@@ -83,13 +83,16 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         }
         __threadfence();
         sync();
-    } else if (sm_idx < G::kFirstRowSM + G::kR) {
+    } else if (sm_idx < G::kFirstRowSM + G::kR * G::kNumRowIssuers) {
+        // Issuer j of a node takes the puts j, j + I, ...: each issuer's puts land in order
         if (thread_idx == 0 and num_tokens > 0) {
-            const uint32_t node = G::node_of_slot(sm_idx - G::kFirstRowSM, launch.my_node), peer = G::counterpart(launch.rank, node);
+            const uint32_t nr = (sm_idx - G::kFirstRowSM) / G::kNumRowIssuers, issuer = (sm_idx - G::kFirstRowSM) % G::kNumRowIssuers;
+            const uint32_t node = G::node_of_slot(nr, launch.my_node), peer = G::counterpart(launch.rank, node);
             const auto dst = Slots<G>::outbox_mirror(launch);
-            const Gin gin(launch.handles, launch.base, Stream::Rows, 0, launch.network);
-            gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
-            for (uint32_t t = 0; t < num_tokens; t += G::kNumRowsPerPut) {
+            const Gin gin = make_gin<G>(launch, Stream::Rows, nr, issuer);
+            if (issuer == 0)
+                gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
+            for (uint32_t t = issuer * G::kNumRowsPerPut; t < num_tokens; t += G::kNumRowsPerPut * G::kNumRowIssuers) {
                 const uint64_t offset = static_cast<uint64_t>(t) * G::buf().token_bytes();
                 gin.put(dst + offset, input + offset,
                         static_cast<uint64_t>(cute::min(num_tokens - t, static_cast<uint32_t>(G::kNumRowsPerPut))) * G::buf().token_bytes(), peer);

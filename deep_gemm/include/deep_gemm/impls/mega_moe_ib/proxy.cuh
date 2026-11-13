@@ -84,7 +84,7 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
         if (num_tokens == 0) {
             // Nothing to return; the source still waits for a header (every byte written is read)
             if (is_leader)
-                comm::Gin(launch.handles, launch.base, comm::Stream::Return, nr, launch.network)
+                make_gin<G>(launch, comm::Stream::Return, nr)
                     .put_value(reinterpret_cast<uint64_t*>(ret_dst + G::buf().off_ret_header()), launch.epoch, source);
             continue;
         }
@@ -185,7 +185,7 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
                 if (detail::add_acq_rel(&signals->fwd_chunk_done[launch.parity][node][chunk], 1u) + 1 == num_records * kNumQuarters) {
                     detail::add_acq_rel(&signals->fwd_chunks_returned[launch.parity][node], 1u);
                     const int64_t offset = static_cast<int64_t>(chunk) * G::kNumRecordsPerPut * kNumRecordBytes;
-                    comm::Gin(launch.handles, launch.base, comm::Stream::Return, chunk + nr, launch.network)
+                    make_gin<G>(launch, comm::Stream::Return, nr, chunk)
                         .put(ret_dst + offset, stage + offset, static_cast<uint64_t>(num_records) * kNumRecordBytes, source);
                     trace::stamp<G>(launch, trace::kLastChunkPut);
                 }

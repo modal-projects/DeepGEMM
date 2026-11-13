@@ -328,6 +328,9 @@ static layout::IBPlan get_mega_moe_ib_plan(
             else if (name == "first_need_order") plan.first_need_order = value;
             else if (name == "key_lanes") plan.key_lanes = value;
             else if (name == "scan_slices") plan.scan_slices = value;
+            else if (name == "row_issuers") plan.row_issuers = value;
+            else if (name == "rows_per_put") plan.rows_per_put = value;
+            else if (name == "contexts_per_node") plan.contexts_per_node = value;
             else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
             else if (name == "retire_percent") plan.retire_percent = value;
             else if (name == "retire_at_percent") plan.retire_at_percent = value;
@@ -347,10 +350,11 @@ static layout::IBPlan get_mega_moe_ib_plan(
 static std::string to_string(const layout::IBPlan& plan) {
     return std::format(
         "{{.ranks_per_node = {}, .routing = deep_gemm::layout::IBRouting({}), .first_need_order = {}, "
-        ".key_lanes = {}, .scan_slices = {}, .l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
+        ".key_lanes = {}, .scan_slices = {}, .row_issuers = {}, .rows_per_put = {}, .contexts_per_node = {}, "
+        ".l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
         ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
         plan.ranks_per_node, static_cast<uint32_t>(plan.routing), plan.first_need_order,
-        plan.key_lanes, plan.scan_slices, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
+        plan.key_lanes, plan.scan_slices, plan.row_issuers, plan.rows_per_put, plan.contexts_per_node, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
         plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }
 

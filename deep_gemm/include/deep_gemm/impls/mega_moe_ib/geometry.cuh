@@ -11,6 +11,7 @@
 // "Remote node slot" nr in [0, kR) enumerates the other nodes in node order.
 
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/comm/gin.cuh>
 #include <deep_gemm/comm/landing.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/mega_moe_ib.cuh>
@@ -65,14 +66,16 @@ struct Geometry {
     // (a function: device code cannot take the address of a static constexpr object)
     CUTLASS_HOST_DEVICE static constexpr layout::IBBufferLayout buf() { return {kNumMaxTokens, kHidden, kNumTopk, kNumExperts}; }
     static constexpr uint32_t kNumRecordsPerPut = 32;   // records per return put
-    static constexpr uint32_t kNumRowsPerPut = 128;     // token rows per forward put
+    static constexpr uint32_t kNumRowsPerPut = kPlan.rows_per_put;     // token rows per forward put
+    static constexpr uint32_t kNumRowIssuers = kPlan.row_issuers;      // posting threads (SMs) per remote node
+    DG_STATIC_ASSERT(kNumRowsPerPut > 0 and kNumRowIssuers > 0, "Invalid row posting plan");
     static constexpr uint32_t kNumMaxChunks = math::constexpr_ceil_div(kNumMaxTokens, kNumRecordsPerPut);
     DG_STATIC_ASSERT(kNumMaxChunks <= layout::MegaMoEIBSignals::kMaxFwdChunks, "Too many return chunks");
     DG_STATIC_ASSERT(buf().record_bytes() % 16 == 0 and kHidden % 512 == 0, "Rows and records are read in 16-byte units, a warp at a time");
 
     // Which SM does what before the first GEMM task (epilogue warps; they are idle until then).
     //   SM 0                    posts the meta (top-k indices, weights, header) to every remote node
-    //   SMs [1, 1 + kR)         post the scale factors and token rows, one SM per remote node
+    //   SMs [1, 1 + kR x I)     post the scale factors and token rows, I = kNumRowIssuers SMs per remote node
     //   the last kNumReceiverSMs  receive one remote source each (slice): its counts and slot table; the last kR
     //                           of them are the sources this GPU is the proxy of, and also do the proxy intake
     // An SM's dispatch warps wait for its epilogue warps before pulling, so SMs that are busy at the start take
@@ -82,7 +85,7 @@ struct Geometry {
     static constexpr uint32_t kNumReceiverSMs = kNumRemoteSources * (kSenderTables ? 1 : kPlan.scan_slices);
     static constexpr uint32_t kFirstReceiverSM = kNumSMs - kNumReceiverSMs;
     static constexpr uint32_t kFirstProxySM = kNumSMs - kR;
-    static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR;
+    static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR * kNumRowIssuers;
     static constexpr uint32_t kEndPullSM = kSenderTables ? kFirstProxySM : kFirstReceiverSM;
     DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs, "Not enough SMs for the start roles");
 
@@ -132,6 +135,15 @@ struct Launch {
         return {name, rank, a, b};
     }
 };
+
+// The Gin context of a put, by the plan's assignment (comm/gin.cuh)
+template <typename G>
+CUTLASS_DEVICE comm::Gin make_gin(const Launch& launch, const comm::Stream& stream, const uint32_t& nr, const uint32_t& lane = 0) {
+    if constexpr (G::kPlan.contexts_per_node)
+        return comm::Gin(launch.handles, launch.base, comm::Gin::context_of(stream, lane, nr, G::kR), launch.network);
+    else
+        return comm::Gin(launch.handles, launch.base, comm::Gin::context_of(stream, stream == comm::Stream::Return ? lane + nr : lane), launch.network);
+}
 
 // Node slot `node` of this GPU's tail, and the regions in it (see layout::IBBufferLayout)
 template <typename geometry_t>

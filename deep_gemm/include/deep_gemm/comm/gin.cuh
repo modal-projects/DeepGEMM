@@ -42,6 +42,24 @@ struct Gin {
                                         : static_cast<uint32_t>(stream);
     }
 
+    // The alternative assignment (`IBPlan::contexts_per_node`): every remote node slot `nr` of `num_remote_nodes`
+    // gets its own Meta and Tables context, Rows share what is left by `lane`, Return uses all contexts
+    __device__ __forceinline__ static uint32_t context_of(const Stream stream, const uint32_t lane, const uint32_t nr,
+                                                          const uint32_t num_remote_nodes) {
+        constexpr uint32_t kNum = layout::kNumIBGinContexts;
+        const uint32_t num_rows = kNum > 2 * num_remote_nodes ? kNum - 2 * num_remote_nodes : 1;
+        return (stream == Stream::Meta ? nr :
+                stream == Stream::Tables ? num_remote_nodes + nr :
+                stream == Stream::Rows ? 2 * num_remote_nodes + lane % num_rows : lane + nr) % kNum;
+    }
+
+    __device__ __forceinline__
+    Gin(const layout::IBHandles& handles, const int64_t base, const uint32_t context_idx, const bool active):
+        gin(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm), static_cast<int>(context_idx),
+            NCCL_GIN_RESOURCE_SHARING_GPU),
+        world(ncclTeamWorld(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm))),
+        window(reinterpret_cast<ncclWindow_t>(handles.gin_window)), base(base), active(active) {}
+
     __device__ __forceinline__
     Gin(const layout::IBHandles& handles, const int64_t base, const Stream stream, const uint32_t lane = 0,
         const bool active = true):

@@ -12,6 +12,7 @@
 #include <deep_gemm/layout/mega_moe.cuh>
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
 #include <deep_gemm/impls/mega_moe_ib/proxy.cuh>
+#include <deep_gemm/impls/mega_moe_ib/pull.cuh>
 #endif
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
@@ -493,8 +494,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         __threadfence();
 #endif
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // SMs whose epilogue warps are busy at the start (posters, receivers) take no part in the pull
+        constexpr uint32_t kNumGlobalWarps = (IB::kEndPullSM - IB::kFirstPullSM) * kNumDispatchWarps;
+        uint64_t ib_tables_seen = 0;
+        for (uint32_t token_idx = (sm_idx - IB::kFirstPullSM) * kNumDispatchWarps + warp_idx;
+             sm_idx >= IB::kFirstPullSM and sm_idx < IB::kEndPullSM; token_idx += kNumGlobalWarps) {
+#else
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+#endif
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -535,6 +544,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
             uint32_t slot_idx = token_idx_in_expert;
             uint32_t token_idx_in_rank;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            ib::local_first<IB, kNumRanks>(remaining, slot_idx, stored_rank_count, ib_launch.my_node, lane_idx);
+#endif
             while (true) {
                 // Compute active count and min across all ranks
                 // NOTES: reduce within each lane first, then warp-reduce once
@@ -576,8 +588,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            const uint32_t ib_entry = ib::slot_entry<IB>(ib_launch, workspace, current_expert_idx, current_rank_in_expert_idx,
+                                                         token_idx_in_rank, ib_tables_seen);
+            const uint32_t src_token_topk_idx = ib_entry & 0xffff;
+#else
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+#endif
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -597,6 +615,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Register pull: every row, node-local or from a mirror, in one NVLink round trip
+            const float weight = ib::pull_row<IB>(
+                ib_launch, sym_buffer, buffer, current_rank_in_expert_idx, ib_entry,
+                buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<uint8_t>(),
+                buffer.l1_sf_buffer.get_base_ptr<uint32_t>() + (pool_block_idx % kNumRingBlocks) * SF_BLOCK_M
+                    + transform_sf_token_idx(token_idx_in_expert % BLOCK_M),
+                kNumSFRingTokens, lane_idx);
+#else
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
@@ -646,6 +673,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
             }
             __syncwarp();
+#endif
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -655,8 +683,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
+#if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
                 // Complete last chunk's store
                 issue_and_wait_pull_store(kNumChunks - 1);
+#endif
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 

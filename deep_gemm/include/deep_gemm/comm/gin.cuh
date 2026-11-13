@@ -84,9 +84,6 @@ struct GinOf {
                 ncclGin_None(), ncclGin_None(), ncclCoopThread(), ncclGin_None(),
                 cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsMaySkipCreditCheck);
     }
-
-    // The backend the communicator really has (trap on a mismatch with the build's)
-    __device__ __forceinline__ uint32_t backend() const { return gin._ginBackend; }
 };
 using Gin = GinOf<>;
 

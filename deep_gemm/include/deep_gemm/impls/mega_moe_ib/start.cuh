@@ -43,15 +43,6 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         DG_DEVICE_ASSERT(false);
     }
 
-    // The build was compiled for one Gin backend: the communicator must have it
-    if constexpr (G::kPlan.gin_backend != 0) {
-        if (sm_idx == G::kMetaSM and thread_idx == 0 and make_gin<G>(launch, Stream::Meta, 0).backend() != G::kPlan.gin_backend) {
-            printf("DeepGEMM IB: built for Gin backend %u, the communicator has %u\n",
-                   G::kPlan.gin_backend, make_gin<G>(launch, Stream::Meta, 0).backend());
-            DG_DEVICE_ASSERT(false);
-        }
-    }
-
     // ---- Sender ----
     if (sm_idx == G::kMetaSM) {
         if (warp_idx < 2 and lane_idx < G::kR) {

@@ -47,7 +47,8 @@ struct IBPlan {
     uint32_t rows_per_put = 128;          // token rows per forward put
     IBScaleFactors scale_factors = IBScaleFactors::BeforeRows;
     // The NCCL Gin backend of the communicator (ncclGinType_t: 2 proxy, 3 GDAKI, 4 GPI, 5 EFA GDA), known when it is
-    // created; the kernel then compiles that backend's put only and traps if the communicator disagrees.
+    // created; the kernel then compiles that backend's put only. The host must refuse a launch whose plan names
+    // another backend than the communicator's: the kernel cannot check it before its puts run.
     // 0 = unknown: every put dispatches over all backends at run time (39% of a scan build's code)
     uint32_t gin_backend = 0;
     // Tail policy, see sched::SchedulePolicy

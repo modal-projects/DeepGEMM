@@ -55,6 +55,8 @@ struct Geometry {
         static constexpr uint32_t kL1LeadCap = kPlan.l1_lead_cap;
         static constexpr uint32_t kRetirePercent = kPlan.retire_percent, kRetireAtPercent = kPlan.retire_at_percent;
         static constexpr bool kSharedL2Early = kPlan.shared_l2_early;
+        // Every cluster has start work (ib::start) in its epilogue threads: none claims a task before it is done
+        static constexpr bool kClaimAfterStart = true;
     };
     static constexpr bool kJoinEarly = kPlan.retire_percent > 0;
     DG_STATIC_ASSERT(not kJoinEarly or kNumRanks <= 32, "One warp raises the combine-ready flags of all ranks");

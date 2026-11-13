@@ -179,11 +179,16 @@ struct L2KBlockDependency {
 //                        publishes the end sentinel like a cluster that ran out of work. `retired()` tells the
 //                        kernel, which gives the freed warps other work.
 //   kSharedL2Early       The shared L2 always runs before the routed tasks (stock: only if it fits one wave).
+//   kClaimAfterStart     The scheduler makes its first claim only once the kernel completes `start_barrier`. A
+//                        claimed task belongs to its cluster, and nobody else can take it: a cluster whose
+//                        consumer threads are still busy with network work would hold the two tasks of its
+//                        schedule stages, and everything that depends on them, until that work is done.
 struct SchedulePolicy {
     static constexpr uint32_t kL1LeadCap = 0;
     static constexpr uint32_t kRetirePercent = 0;
     static constexpr uint32_t kRetireAtPercent = 100;
     static constexpr bool kSharedL2Early = false;
+    static constexpr bool kClaimAfterStart = false;
 };
 
 // State only a retiring scheduler has (empty for the stock policy)
@@ -508,7 +513,10 @@ struct MegaMoEScheduler: RetireState<(policy_t::kRetirePercent > 0)> {
         }
     }
 
-    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains) {
+    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains,
+                                 const Barrier* start_barrier = nullptr) {
+        if constexpr (policy_t::kClaimAfterStart)
+            start_barrier->wait(0);
         const auto lane_idx = ptx::get_lane_idx();
         sm_locality_domain_idx = kNumLocalityDomains == 1 ? 0u : sm_locality_domains[ptx::get_sm_idx()];
 

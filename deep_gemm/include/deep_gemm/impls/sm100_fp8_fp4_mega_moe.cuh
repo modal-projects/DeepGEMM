@@ -228,7 +228,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         task_info_t task_infos[kNumScheduleStages];
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // The barrier an IB build's scheduler waits for before its first claim (sched::SchedulePolicy::
+        // kClaimAfterStart). It takes the place of the first pull barrier, which an IB build does not have
+        // (register pull), because the hosts in service sum this struct member by member from their own copy:
+        // a member of its own would need 8 more bytes than they allocate. It becomes a separate member in the
+        // commit that removes the compat layer (every host then sizes the struct from this tree).
+        union {
+            Barrier dispatch_barriers[kNumDispatchWarps];
+            Barrier start_barrier;
+        };
+#else
         Barrier dispatch_barriers[kNumDispatchWarps];
+#endif
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
@@ -270,10 +282,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             );
         }
     } else if (warp_idx == 1) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // One arrival per CTA of the cluster, when its epilogue threads have left `ib::start`
+        if (lane_idx == 0)
+            shared_storage.start_barrier.init(2);
+#else
         // Init m-barriers for dispatch
         #pragma unroll
         for (uint32_t i = lane_idx; i < kNumDispatchWarps; i += 32)
             shared_storage.dispatch_barriers[i].init(1);
+#endif
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
         // Init GEMM barriers
@@ -1050,7 +1068,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            scheduler.mainloop(num_tokens, sm_locality_domains, &shared_storage.start_barrier);
+#else
             scheduler.mainloop(num_tokens, sm_locality_domains);
+#endif
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -1086,6 +1108,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ib::start<IB, kNumRanks, kNumSMs, kNumEpilogueThreads, kEpilogueFullBarrierIdx>(
             ib_launch, workspace, &sym_buffer, buffer.input_token_buffer.get_base_ptr<uint8_t>(), num_tokens,
             reinterpret_cast<uint32_t*>(&shared_storage.smem_d), sizeof(shared_storage.smem_d), sm_idx, epilogue_thread_idx);
+        // The cluster's scheduler may claim now (the barrier is the leader CTA's)
+        if (epilogue_thread_idx == 0)
+            shared_storage.start_barrier.arrive(0u);
 #endif
 
         // Ensure the epilogue barrier cannot run with the pull barrier

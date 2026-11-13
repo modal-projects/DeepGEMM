@@ -119,7 +119,7 @@ CUTLASS_DEVICE void await_raised(const uint64_t* flag, const uint64_t& epoch, co
 // thread `gtid` of `num_threads` takes every `num_threads`-th unit. Whatever does not fill a last unit is written
 // word by word by thread 0 (an odd number of top-k index entries leaves 8 bytes: missing them left a stale
 // index for a later launch, about one launch in 1500).
-// A diagnostics build traps on an all-ones unit that is still blank: something is re-armed that never landed.
+// A diagnostics build traps on a unit that still holds `pattern`: something is re-armed that never landed.
 template <bool kDiag>
 CUTLASS_DEVICE void rearm(void* region, const uint64_t& num_bytes, const uint4& pattern,
                           const uint32_t& gtid, const uint32_t& num_threads, const Site& site) {
@@ -127,7 +127,8 @@ CUTLASS_DEVICE void rearm(void* region, const uint64_t& num_bytes, const uint4& 
     const uint64_t num_units = num_bytes / 16;
     for (uint64_t i = gtid; i < num_units; i += num_threads) {
         if constexpr (kDiag) {
-            if (is_blank(load(units + i)) and pattern.x == kBlankWord) {
+            const uint4 v = load(units + i);
+            if (v.x == pattern.x and v.y == pattern.y and v.z == pattern.z and v.w == pattern.w) {
                 printf("DeepGEMM IB re-arm of a unit that never landed: %s rank=%u unit=%llu a=%u\n",
                        site.name, site.rank, static_cast<unsigned long long>(i), site.a);
                 DG_DEVICE_ASSERT(false and "IB re-arm before landing");

@@ -220,7 +220,7 @@ CUTLASS_DEVICE void rearm_mirrors(const Launch& launch, const uint32_t& gtid, co
         const uint64_t num_entries = static_cast<uint64_t>(num_tokens) * G::kK;
         rearm<G::kDiag>(mirror, static_cast<uint64_t>(num_tokens) * G::buf().token_bytes(), blank_unit(), gtid, num_grid_threads, launch.site("rearm rows", node));
         rearm<G::kDiag>(mirror + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), blank_unit(), gtid, num_grid_threads, launch.site("rearm sf", node));
-        rearm<false>(mirror + G::buf().off_idx(), num_entries * 8, uint4{0u, 0x80000000u, 0u, 0x80000000u}, gtid, num_grid_threads, launch.site("rearm idx", node));
+        rearm<G::kDiag>(mirror + G::buf().off_idx(), num_entries * 8, uint4{0u, 0x80000000u, 0u, 0x80000000u}, gtid, num_grid_threads, launch.site("rearm idx", node));
         rearm<G::kDiag>(mirror + G::buf().off_weights(), num_entries * 4, blank_unit(), gtid, num_grid_threads, launch.site("rearm weights", node));
         if (gtid == 0)
             *reinterpret_cast<uint64_t*>(mirror + G::buf().off_header()) = ~0ull;

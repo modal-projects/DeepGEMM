@@ -5,7 +5,7 @@
 // Ranks of one NVLink domain (a node) keep talking through load/store exactly as in the stock kernel. Ranks of
 // other nodes are reached with NCCL Gin puts from inside the kernel. Nothing here changes the stock layout:
 //   * the handles Gin needs travel behind the per-rank pointers in `sym_buffer_ptrs` (`IBHandles`), and reach the
-//     kernel as one extra argument that only IB builds have;
+//     kernel as one extra argument that only IB builds have; every build decision is one constant (`IBPlan`);
 //   * all IB state lives in a tail appended to the symmetric buffer, after the bytes the stock kernel uses
 //     (`IBBufferLayout`): first the IB signals, then one slot per node.
 // A build without DG_MEGA_MOE_IB sees none of it.
@@ -27,11 +27,32 @@ constexpr static uint32_t kNumIBExtraPtrs = 4;
 // Gin contexts the kernel spreads its puts over; Python requests as many when it creates the device communicator
 constexpr static uint32_t kNumIBGinContexts = 8;
 
+// Who builds the per-expert counts and slot tables of a remote source: the receivers, by scanning the top-k rows
+// in the proxy's mirror, or the sender, which then puts one table message per node
+enum class IBRouting : uint32_t { ReceiverScan = 0, SenderTables = 1 };
+
+// Every decision of an IB build that is not a template argument of the kernel. The host heuristics fill it
+// (`get_mega_moe_ib_plan`) and print it into the JIT source as `DG_MEGA_MOE_IB_PLAN`; the kernel reads it as a
+// constant. No header reads any other macro, so two builds differ exactly when their plans or shapes do.
+struct IBPlan {
+    uint32_t ranks_per_node = 1;          // ranks per NVLink domain; remote nodes R = ranks / ranks_per_node - 1
+    IBRouting routing = IBRouting::ReceiverScan;
+    bool first_need_order = false;        // rows are staged and posted in first-need order (needs SenderTables)
+    uint32_t key_lanes = 1;               // lanes per token in the key pass of the token sort (1, 2 or 4)
+    uint32_t scan_slices = 1;             // SMs per remote source in the receiver scan
+    // Tail policy, see sched::SchedulePolicy
+    uint32_t l1_lead_cap = 0, retire_percent = 0, retire_at_percent = 100;
+    bool shared_l2_early = false;
+    // Measurement builds
+    uint32_t diagnostics = 0;             // 1: hot polls time out with a site name, stage marks per SM
+    bool trace = false;                   // per-stage time stamps
+    bool zero_network = false;            // no puts, no re-arm, epochs not checked: the zero-network ceiling
+};
+
+// What Gin needs. Reaches the kernel as one trailing argument that only IB builds have.
 struct IBHandles {
     int64_t gin_dev_comm = 0;    // device pointer to ncclDevComm_t
     int64_t gin_window = 0;      // ncclWindow_t of the whole symmetric buffer
-    uint32_t num_lsa_ranks = 0;  // ranks per NVLink domain
-    uint32_t rank_idx = 0;
 
     IBHandles() = default;
 
@@ -48,20 +69,20 @@ struct IBHandles {
         return present(c) ? size - kNumIBExtraPtrs : size;
     }
 
+    // Ranks per NVLink domain of an IB pointer list (a compile-time constant of the kernel, through the plan)
     template <typename Container>
-    explicit IBHandles(const Container& c, const uint32_t& rank_idx): rank_idx(rank_idx) {
+    static uint32_t ranks_per_node_of(const Container& c) {
+        DG_UNIFIED_ASSERT(present(c) and c[c.size() - 1] > 0);
+        return static_cast<uint32_t>(c[c.size() - 1]);
+    }
+
+    template <typename Container>
+    explicit IBHandles(const Container& c) {
         DG_UNIFIED_ASSERT(present(c));
         const auto size = static_cast<uint32_t>(c.size());
         gin_dev_comm = c[size - 3];
         gin_window = c[size - 2];
-        num_lsa_ranks = static_cast<uint32_t>(c[size - 1]);
-        DG_UNIFIED_ASSERT(num_lsa_ranks > 0);
     }
-
-    // Node (NVLink domain) of a rank, and whether a rank is reachable from this one by load/store
-    CUTLASS_HOST_DEVICE uint32_t node_of(const uint32_t& r) const { return r / num_lsa_ranks; }
-    CUTLASS_HOST_DEVICE uint32_t my_node() const { return rank_idx / num_lsa_ranks; }
-    CUTLASS_HOST_DEVICE bool is_lsa(const uint32_t& r) const { return node_of(r) == my_node(); }
 };
 
 // IB signals: GPU-local words only (other nodes never write here; they put into the node slots).
@@ -70,6 +91,7 @@ struct alignas(128) MegaMoEIBSignals {
     static constexpr uint32_t kMaxFwdChunks = 64;    // forward-combine chunks per remote node (32 tokens each)
     static constexpr uint32_t kMaxSources = 64;      // remote source ranks
     static constexpr uint32_t kNumTableWords = 1u << 20;
+    static constexpr uint32_t kNumSorts = 3, kMaxSortParts = 8;
 
     // Launch counter of this GPU. Its parity selects which copy of every NIC-written region this launch reads,
     // so a late write of the previous launch can never be taken for a write of this one.
@@ -81,12 +103,16 @@ struct alignas(128) MegaMoEIBSignals {
     alignas(128) uint32_t fwd_item_claim[2][kMaxNodes];
     alignas(128) uint32_t fwd_chunk_done[2][kMaxNodes][kMaxFwdChunks];
     alignas(128) uint32_t fwd_chunks_returned[2][kMaxNodes];
-    // Sender: epoch once this GPU posted its meta (other SMs may then post rows)
-    alignas(128) uint64_t meta_posted;
-    // Receiver: epoch once the slot tables / the order tables of remote source k are usable on this GPU
+    // Receiver: epoch once the slot table of remote source k is complete on this GPU (read by its pull warps)
     alignas(128) uint64_t tables_ready[kMaxSources];
-    alignas(128) uint64_t order_ready[kMaxSources];
-    // Per-GPU tables and claim counters, sub-allocated by impls/mega_moe_ib/layout.cuh
+    // Proxy: epoch once the return order of remote source node n is written (read by the forward-combine)
+    alignas(128) uint64_t order_ready[kMaxNodes];
+    // Sender, first-need order: epoch once chunk c of the rows for remote node slot nr is staged
+    alignas(128) uint64_t rows_staged[kMaxNodes][kMaxFwdChunks];
+    // Multi-SM counting sorts (token sort, table builder, sliced scan): part p published its histogram row / is done
+    alignas(128) uint64_t sort_shared[kNumSorts][kMaxSortParts];
+    alignas(128) uint64_t sort_done[kNumSorts][kMaxSortParts];
+    // Per-GPU tables (return order, first-need order, sort rows), sub-allocated by impls/mega_moe_ib/geometry.cuh
     alignas(128) uint32_t tables[kNumTableWords];
 
     // Diagnostics (hang forensics and the trace build)

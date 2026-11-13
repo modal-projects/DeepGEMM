@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <string>
@@ -10,6 +11,7 @@
 #include <utility>
 
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_ib.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_jit/utils/env.hpp>
 
@@ -260,6 +262,94 @@ static MegaMoEConfig get_mega_moe_config(
         }
     }
     return config;
+}
+
+// The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
+// Derived quantities are computed here; everything fitted is in this one function, each line with the measurement
+// that set it (B300, 800G; REFACTOR_DESIGN.md section 5). `DG_MEGA_MOE_IB_PLAN="field=value,..."` overrides fields
+// for development (e.g. "routing=1,first_need_order=1,diagnostics=1").
+static layout::IBPlan get_mega_moe_ib_plan(
+    const int& num_ranks, const int& num_ranks_per_node,
+    const int& num_tokens, const int& num_topk) {
+    DG_HOST_ASSERT(num_ranks_per_node > 0 and num_ranks % num_ranks_per_node == 0 and num_ranks >= num_ranks_per_node);
+    const int num_remote_nodes = num_ranks / num_ranks_per_node - 1;
+    const int num_remote_sources = num_ranks - num_ranks_per_node;
+
+    layout::IBPlan plan;
+    plan.ranks_per_node = num_ranks_per_node;
+
+    // FITTED: the sender routes and posts rows in first-need order from 256 tokens with two or more remote nodes
+    // (EP32: -9 .. -46 us against the receiver scan at 256 .. 1024); with one remote node it loses 17-55 us
+    const bool is_ordered = num_remote_nodes >= 2 and num_tokens >= 256;
+    plan.routing = is_ordered ? layout::IBRouting::SenderTables : layout::IBRouting::ReceiverScan;
+    plan.first_need_order = is_ordered;
+
+    // DERIVED: a lane gets its loads back in one round up to ~10 in flight, so a token's top-k is split over the
+    // smallest power-of-two lane group that respects it. The 8 sort SMs give ceil(tokens / 8) tokens their lanes
+    // out of 256 epilogue threads; when the group does not fit, one lane per token (two lanes with 13 loads each
+    // measured worse than one at top-k 25).
+    constexpr int kNumSortSMs = 8, kNumMaxLoadsPerLane = 10, kNumEpilogueThreads = 256;
+    int key_lanes = 1;
+    while (key_lanes * kNumMaxLoadsPerLane < num_topk)
+        key_lanes *= 2;
+    if (key_lanes * ceil_div(num_tokens, kNumSortSMs) > kNumEpilogueThreads)
+        key_lanes = 1;
+    plan.key_lanes = is_ordered ? key_lanes : 1;
+
+    // The receiver scan of one source is split over as many SMs as 32 scan SMs allow (DERIVED), from 8192 top-k
+    // entries per source on (FITTED)
+    constexpr int kNumMaxScanSMs = 32, kNumMinSlicedEntries = 8192, kNumMaxSlices = 4;
+    plan.scan_slices = 1;
+    if (not is_ordered and num_tokens * num_topk >= kNumMinSlicedEntries)
+        plan.scan_slices = std::max(1, std::min(kNumMaxSlices, kNumMaxScanSMs / num_remote_sources));
+
+    // FITTED tail policy of the ordered regime: L1 leads L2 by at most 9 pool blocks (-7 .. -8 us), half of the
+    // clusters stop claiming at 90% of the routed L2 (-10 .. -17); both only pay with the network in the loop.
+    // Shared L2 before the routed tasks: -6 .. -7 us at 512 .. 768 with top-k 19, +9 at 1024 with top-k 25.
+    if (is_ordered) {
+        plan.l1_lead_cap = 9;
+        plan.retire_percent = 50, plan.retire_at_percent = 90;
+        plan.shared_l2_early = num_topk > 8 and num_topk < 24;
+    }
+
+    // Development overrides
+    if (const char* overrides = std::getenv("DG_MEGA_MOE_IB_PLAN"); overrides != nullptr) {
+        std::string text(overrides);
+        size_t begin = 0;
+        while (begin < text.size()) {
+            const size_t end = std::min(text.find(',', begin), text.size());
+            const size_t eq = text.find('=', begin);
+            DG_HOST_ASSERT(eq != std::string::npos and eq < end);
+            const std::string name = text.substr(begin, eq - begin);
+            const auto value = static_cast<uint32_t>(std::stoul(text.substr(eq + 1, end - eq - 1)));
+            if (name == "routing") plan.routing = static_cast<layout::IBRouting>(value);
+            else if (name == "first_need_order") plan.first_need_order = value;
+            else if (name == "key_lanes") plan.key_lanes = value;
+            else if (name == "scan_slices") plan.scan_slices = value;
+            else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
+            else if (name == "retire_percent") plan.retire_percent = value;
+            else if (name == "retire_at_percent") plan.retire_at_percent = value;
+            else if (name == "shared_l2_early") plan.shared_l2_early = value;
+            else if (name == "diagnostics") plan.diagnostics = value;
+            else if (name == "trace") plan.trace = value;
+            else if (name == "zero_network") plan.zero_network = value;
+            else DG_HOST_ASSERT(false and "Unknown DG_MEGA_MOE_IB_PLAN field");
+            begin = end + 1;
+        }
+    }
+    DG_HOST_ASSERT(not plan.first_need_order or plan.routing == layout::IBRouting::SenderTables);
+    return plan;
+}
+
+// The plan as the JIT source spells it (a designated initializer of layout::IBPlan, fields in declaration order)
+static std::string to_string(const layout::IBPlan& plan) {
+    return std::format(
+        "{{.ranks_per_node = {}, .routing = deep_gemm::layout::IBRouting({}), .first_need_order = {}, "
+        ".key_lanes = {}, .scan_slices = {}, .l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
+        ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
+        plan.ranks_per_node, static_cast<uint32_t>(plan.routing), plan.first_need_order,
+        plan.key_lanes, plan.scan_slices, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
+        plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }
 
 } // namespace deep_gemm

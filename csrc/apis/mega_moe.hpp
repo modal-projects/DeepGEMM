@@ -260,10 +260,10 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     if (layout::IBHandles::present(sym_buffer_ptrs)) {
         // Ranks of other NVLink domains: the buffer also carries the IB tail, one slot per node
-        const layout::IBHandles handles(sym_buffer_ptrs, static_cast<uint32_t>(rank_idx));
-        DG_HOST_ASSERT(num_ranks % static_cast<int>(handles.num_lsa_ranks) == 0);
+        const auto num_ranks_per_node = static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs));
+        DG_HOST_ASSERT(num_ranks % num_ranks_per_node == 0);
         const auto [tail_offset, num_tail_bytes, _0, _1, _2, _3, _4] = get_ib_tail_for_mega_moe(
-            num_required_bytes, num_ranks / static_cast<int>(handles.num_lsa_ranks), num_experts,
+            num_required_bytes, num_ranks / num_ranks_per_node, num_experts,
             num_max_tokens_per_rank, num_topk, hidden);
         DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(tail_offset + num_tail_bytes));
     }

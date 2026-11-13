@@ -25,24 +25,9 @@ static bool& mega_moe_launch_skipped() {
     return skipped;
 }
 
-// Build macros of the IB kernel. These three and DG_MEGA_MOE_IB itself are the only macros its headers read
-// (impls/mega_moe_ib/config.cuh derives everything else from the template arguments):
-//   DG_MEGA_MOE_IB_REGIME       start path, see config.cuh. Until the host picks it from (ranks, ranks per
-//                               domain, top-k, tokens), the environment variable of the same name does.
-//   DG_MEGA_MOE_IB_DIAGNOSTICS  0 removes the protocol diagnostics from the polls (default 1)
-//   DG_MEGA_MOE_IB_TRACE        1 builds the per-stage time stamps (default 0)
-static std::string get_mega_moe_ib_defines() {
-    std::string defines = "#define DG_MEGA_MOE_IB 1\n";
-    for (const char* name: {"DG_MEGA_MOE_IB_REGIME", "DG_MEGA_MOE_IB_DIAGNOSTICS", "DG_MEGA_MOE_IB_TRACE"}) {
-        const char* value = std::getenv(name);
-        if (value == nullptr or *value == '\0')
-            continue;
-        char* end = nullptr;
-        const long parsed = std::strtol(value, &end, 10);
-        DG_HOST_ASSERT(*end == '\0' and parsed >= 0);
-        defines += std::format("#define {} {}\n", name, parsed);
-    }
-    return defines;
+// What an IB build is compiled with: the switch and the plan (layout::IBPlan). Its headers read nothing else.
+static std::string get_mega_moe_ib_defines(const layout::IBPlan& plan) {
+    return std::format("#define DG_MEGA_MOE_IB 1\n#define DG_MEGA_MOE_IB_PLAN {}\n", to_string(plan));
 }
 
 static void sm100_fp8_fp4_mega_moe(
@@ -181,7 +166,9 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = get_num_sms_for_mega_moe();
 
     // Compile
-    const auto code = (is_ib ? get_mega_moe_ib_defines() : std::string()) + std::format(R"(
+    const auto ib_defines = not is_ib ? std::string() : get_mega_moe_ib_defines(get_mega_moe_ib_plan(
+        num_ranks, static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs)), num_tokens, num_topk));
+    const auto code = ib_defines + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -286,7 +273,7 @@ static void __instantiate_kernel() {{
         ib_args...);
     };
     if (is_ib)
-        launch(layout::IBHandles(sym_buffer_ptrs, rank_idx));
+        launch(layout::IBHandles(sym_buffer_ptrs));
     else
         launch();
 }

@@ -74,7 +74,12 @@ struct Geometry {
     // Buffer geometry (shared with the host) and the units of the two transfers
     // (a function: device code cannot take the address of a static constexpr object)
     CUTLASS_HOST_DEVICE static constexpr layout::IBBufferLayout buf() { return {kNumMaxTokens, kHidden, kNumTopk, kNumExperts}; }
-    static constexpr uint32_t kNumRecordsPerPut = 8;    // records per return put
+    // Records per return put. A chunk leaves with its slowest record, so small chunks reach the source earlier;
+    // every put is issued by a warp on an SM that also runs the GEMM. With more than one remote node the GEMM
+    // waits for rows and the issue time is free: 8 against 32 is -3.5 .. -7 us at 128 .. 1024 tokens (top-19 and
+    // top-25; top-6 -5 at 512, 0 at 1024). With one remote node the kernel is GEMM-bound: 8 costs +1 / +4 / +4 us
+    // at 1024 tokens (top-19 / 25 / 6), all of it before the last GEMM task.
+    static constexpr uint32_t kNumRecordsPerPut = kR > 1 ? 8 : 32;
     static constexpr uint32_t kNumRowsPerPut = 128;     // token rows per forward put
     static constexpr uint32_t kNumMaxChunks = math::constexpr_ceil_div(kNumMaxTokens, kNumRecordsPerPut);
     DG_STATIC_ASSERT(kNumMaxChunks <= layout::MegaMoEIBSignals::kMaxReturnChunks and

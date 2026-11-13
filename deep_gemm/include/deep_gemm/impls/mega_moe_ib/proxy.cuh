@@ -57,9 +57,7 @@ CUTLASS_DEVICE void reset_counters(const Launch& launch, const uint32_t& thread_
 //      forward path, for every token whether or not it has an expert on this node;
 //   2. for each of the token's experts on this node, in top-k order: poll that partial row, re-arm it, add;
 //   3. quantize, store the record into the staging buffer;
-//   4. count the item; whoever completes a chunk of kNumRecordsPerPut records puts it. (A chunk leaves with its
-//      slowest record: 8 against 32 is -4 .. -9 us at 512 / 1024 tokens with top-25, below 8 the puts' issue
-//      time costs the reducing warps more than the earlier chunks give.)
+//   4. count the item; whoever completes a chunk of kNumRecordsPerPut records puts it.
 // `first_slot` rotates the node order per warp so that all return streams advance together.
 template <typename G, typename sched_t>
 CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, const bool& is_leader, const uint32_t& lane_idx) {

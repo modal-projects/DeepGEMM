@@ -6,6 +6,8 @@
 // Reference: DeepEP deep_ep/include/deep_ep/comm/handle.cuh.
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+#include <type_traits>
+
 #include <nccl.h>
 #include <nccl_device.h>
 
@@ -29,8 +31,13 @@ enum class Stream : uint32_t { Meta = 0, Tables = 1, Rows = 2, Return = 3 };
 // Every put skips the send-queue credit check (it polls a completion queue in host memory: 1-2.5 us per post).
 // That is safe only while the operations in flight per queue pair stay below its depth: deep_gemm/mega/ib.py sets
 // NCCL_GIN_GDAKI_QP_DEPTH=1024, and one launch issues far fewer operations per context than that.
-struct Gin {
-    ncclGin gin;
+//
+// `kBackend` is the communicator's Gin backend (`layout::IBPlan::gin_backend`) or 0. `ncclGin` picks the backend at
+// run time inside every put, so each put site carries all four; with the backend known, only its put is compiled.
+template <uint32_t kBackend = 0>
+struct GinOf {
+    using gin_t = std::conditional_t<kBackend != 0, ncclGin_BackendMask<1u << kBackend>, ncclGin>;
+    gin_t gin;
     ncclTeam world;
     ncclWindow_t window;
     int64_t base;
@@ -54,14 +61,14 @@ struct Gin {
     }
 
     __device__ __forceinline__
-    Gin(const layout::IBHandles& handles, const int64_t base, const uint32_t context_idx, const bool active):
+    GinOf(const layout::IBHandles& handles, const int64_t base, const uint32_t context_idx, const bool active):
         gin(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm), static_cast<int>(context_idx),
             NCCL_GIN_RESOURCE_SHARING_GPU),
         world(ncclTeamWorld(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm))),
         window(reinterpret_cast<ncclWindow_t>(handles.gin_window)), base(base), active(active) {}
 
     __device__ __forceinline__
-    Gin(const layout::IBHandles& handles, const int64_t base, const Stream stream, const uint32_t lane = 0,
+    GinOf(const layout::IBHandles& handles, const int64_t base, const Stream stream, const uint32_t lane = 0,
         const bool active = true):
         gin(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm), static_cast<int>(context_of(stream, lane)),
             NCCL_GIN_RESOURCE_SHARING_GPU),
@@ -88,7 +95,25 @@ struct Gin {
                 ncclGin_None(), ncclGin_None(), ncclCoopThread(), ncclGin_None(),
                 cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsMaySkipCreditCheck);
     }
+
+    // The backend the communicator really has (trap on a mismatch with the build's)
+    __device__ __forceinline__ uint32_t backend() const { return gin._ginBackend; }
 };
+using Gin = GinOf<>;
 
 } // namespace deep_gemm::comm
+
+// NCCL 2.32 declares these two helpers for the all-backend type only. A put without a remote or local action, the
+// only kind this kernel issues, needs just their "none" forms (nccl_device/impl/gin__funcs.h); found by
+// argument-dependent lookup when put / putValue are instantiated for a single backend.
+template <unsigned mask, typename action_t>
+NCCL_DEVICE_INLINE constexpr ncclGinSignalDescriptor ncclGin_getSignalDescriptor(ncclGin_BackendMask<mask> const&, action_t) {
+    ncclGinSignalDescriptor desc{};
+    desc.type = NCCL_GIN_SIGNAL_TYPE_NONE;
+    return desc;
+}
+template <unsigned mask, typename action_t>
+NCCL_DEVICE_INLINE constexpr ncclGinCounter_t ncclGin_getCounterId(ncclGin_BackendMask<mask> const&, action_t) {
+    return -1u;
+}
 #endif

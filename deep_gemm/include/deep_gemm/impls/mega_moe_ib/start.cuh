@@ -43,12 +43,21 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         DG_DEVICE_ASSERT(false);
     }
 
+    // The build was compiled for one Gin backend: the communicator must have it
+    if constexpr (G::kPlan.gin_backend != 0) {
+        if (sm_idx == G::kMetaSM and thread_idx == 0 and make_gin<G>(launch, Stream::Meta, 0).backend() != G::kPlan.gin_backend) {
+            printf("DeepGEMM IB: built for Gin backend %u, the communicator has %u\n",
+                   G::kPlan.gin_backend, make_gin<G>(launch, Stream::Meta, 0).backend());
+            DG_DEVICE_ASSERT(false);
+        }
+    }
+
     // ---- Sender ----
     if (sm_idx == G::kMetaSM) {
         if (warp_idx < 2 and lane_idx < G::kR) {
             const uint32_t node = G::node_of_slot(lane_idx, launch.my_node), peer = G::counterpart(launch.rank, node);
             const auto dst = Slots<G>::outbox_mirror(launch);
-            const Gin gin = make_gin<G>(launch, Stream::Meta, lane_idx);
+            const auto gin = make_gin<G>(launch, Stream::Meta, lane_idx);
             const uint64_t num_entries = static_cast<uint64_t>(num_tokens) * G::kK;
             if (warp_idx == 0) {
                 if (num_tokens > 0)
@@ -80,7 +89,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             const uint32_t nr = (sm_idx - G::kFirstRowSM) / G::kNumRowIssuers, issuer = (sm_idx - G::kFirstRowSM) % G::kNumRowIssuers;
             const uint32_t node = G::node_of_slot(nr, launch.my_node), peer = G::counterpart(launch.rank, node);
             const auto dst = Slots<G>::outbox_mirror(launch);
-            const Gin gin = make_gin<G>(launch, Stream::Rows, nr, issuer);
+            const auto gin = make_gin<G>(launch, Stream::Rows, nr, issuer);
             const auto put_scale_factors = [&](const layout::IBScaleFactors& when) {
                 if (issuer == 0 and G::kPlan.scale_factors == when)
                     gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);

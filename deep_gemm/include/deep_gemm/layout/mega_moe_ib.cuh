@@ -47,6 +47,10 @@ struct IBPlan {
     uint32_t rows_per_put = 128;          // token rows per forward put
     bool contexts_per_node = false;       // Gin contexts by (stream, remote node) instead of by stream (comm/gin.cuh)
     IBScaleFactors scale_factors = IBScaleFactors::BeforeRows;
+    // The NCCL Gin backend of the communicator (ncclGinType_t: 2 proxy, 3 GDAKI, 4 GPI, 5 EFA GDA), known when it is
+    // created; the kernel then compiles that backend's put only and traps if the communicator disagrees.
+    // 0 = unknown: every put dispatches over all backends at run time (39% of a scan build's code)
+    uint32_t gin_backend = 0;
     // Tail policy, see sched::SchedulePolicy
     uint32_t l1_lead_cap = 0, retire_percent = 0, retire_at_percent = 100;
     bool shared_l2_early = false;

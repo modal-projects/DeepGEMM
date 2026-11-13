@@ -1325,6 +1325,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr uint32_t kIBMSB = 0;
 #endif
+    // DG_MEGA_MOE_IB_SST_GTAB=1 (start, SST): the per-source "slot table ready" flag ib_o_tab_ready[k] is written by this GPU's
+    // receive SM (after a device-scope fence over its table stores, all local memory) and read only by this GPU's pull warps,
+    // so GPU-scope release / acquire suffices (same argument as GPU_ACQ for the counts); the system-scope forms sit on the path
+    // to the first routed L1 (one release per source: ~5 us traced at MegaSeek 512; one acquire per source and pulling warp).
+#if defined(DG_MEGA_MOE_IB_SST_GTAB) and DG_MEGA_MOE_IB_SST_GTAB
+    constexpr bool kIBSSTGTab = true;
+#else
+    constexpr bool kIBSSTGTab = false;
+#endif
     // DG_MEGA_MOE_IB_PUT_FN=1: the SST / ORD blocks issue their puts through ONE shared non-inlined function (comm::gin_put_fn,
     // scalars and pointers by value) instead of inlining the Gin put at each site
 #if defined(DG_MEGA_MOE_IB_PUT_FN) and DG_MEGA_MOE_IB_PUT_FN
@@ -3355,8 +3364,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (is_remote(current_rank_in_expert_idx)) {
                     const uint32_t k_t = ib_k_of_rank(current_rank_in_expert_idx);
                     if (not ((ib_order_seen >> k_t) & 1ull)) {
+                        if constexpr (kIBSSTGTab) {
+                            IB_POLL(ptx::ld_acq_gpu(&workspace.signals->ib_o_tab_ready[k_t]) != ib_epoch, (void) 0, "tab_ready", k_t, 0);
+                        } else {
                         IB_POLL(ptx::ld_acq_sys(&workspace.signals->ib_o_tab_ready[k_t]) != ib_epoch,
                                 (void) 0, "tab_ready", k_t, 0);
+                        }
                         ib_order_seen |= 1ull << k_t;
                     }
                 }
@@ -4414,6 +4427,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr bool kOrdContig = false;
 #endif
                 const uint32_t ord_per = (num_tokens + kMx - 1) / kMx;  // tokens per SM (<= kOT * threads)
+                // DG_MEGA_MOE_IB_ORD_KEYP=P (start; P = 2, 4 or 8, 1 = 4; needs ORD_MSO + ORD_CONTIG + SST_FAST): the key pass uses P lanes
+                // per token (aligned lane groups inside a warp) instead of one, each lane loading every P-th top-k entry of the token; the
+                // group's per-node minima are combined with warp shuffles and lane 0 of the group then owns the token exactly as the
+                // single lane did. Why: one lane issuing all top-k loads of a token (19 / 25) gets them back after ~11 us this early in
+                // the kernel (traced at MegaSeek 512: issued 0.2, returned 11.6 on every order SM), while with <= 10 loads per lane they
+                // are back at ~3.8; the first ordered x piece and the SST put both wait for this pass. Same keys, positions and tables.
+                // ONE form per build (a run-time choice between two key loops cost ~+5 us on GigaSeek with the knob idle). The lane
+                // groups need P x (tokens per order SM) <= epilogue threads: with 8 order SMs and 256 epilogue threads that is P = 4 up
+                // to 512 tokens and P = 2 up to 1024; a launch that does not fit traps.
+#if defined(DG_MEGA_MOE_IB_ORD_KEYP) and DG_MEGA_MOE_IB_ORD_KEYP
+                DG_STATIC_ASSERT(kOrdContig and kIBSSTFast and kIBMSO > 0, "ORD_KEYP needs ORD_MSO + ORD_CONTIG + SST_FAST");
+                constexpr uint32_t kKeyP = DG_MEGA_MOE_IB_ORD_KEYP >= 2 ? static_cast<uint32_t>(DG_MEGA_MOE_IB_ORD_KEYP) : 4u;
+                DG_STATIC_ASSERT(kKeyP == 2 or kKeyP == 4 or kKeyP == 8, "ORD_KEYP: 1 (= 4 lanes per token), 2, 4 or 8");
+                constexpr bool kp_on = true;
+                if (epilogue_thread_idx == 0 and ord_per * kKeyP > kNumEpilogueThreads) {
+                    printf("DeepGEMM IB ORD_KEYP: %u tokens per order SM x %u lanes do not fit %u epilogue threads\n", ord_per, kKeyP, kNumEpilogueThreads);
+                    asm volatile("trap;");
+                }
+#else
+                constexpr uint32_t kKeyP = 1;
+                constexpr bool kp_on = false;
+#endif
+                constexpr uint32_t kKeyPL = (kNumTopk + kKeyP - 1) / kKeyP;  // loads per lane
                 auto* const oh = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
                 constexpr uint32_t kOWStride = 3 * kOK;  // FAST: per-warp buckets [warp][<= 3 remote nodes][key] after oh
                 DG_STATIC_ASSERT(not kIBSSTFast or (kNumEpilogueWarps + 2 + (kIBMSO > 0 ? 2u : 0u)) * kOWStride * 2 + 4 <= sizeof(SharedStorage::smem_d), "ORD per-warp buckets in smem_d");
@@ -4433,9 +4469,47 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t j = 0; j < kOT; ++ j) {
                     // DG_MEGA_MOE_IB_ORD_CONTIG=1: SM m owns a CONTIGUOUS token range (its 19 x 8 B idx rows are adjacent lines) instead of
                     // every kMx-th token (each SM then touched every line of the idx region for 1/8 of its entries: keyed at 14 us)
-                    const uint32_t t = kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
+                    // ORD_KEYP: token slot of this lane group; only lane 0 of the group owns the token afterwards
+                    const uint32_t kp_slot = epilogue_thread_idx / kKeyP;
+                    const uint32_t kp_tg = j == 0 and kp_slot < ord_per ? mso_m * ord_per + kp_slot : 0xffffffffu;
+                    const uint32_t t = kp_on ? (lane_idx % kKeyP == 0 ? kp_tg : 0xffffffffu) :
+                                       kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
                                                   : (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
                     uint32_t packed = kNumExpertsPerRank * 0x01010101u;
+                    if constexpr (kp_on) {
+                        if (kp_tg < num_tokens) {
+                            uint32_t pv[kKeyPL];
+                            #pragma unroll
+                            for (uint32_t u = 0; u < kKeyPL; ++ u) {
+                                const uint32_t k = lane_idx % kKeyP + u * kKeyP;
+                                pv[u] = k < kNumTopk ? __ldcg(reinterpret_cast<const uint32_t*>(in_idx) + 2 * (kp_tg * kNumTopk + k)) : 0xffffffffu;
+                            }
+                            #pragma unroll
+                            for (uint32_t u = 0; u < kKeyPL; ++ u) {
+                                const int e = static_cast<int>(pv[u]);
+                                const uint32_t eu = static_cast<uint32_t>(e);
+                                const uint32_t o_n = (eu >= node_experts ? 1u : 0u) + (eu >= 2 * node_experts ? 1u : 0u) + (eu >= 3 * node_experts ? 1u : 0u);
+                                if (e >= 0 and o_n != ib_my_node) {
+                                    const uint32_t sh = 8 * ib_nr_of_node(o_n);
+                                    const uint32_t le = eu % kNumExpertsPerRank;
+                                    if (le < ((packed >> sh) & 0xffu))
+                                        packed = (packed & ~(0xffu << sh)) | (le << sh);
+                                }
+                            }
+                        }
+                        // per-node minimum over the kKeyP lanes of the group (every lane of the warp shuffles; groups are lane-aligned)
+                        #pragma unroll
+                        for (uint32_t sx = 1; sx < kKeyP; sx <<= 1) {
+                            const uint32_t other = __shfl_xor_sync(0xffffffffu, packed, sx);
+                            uint32_t mn = 0;
+                            #pragma unroll
+                            for (uint32_t f = 0; f < 4; ++ f) {
+                                const uint32_t a = (packed >> (8 * f)) & 0xffu, b = (other >> (8 * f)) & 0xffu;
+                                mn |= (a < b ? a : b) << (8 * f);
+                            }
+                            packed = mn;
+                        }
+                    } else
                     if (t < num_tokens) {
                         uint32_t v[kNumTopk];
                         #pragma unroll
@@ -4518,7 +4592,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t j = 0; j < kOT; ++ j) {
                     // DG_MEGA_MOE_IB_ORD_CONTIG=1: SM m owns a CONTIGUOUS token range (its 19 x 8 B idx rows are adjacent lines) instead of
                     // every kMx-th token (each SM then touched every line of the idx region for 1/8 of its entries: keyed at 14 us)
-                    const uint32_t t = kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
+                    const uint32_t kp_slot2 = epilogue_thread_idx / kKeyP;
+                    const uint32_t t = kp_on ? (j == 0 and lane_idx % kKeyP == 0 and kp_slot2 < ord_per ? mso_m * ord_per + kp_slot2 : 0xffffffffu) :
+                                       kOrdContig ? (j * kNumEpilogueThreads + epilogue_thread_idx < ord_per ? mso_m * ord_per + j * kNumEpilogueThreads + epilogue_thread_idx : 0xffffffffu)
                                                   : (j * kNumEpilogueThreads + epilogue_thread_idx) * kMx + (kIBMSO > 0 ? mso_m : 0u);
                     if (t < num_tokens) {
                         if constexpr (not kIBSSTFast) {
@@ -4957,7 +5033,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (epilogue_thread_idx == 0)
                         ptx::st_rel(ib_xo_flag + 250, ib_epoch);
                 }
-                if (not kIBSSTRPut and msb_s == 0 and epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes) {
+                const bool sst_put_me = epilogue_warp_idx == 0 and lane_idx + 1 < ib_num_nodes;  // one lane per remote node
+                if (not kIBSSTRPut and msb_s == 0 and sst_put_me) {
                     const uint32_t nr = lane_idx, n = ib_node_of_slot(nr);
                     const uint32_t a = sst_nstart[n], b = sst_nstart[n + 1];
 #if defined(DG_MEGA_MOE_IB_SST_CTX) and DG_MEGA_MOE_IB_SST_CTX == 1
@@ -5763,8 +5840,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     __threadfence();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (epilogue_thread_idx == 0)
-                        ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
+                    if (epilogue_thread_idx == 0) {
+                        if constexpr (kIBSSTGTab) ptx::st_rel(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
+                        else ptx::st_rel_sys(&workspace.signals->ib_o_tab_ready[k], ib_epoch);
+                    }
                     IB_TRACE_MAX(32, epilogue_thread_idx == 0);  // tables done
                     DG_IB_OUTLINE_END
                 }

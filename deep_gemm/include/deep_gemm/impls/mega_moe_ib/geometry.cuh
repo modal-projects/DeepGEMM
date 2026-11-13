@@ -35,6 +35,7 @@ struct Geometry {
     // Zero-network measurement: the first two launches fill both buffer sets over the real network; from the
     // third on nothing is put, nothing the NIC wrote is re-armed and epochs in landed headers are not checked
     // (valid only for identical inputs every launch)
+    static constexpr bool kRearm = not kPlan.zero_network;
     CUTLASS_DEVICE static bool is_network_live(const uint64_t& epoch) { return not (kPlan.zero_network and epoch > 2); }
 
     // Topology
@@ -85,13 +86,24 @@ struct Geometry {
     static constexpr uint32_t kEndPullSM = kSenderTables ? kFirstProxySM : kFirstReceiverSM;
     DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs, "Not enough SMs for the start roles");
 
+    // The remote source a receiver SM handles: the last kR SMs take this GPU's counterparts (node slot order from
+    // the end), the SMs before them the other ranks of the remote nodes
+    CUTLASS_DEVICE static uint32_t source_of_receiver(const uint32_t& sm_idx, const uint32_t& my_rank) {
+        const uint32_t rev = kNumSMs - 1 - sm_idx, my_idx = my_rank % kLsa;
+        if (rev < kR)
+            return rev * kLsa + my_idx;
+        const uint32_t q = rev - kR, j = q % (kLsa - 1);
+        return (q / (kLsa - 1)) * kLsa + (j < my_idx ? j : j + 1);
+    }
+
     // Tables of this GPU inside `MegaMoEIBSignals::tables`, [remote node slot][token] each
     static constexpr uint32_t kTableT = kNumMaxTokens;
     static constexpr uint32_t kOffReturnPerm = 0;                       // proxy: return position -> token
     static constexpr uint32_t kOffReturnPos = kOffReturnPerm + kR * kTableT;  // source: token -> return position
     static constexpr uint32_t kOffNeedPos = kOffReturnPos + kR * kTableT;     // source: token -> mirror row
     static constexpr uint32_t kOffNeedInv = kOffNeedPos + kR * kTableT;       // source: mirror row -> token
-    static constexpr uint32_t kOffSortRows = kOffNeedInv + kR * kTableT;
+    static constexpr uint32_t kOffSortKeys = kOffNeedInv + kR * kTableT;      // sort keys, [SM][token]
+    static constexpr uint32_t kOffSortRows = kOffSortKeys + kNumSMs * kTableT;
     DG_STATIC_ASSERT(kOffSortRows <= layout::MegaMoEIBSignals::kNumTableWords / 2, "IB tables do not fit");
 };
 

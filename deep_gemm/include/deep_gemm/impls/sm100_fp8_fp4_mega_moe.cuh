@@ -13,6 +13,8 @@
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
 #include <deep_gemm/impls/mega_moe_ib/proxy.cuh>
 #include <deep_gemm/impls/mega_moe_ib/pull.cuh>
+#include <deep_gemm/impls/mega_moe_ib/start.cuh>
+#include <deep_gemm/impls/mega_moe_ib/combine.cuh>
 #endif
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
@@ -346,7 +348,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    // The dispatch warps also run the proxy sum, whose items need the registers
+    constexpr bool kUseMoreEpilogueRegisters = false;
+#else
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
+#endif
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;
@@ -699,7 +706,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // Idle until the cleanup: sum the partial results of the tokens this GPU is the proxy of
         ib::reduce<IB, decltype(scheduler)>(ib_launch, (warp_idx * kNumSMs + sm_idx) % cute::max(IB::kR, 1u),
-                                            sm_idx == 0 and warp_idx == 0, lane_idx);
+                                            sm_idx == 0 and thread_idx == 0, lane_idx);
 #endif
 
         // Clean workspace for the next usage, and also do cumulative stats
@@ -1067,6 +1074,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(WG_BLOCK_M % STORE_BLOCK_M_L1 == 0 and WG_BLOCK_M % STORE_BLOCK_M_L2 == 0, "Invalid warpgroup block M");
         DG_STATIC_ASSERT(STORE_BLOCK_M_L1 % ATOM_M == 0 and STORE_BLOCK_M_L2 % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Before the first task: post this rank's inputs to the other nodes and receive theirs
+        ib::start<IB, kNumRanks, kNumSMs, kNumEpilogueThreads, kEpilogueFullBarrierIdx>(
+            ib_launch, workspace, &sym_buffer, buffer.input_token_buffer.get_base_ptr<uint8_t>(), num_tokens,
+            reinterpret_cast<uint32_t*>(&shared_storage.smem_d), sizeof(shared_storage.smem_d), sm_idx, epilogue_thread_idx);
+#endif
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1539,9 +1553,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Experts on other nodes are not slots of this loop: their results come back as records (below)
+            const int stored_topk_slot_idx = ib::local_slot<IB>(ib_launch, lane_idx < kNumTopk ?
+                static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
+                (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1), lane_idx);
+#else
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
+#endif
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             // Wait for the ranks of the selected experts to finish their L2 writes
@@ -1600,6 +1621,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 load_stage_idx ^= 1;
             }
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // The local part is done: park the fp32 sums, the records are added in a second loop
+            ib::park<kNumUint4PerLane>(reduced, ib::Slots<IB>::combine_scratch(ib_launch) + static_cast<int64_t>(token_idx) * kHidden
+                                                + chunk_idx * (kHidden / kNumChunks), lane_idx);
+#else
             // Cast
             #pragma unroll
             for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
@@ -1628,7 +1654,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cute::tma_store_arrive();
             }
             __syncwarp();
+#endif
         }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Second loop of the combine: add one record per remote node to the parked sums and store
+        ib::add_records<IB, kNumChunks, kNumUint4PerLane>(
+            ib_launch, buffer.input_topk_idx_buffer.get_base_ptr<int64_t>(), y, num_tokens, combine_store_buffer,
+            epilogue_warp_idx * kNumSMs + sm_idx, kNumSMs * kNumEpilogueWarps, lane_idx);
+        if (sm_idx == 0 and num_tokens == 0)
+            ib::await_empty_returns<IB>(ib_launch, epilogue_thread_idx);
+#endif
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

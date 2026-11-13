@@ -208,7 +208,7 @@ CUTLASS_DEVICE void rearm_mirrors(const Launch& launch, const uint32_t& gtid, co
             });
         }
         sync_scope();
-        if (not launch.network)
+        if constexpr (not G::kRearm)
             continue;
         const auto mirror = Slots<G>::mirror(launch, node);
         const uint64_t num_entries = static_cast<uint64_t>(num_tokens) * G::kK;

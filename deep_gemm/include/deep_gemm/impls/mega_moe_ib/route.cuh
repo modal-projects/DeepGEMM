@@ -185,6 +185,7 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
                 G::counterpart(launch.rank, node));
         }
         __syncwarp();
+        trace::stamp<G>(launch, trace::kTablesPosted, thread_idx == 0);
     }
 }
 

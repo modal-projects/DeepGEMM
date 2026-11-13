@@ -97,9 +97,6 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #ifndef DG_MEGA_MOE_IBP_KEY_LANES
 #define DG_MEGA_MOE_IBP_KEY_LANES 1
 #endif
-#ifndef DG_MEGA_MOE_IBP_SCAN_SLICES
-#define DG_MEGA_MOE_IBP_SCAN_SLICES 1
-#endif
 #ifndef DG_MEGA_MOE_IBP_ROW_ISSUERS
 #define DG_MEGA_MOE_IBP_ROW_ISSUERS 1
 #endif
@@ -108,6 +105,9 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #endif
 #ifndef DG_MEGA_MOE_IBP_CONTEXTS_PER_NODE
 #define DG_MEGA_MOE_IBP_CONTEXTS_PER_NODE 0
+#endif
+#ifndef DG_MEGA_MOE_IBP_SCALE_FACTORS
+#define DG_MEGA_MOE_IBP_SCALE_FACTORS 0
 #endif
 #ifndef DG_MEGA_MOE_IBP_L1_LEAD_CAP
 #define DG_MEGA_MOE_IBP_L1_LEAD_CAP 0
@@ -143,9 +143,9 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #define DG_MEGA_MOE_IB_PLAN { \
     .ranks_per_node = DG_MEGA_MOE_IBP_RANKS_PER_NODE, .routing = deep_gemm::layout::IBRouting(DG_MEGA_MOE_IBP_ROUTING), \
     .first_need_order = DG_MEGA_MOE_IBP_FIRST_NEED_ORDER != 0, .key_lanes = DG_MEGA_MOE_IBP_KEY_LANES, \
-    .scan_slices = DG_MEGA_MOE_IBP_SCAN_SLICES, .row_issuers = DG_MEGA_MOE_IBP_ROW_ISSUERS, \
+    .row_issuers = DG_MEGA_MOE_IBP_ROW_ISSUERS, \
     .rows_per_put = DG_MEGA_MOE_IBP_ROWS_PER_PUT, .contexts_per_node = DG_MEGA_MOE_IBP_CONTEXTS_PER_NODE != 0, \
-    .l1_lead_cap = DG_MEGA_MOE_IBP_L1_LEAD_CAP, \
+    .scale_factors = deep_gemm::layout::IBScaleFactors(DG_MEGA_MOE_IBP_SCALE_FACTORS), .l1_lead_cap = DG_MEGA_MOE_IBP_L1_LEAD_CAP, \
     .retire_percent = DG_MEGA_MOE_IBP_RETIRE_PERCENT, .retire_at_percent = DG_MEGA_MOE_IBP_RETIRE_AT_PERCENT, \
     .shared_l2_early = DG_MEGA_MOE_IBP_SHARED_L2_EARLY != 0, .diagnostics = DG_MEGA_MOE_IBP_DIAGNOSTICS, \
     .trace = DG_MEGA_MOE_IBP_TRACE != 0, .zero_network = DG_MEGA_MOE_IBP_ZERO_NETWORK != 0}

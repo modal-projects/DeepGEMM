@@ -82,7 +82,7 @@ struct Geometry {
     // no part in the pull rotation.
     static constexpr uint32_t kMetaSM = 0;
     static constexpr uint32_t kFirstRowSM = 1;
-    static constexpr uint32_t kNumReceiverSMs = kNumRemoteSources * (kSenderTables ? 1 : kPlan.scan_slices);
+    static constexpr uint32_t kNumReceiverSMs = kNumRemoteSources;
     static constexpr uint32_t kFirstReceiverSM = kNumSMs - kNumReceiverSMs;
     static constexpr uint32_t kFirstProxySM = kNumSMs - kR;
     static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR * kNumRowIssuers;

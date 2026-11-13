@@ -32,6 +32,10 @@ constexpr static uint32_t kNumIBGinContexts = 8;
 // in the proxy's mirror, or the sender, which then puts one table message per node
 enum class IBRouting : uint32_t { ReceiverScan = 0, SenderTables = 1 };
 
+// Where a source's scale factors travel: on the Rows stream in front of the token rows, on the Rows stream behind
+// them, or on the Meta stream (behind the top-k indices), where they neither wait for the rows nor delay them
+enum class IBScaleFactors : uint32_t { BeforeRows = 0, AfterRows = 1, WithMeta = 2 };
+
 // Every decision of an IB build that is not a template argument of the kernel. The host heuristics fill it
 // (`get_mega_moe_ib_plan`) and print it into the JIT source as `DG_MEGA_MOE_IB_PLAN`; the kernel reads it as a
 // constant. No header reads any other macro, so two builds differ exactly when their plans or shapes do.
@@ -40,10 +44,10 @@ struct IBPlan {
     IBRouting routing = IBRouting::ReceiverScan;
     bool first_need_order = false;        // rows are staged and posted in first-need order (needs SenderTables)
     uint32_t key_lanes = 1;               // lanes per token in the key pass of the token sort (1, 2 or 4)
-    uint32_t scan_slices = 1;             // SMs per remote source in the receiver scan
     uint32_t row_issuers = 1;             // threads (one SM each) that post a remote node's token rows; each keeps its puts in order
     uint32_t rows_per_put = 128;          // token rows per forward put
     bool contexts_per_node = false;       // Gin contexts by (stream, remote node) instead of by stream (comm/gin.cuh)
+    IBScaleFactors scale_factors = IBScaleFactors::BeforeRows;
     // Tail policy, see sched::SchedulePolicy
     uint32_t l1_lead_cap = 0, retire_percent = 0, retire_at_percent = 100;
     bool shared_l2_early = false;

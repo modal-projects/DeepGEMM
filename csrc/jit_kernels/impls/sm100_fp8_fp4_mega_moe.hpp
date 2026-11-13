@@ -165,11 +165,13 @@ static void sm100_fp8_fp4_mega_moe(
 
     const auto num_sms = get_num_sms_for_mega_moe();
 
-    // Compile
+    // Compile. The source of the kernel for `tokens` tokens on this rank: the token count picks the tile (`c`) and,
+    // across NVLink domains, the plan
+    const auto make_code = [&](const MegaMoEConfig& c, const int& tokens) {
     const auto ib_defines = not is_ib ? std::string() : get_mega_moe_ib_defines(get_mega_moe_ib_plan(
-        num_ranks, static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs)), num_tokens, num_topk,
+        num_ranks, static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs)), tokens, num_topk,
         static_cast<int>(layout::IBHandles::gin_backend_of(sym_buffer_ptrs))));
-    const auto code = ib_defines + std::format(R"(
+    return ib_defines + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -198,18 +200,20 @@ static void __instantiate_kernel() {{
         hidden, intermediate_hidden,
         num_experts, num_shared_experts,
         num_topk,
-        config.block_m, config.block_n, config.block_k,
-        config.store_block_m_l1, config.store_block_m_l2,
-        config.sf_block_m, config.sf_block_n,
-        config.num_ring_tokens,
-        config.num_sf_ring_tokens,
-        config.num_stages,
-        config.num_bytes_per_pull,
-        config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
+        c.block_m, c.block_n, c.block_k,
+        c.store_block_m_l1, c.store_block_m_l2,
+        c.sf_block_m, c.sf_block_n,
+        c.num_ring_tokens,
+        c.num_sf_ring_tokens,
+        c.num_stages,
+        c.num_bytes_per_pull,
+        c.num_dispatch_threads, c.num_non_epilogue_threads, c.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type()));
+    };
+    const auto code = make_code(config, num_tokens);
 
     // DG_DEV_COMPILE_ONLY=<file> (development servers precompile variants in parallel): compile into the JIT
     // disk cache, write the cache entry's path to <file>, and return without loading or launching
@@ -224,6 +228,12 @@ static void __instantiate_kernel() {{
     // this process has not launched (and the stream is not capturing), nothing is launched and
     // mega_moe_launch_skipped() is set: the Python wrapper barriers the group and calls again.
     // Steady state: one hash-set lookup. DG_MOE_NO_RENDEZVOUS=1 disables it.
+    // The rendezvous is a group barrier, so every rank must enter it in the SAME call. A rank whose token count
+    // crosses a tile class (or a plan boundary) alone would meet a new kernel object alone and wait in the barrier
+    // while its peers, already launched, wait for it in the kernel. So the first time, every kernel this buffer
+    // can launch (any token count up to the buffer's maximum) is compiled and marked: one rendezvous per buffer
+    // shape, and no rank meets a new kernel object afterwards. Costs first-call time only (one compile per tile
+    // class and plan; the JIT disk cache keeps them).
     mega_moe_launch_skipped() = false;
     if (num_ranks > 1) {
         const char* no_rendezvous = std::getenv("DG_MOE_NO_RENDEZVOUS");
@@ -232,6 +242,16 @@ static void __instantiate_kernel() {{
             cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
             DG_CUDA_RUNTIME_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream().stream(), &capture_status));
             launched_kernels.insert(kernel.get());
+            std::unordered_set<std::string> family{code};
+            for (int tokens = 0; tokens <= num_max_tokens_per_rank; ++ tokens) {
+                const auto other = make_code(get_mega_moe_config(
+                    num_ranks, num_experts, num_experts_per_rank,
+                    num_max_tokens_per_rank, tokens, num_topk, hidden, intermediate_hidden,
+                    num_ring_tokens, num_sf_ring_tokens,
+                    MmaKind::MXFP8FP4), tokens);
+                if (family.insert(other).second)
+                    launched_kernels.insert(jit->compile("sm100_fp8_fp4_mega_moe", other).get());
+            }
             if (capture_status == cudaStreamCaptureStatusNone) {
                 mega_moe_launch_skipped() = true;
                 return;

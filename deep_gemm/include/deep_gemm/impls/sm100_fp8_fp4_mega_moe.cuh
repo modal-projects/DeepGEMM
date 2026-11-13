@@ -1449,6 +1449,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Local to the proxy: record format, positions and readiness are unchanged (the source polls every record byte).
         // Dead control: DG_MEGA_MOE_IB_FWD_TOK_MAX=1 (compiled in, never taken for >= 2 tokens).
         bool tok_skip = false;
+        // With DG_MEGA_MOE_IB_LSA the node count is a constant: one copy of the body per remote node (DG_MEGA_MOE_IB_LSA_UNROLL=1)
+        // instead of a loop over them (the run-time form is always unrolled, to kNumRanks - 1 copies)
+#if defined(DG_MEGA_MOE_IB_LSA) and DG_MEGA_MOE_IB_LSA and defined(DG_MEGA_MOE_IB_LSA_UNROLL) and DG_MEGA_MOE_IB_LSA_UNROLL
+        #pragma unroll
+#endif
         for (uint32_t nr_it = 0; fi_on ? fi_g < fi_R * fi_max : nr_it + 1 < ib_num_nodes; ++ nr_it) {
             uint32_t nr = fi_on ? fi_g % fi_R : nr_it + rot0;
             if (kIBFwdRotate and nr >= fi_R) nr -= fi_R;

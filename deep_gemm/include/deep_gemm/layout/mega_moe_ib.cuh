@@ -45,7 +45,6 @@ struct IBPlan {
     bool first_need_order = false;        // rows are staged and posted in first-need order (needs SenderTables)
     uint32_t row_issuers = 1;             // threads (one SM each) that post a remote node's token rows; each keeps its puts in order
     uint32_t rows_per_put = 128;          // token rows per forward put
-    bool contexts_per_node = false;       // Gin contexts by (stream, remote node) instead of by stream (comm/gin.cuh)
     IBScaleFactors scale_factors = IBScaleFactors::BeforeRows;
     // The NCCL Gin backend of the communicator (ncclGinType_t: 2 proxy, 3 GDAKI, 4 GPI, 5 EFA GDA), known when it is
     // created; the kernel then compiles that backend's put only and traps if the communicator disagrees.

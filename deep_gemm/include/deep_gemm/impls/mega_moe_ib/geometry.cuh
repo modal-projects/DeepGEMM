@@ -159,13 +159,10 @@ struct Launch {
     }
 };
 
-// The Gin context of a put, by the plan's assignment (comm/gin.cuh)
+// The Gin context of a put: one per stream (comm/gin.cuh); return puts rotate over theirs by chunk and node
 template <typename G>
 CUTLASS_DEVICE comm::GinOf<G::kPlan.gin_backend> make_gin(const Launch& launch, const comm::Stream& stream, const uint32_t& nr, const uint32_t& lane = 0) {
-    if constexpr (G::kPlan.contexts_per_node)
-        return comm::GinOf<G::kPlan.gin_backend>(launch.handles, launch.base, comm::Gin::context_of(stream, lane, nr, G::kR), launch.network);
-    else
-        return comm::GinOf<G::kPlan.gin_backend>(launch.handles, launch.base, comm::Gin::context_of(stream, stream == comm::Stream::Return ? lane + nr : lane), launch.network);
+    return comm::GinOf<G::kPlan.gin_backend>(launch.handles, launch.base, comm::Gin::context_of(stream, stream == comm::Stream::Return ? lane + nr : lane), launch.network);
 }
 
 // Node slot `node` of this GPU's tail, and the regions in it (see layout::IBBufferLayout)

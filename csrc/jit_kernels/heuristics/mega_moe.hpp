@@ -267,6 +267,18 @@ static MegaMoEConfig get_mega_moe_config(
     return config;
 }
 
+// A development switch of the Mega MoE host code (plan overrides, trace and zero-network builds, compile-only
+// calls, no rendezvous: what the development servers set per measurement). It acts only in a process that
+// asked for development behaviour with DG_MEGA_MOE_DEV=1; anywhere else a set switch is refused, by name: a
+// serving process must not send nothing (zero network) or skip its launches because of a stray variable.
+static const char* get_mega_moe_dev_env(const std::string& name) {
+    const char* value = std::getenv(name.c_str());
+    const char* dev = std::getenv("DG_MEGA_MOE_DEV");
+    if (value != nullptr and (dev == nullptr or std::string_view(dev) != "1"))
+        DG_HOST_UNREACHABLE(std::format("{} is a Mega MoE development switch: it needs DG_MEGA_MOE_DEV=1", name));
+    return value;
+}
+
 // The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
 // One physical quantity decides the regime: how long the token rows of a rank are on the wire,
 //   row_us = remote nodes x tokens x hidden bytes / link rate per GPU.
@@ -312,16 +324,20 @@ static layout::IBPlan get_mega_moe_ib_plan(
         plan.shared_l2_early = plan.retire_percent > 0;
     }
 
-    // Development overrides, one variable per field: DG_MEGA_MOE_IBP_<FIELD>=value (what the development servers
-    // pass per arm; a name that is no field is refused: a misspelt arm must not run the default plan). Their
-    // switch names for a trace and a zero-network run also apply.
+    // Development overrides (DG_MEGA_MOE_DEV=1), one variable per field: DG_MEGA_MOE_IBP_<FIELD>=value (what the
+    // development servers pass per arm; a name that is no field is refused: a misspelt arm must not run the
+    // default plan). Their switch names for a trace and a zero-network run also apply.
     for (char** entry = environ; *entry != nullptr; ++ entry) {
         constexpr std::string_view kPrefix = "DG_MEGA_MOE_IBP_";
         const std::string_view variable(*entry);
         if (not variable.starts_with(kPrefix) or variable.find('=') == std::string_view::npos)
             continue;
         const auto name = variable.substr(kPrefix.size(), variable.find('=') - kPrefix.size());
-        const auto value = static_cast<uint32_t>(std::stoul(std::string(variable.substr(variable.find('=') + 1))));
+        get_mega_moe_dev_env(std::string(variable.substr(0, variable.find('='))));
+        const auto digits = std::string(variable.substr(variable.find('=') + 1));
+        if (digits.empty() or digits.find_first_not_of("0123456789") != std::string::npos)
+            DG_HOST_UNREACHABLE(std::format("Mega MoE IB plan override without a number: {}", variable));
+        const auto value = static_cast<uint32_t>(std::stoul(digits));
         if (name == "ORDERED") plan.ordered = value;
         else if (name == "GIN_BACKEND") plan.gin_backend = value;
         else if (name == "L1_LEAD_CAP") plan.l1_lead_cap = value;
@@ -333,9 +349,9 @@ static layout::IBPlan get_mega_moe_ib_plan(
         else if (name == "ZERO_NETWORK") plan.zero_network = value;
         else DG_HOST_UNREACHABLE(std::format("Unknown Mega MoE IB plan override: {}", variable));
     }
-    if (const char* value = std::getenv("DG_MEGA_MOE_IB_TRACE"); value != nullptr and std::stoul(value) != 0)
+    if (const char* value = get_mega_moe_dev_env("DG_MEGA_MOE_IB_TRACE"); value != nullptr and std::stoul(value) != 0)
         plan.trace = true;
-    if (const char* value = std::getenv("DG_MEGA_MOE_IB_ORACLE"); value != nullptr and std::stoul(value) >= 2)
+    if (const char* value = get_mega_moe_dev_env("DG_MEGA_MOE_IB_ORACLE"); value != nullptr and std::stoul(value) >= 2)
         plan.zero_network = true;
     // The kernel compiles the plan's backend only and cannot check it before its puts run
     DG_HOST_ASSERT(plan.gin_backend == 0 or gin_backend == 0 or plan.gin_backend == static_cast<uint32_t>(gin_backend));

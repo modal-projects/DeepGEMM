@@ -224,7 +224,7 @@ static void __instantiate_kernel() {{
 
     // DG_DEV_COMPILE_ONLY=<file> (development servers precompile variants in parallel): compile into the JIT
     // disk cache, write the cache entry's path to <file>, and return without loading or launching
-    if (const char* compile_only_out = std::getenv("DG_DEV_COMPILE_ONLY"); compile_only_out != nullptr) {
+    if (const char* compile_only_out = get_mega_moe_dev_env("DG_DEV_COMPILE_ONLY"); compile_only_out != nullptr) {
         std::ofstream(compile_only_out) << jit->compile_without_load("sm100_fp8_fp4_mega_moe", code).string();
         return;
     }
@@ -243,7 +243,7 @@ static void __instantiate_kernel() {{
     // class and plan; the JIT disk cache keeps them).
     mega_moe_launch_skipped() = false;
     if (num_ranks > 1) {
-        const char* no_rendezvous = std::getenv("DG_MOE_NO_RENDEZVOUS");
+        const char* no_rendezvous = get_mega_moe_dev_env("DG_MOE_NO_RENDEZVOUS");
         static std::unordered_set<const void*> launched_kernels;
         if ((no_rendezvous == nullptr or std::string(no_rendezvous) == "0") and not launched_kernels.contains(kernel.get())) {
             cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;

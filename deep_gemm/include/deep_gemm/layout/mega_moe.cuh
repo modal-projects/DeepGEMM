@@ -87,6 +87,10 @@ struct alignas(128) MegaMoESignals {
 
     // Shared-expert signals
     uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
+#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
+    // TEMPORARY (layout/mega_moe_ib_compat.cuh): the old host's signals struct is this much longer
+    uint8_t ib_compat_old_fields[26742784 - 21140864];
+#endif
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 

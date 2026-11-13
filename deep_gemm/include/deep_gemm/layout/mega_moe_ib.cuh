@@ -16,6 +16,7 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/layout/mega_moe_ib_compat.cuh>  // TEMPORARY
 
 namespace deep_gemm::layout {
 
@@ -56,6 +57,9 @@ struct IBHandles {
 
     IBHandles() = default;
 
+    CUTLASS_HOST_DEVICE IBHandles(const int64_t gin_dev_comm, const int64_t gin_window):
+        gin_dev_comm(gin_dev_comm), gin_window(gin_window) {}
+
     template <typename Container>
     static bool present(const Container& c) {
         const auto size = static_cast<uint32_t>(c.size());
@@ -86,6 +90,9 @@ struct IBHandles {
 };
 
 // IB signals: GPU-local words only (other nodes never write here; they put into the node slots).
+#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
+using MegaMoEIBSignals = ib_compat::OldIBSignals;  // TEMPORARY
+#else
 struct alignas(128) MegaMoEIBSignals {
     static constexpr uint32_t kMaxNodes = 16;
     static constexpr uint32_t kMaxFwdChunks = 64;    // forward-combine chunks per remote node (32 tokens each)
@@ -121,6 +128,7 @@ struct alignas(128) MegaMoEIBSignals {
     alignas(128) uint64_t trace[48];
     alignas(128) uint32_t hist[4][64];
 };
+#endif
 
 // Geometry of the IB tail of the symmetric buffer. One instance per (max tokens, hidden, top-k, experts); the
 // kernel builds it from its template arguments and the host from the call's arguments, so the two cannot drift.
@@ -172,13 +180,28 @@ struct IBBufferLayout {
     CUTLASS_HOST_DEVICE constexpr int64_t off_proxy_combine() const { return 2 * mirror_stride() + 2 * ret_stride(); }
     CUTLASS_HOST_DEVICE constexpr int64_t off_fwd_stage() const { return off_proxy_combine() + proxy_combine_stride(); }
     CUTLASS_HOST_DEVICE constexpr int64_t node_stride() const {
+#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
+        return off_fwd_stage() + fwd_stage_stride() + ib_compat::num_old_node_slot_extra_bytes(num_max_tokens, num_experts);  // TEMPORARY
+#else
         return math::constexpr_align<int64_t>(off_fwd_stage() + fwd_stage_stride(), 128);
+#endif
     }
 
-    // Offsets inside the tail, and its size
-    CUTLASS_HOST_DEVICE constexpr int64_t off_signals() const { return 0; }
+    // Offsets inside the tail, and its size. `signals()` is where the IB signals of a GPU live, given its stock
+    // signals and the start of its tail.
     CUTLASS_HOST_DEVICE constexpr int64_t off_node(const int64_t& node) const {
+#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
+        return node * node_stride();  // TEMPORARY
+#else
         return math::constexpr_align<int64_t>(sizeof(MegaMoEIBSignals), 128) + node * node_stride();
+#endif
+    }
+    CUTLASS_HOST_DEVICE static MegaMoEIBSignals* signals(void* stock_signals, void* tail) {
+#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
+        return reinterpret_cast<MegaMoEIBSignals*>(static_cast<uint8_t*>(stock_signals) + ib_compat::kNumStockSignalBytes);  // TEMPORARY
+#else
+        return static_cast<MegaMoEIBSignals*>(tail);
+#endif
     }
     CUTLASS_HOST_DEVICE constexpr int64_t num_bytes(const int64_t& num_nodes) const { return off_node(num_nodes); }
 

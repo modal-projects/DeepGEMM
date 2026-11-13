@@ -78,7 +78,10 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             const uint32_t node = G::node_of_slot(nr, launch.my_node), peer = G::counterpart(launch.rank, node);
             const auto dst = Slots<G>::outbox_mirror(launch);
             const auto gin = make_gin<G>(launch, Stream::Rows, nr);
-            gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
+            const auto put_scale_factors = [&]() {
+                gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
+            };
+            put_scale_factors();
             for (uint32_t t = 0; t < num_tokens; t += G::kNumRowsPerPut) {
                 const uint64_t offset = static_cast<uint64_t>(t) * G::buf().token_bytes();
                 // First-need order: the rows of this put come from the stage, once their chunks are staged

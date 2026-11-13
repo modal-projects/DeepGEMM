@@ -384,7 +384,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifndef DG_MEGA_MOE_IB_PCOMB_COPIES
 #define DG_MEGA_MOE_IB_PCOMB_COPIES 1
 #endif
-    constexpr int64_t kIBPCombCopies = DG_MEGA_MOE_IB_PCOMB_COPIES;
     constexpr uint32_t kIBChunk = 32;  // tokens per dispatch x put and per return put
     // DG_MEGA_MOE_IB_X_PIECE=N: tokens per dispatch x put (sender only; receivers poll rows), default kIBChunk.
     // DG_MEGA_MOE_IB_X_NCTX=C: x / SF pieces spread over at most C contexts (HDR_CTX). With X_ORDER, fewer and larger
@@ -583,7 +582,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(static_cast<int64_t>(kNumRanks / 4) * kIBT * kIBTokBytes + kIBT * static_cast<int64_t>(kHidden) * 4 <= kIBPCombStride,
                      "C3_SPLIT scratch (last 2 slot regions of the own-node proxy-combine region) must not reach the x staging at its start");
     const auto ib_c3_scratch_base = [&]() { return ib_pcomb(ib_my_node) + kIBPCombStride - kIBT * static_cast<int64_t>(kHidden) * 4; };
-    const auto ib_ptab = [&](const uint32_t& n) { return reinterpret_cast<uint32_t*>(ib_fstage(n) + kIBFStageStride); };
     const auto ib_input_base = reinterpret_cast<uint8_t*>(buffer.input_token_buffer.get_base_ptr());
     const auto ib_atom_add_acq_rel = [](uint32_t* ptr, const uint32_t& v) {
         uint32_t old;
@@ -1021,11 +1019,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // which overruns the count wait of the ordered start (EP32 MegaSeek: -18.6 on the legacy start, +8.8 on ordered supply).
     // DG_MEGA_MOE_IB_PCOMB_ROT_DEAD=1: code-generation control: everything compiled in, a runtime condition keeps rotation off.
     constexpr bool kIBRot = false;
-    constexpr uint32_t kIBRotMode = 0;
     constexpr bool rot_rt = true;
     const uint32_t rot_b = 1 + ib_parity, rot_o = 2 - ib_parity;
     const auto rot_pc = [&](const uint32_t& n) { return (kIBRot and rot_rt) ? ib_pcomb_c(n, rot_b) : ib_pcomb(n); };
-    const auto rot_claim = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 64); };
     const auto rot_hdr = [&](const uint32_t& c) { return reinterpret_cast<uint64_t*>(ib_pcomb_c(ib_my_node, c)); };
     const auto rot_nt = [&](const uint32_t& c) { return reinterpret_cast<uint32_t*>(ib_pcomb_c(ib_my_node, c) + 128); };
     const auto rot_mask = [&](const uint32_t& c, const uint32_t& nr) {
@@ -1052,74 +1048,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
         }
-    };
-    // shared deferred re-arm of copy c (any warp, all 32 lanes): items claimed until none is left
-    const auto rot_work = [&](const uint32_t& c) {
-        constexpr uint32_t kRowUnits = kHidden * 2 / 16, kQ = kIBRotMode == 4 ? 1 : 4, kQUnits = kRowUnits / kQ;
-        DG_STATIC_ASSERT(kQUnits * kQ == kRowUnits and kQUnits % 32 == 0, "PCOMB_ROT work item");
-        constexpr uint32_t kSlotMask = kNumTopk >= 32 ? 0xffffffffu : (1u << kNumTopk) - 1u;
-        const uint4 ones = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
-        const uint32_t nrem = ib_num_nodes - 1;
-        uint32_t total = 0;
-        for (uint32_t nr = 0; nr < nrem; ++ nr)
-            total += cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr)) * kQ;
-        while (true) {
-            uint32_t g = 0;
-            if (lane_idx == 0) g = atomicAdd(rot_claim(c), 1u);
-            g = __shfl_sync(0xffffffffu, g, 0);
-            if (g >= total) break;
-            uint32_t nr = 0;
-            for (; nr + 1 < nrem; ++ nr) {
-                const uint32_t n_items = cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr)) * kQ;
-                if (g < n_items) break;
-                g -= n_items;
-            }
-            const uint32_t t = g / kQ, q = g % kQ;
-            uint32_t m = ptx::ld_volatile(rot_mask(c, nr) + t) & kSlotMask;
-            const auto base = ib_pcomb_c(ib_node_of_slot(nr), c);
-            while (m) {
-                const uint32_t k = __ffs(m) - 1;
-                m &= m - 1;
-                const auto row = reinterpret_cast<uint4*>(base + (static_cast<int64_t>(k) * kIBT + t) * kHidden * 2) + q * kQUnits;
-                for (uint32_t u = lane_idx; u < kQUnits; u += 32)
-                    row[u] = ones;
-            }
-        }
-    };
-    // PCOMB_ROT=3 (re-arm throughput by the copy engine): the dispatch warps re-arm at their count wait as with =1, but each row
-    // is written by TMA bulk stores (cp.async.bulk shared -> global) from the warp's pull buffer filled with 0xFF (free until the
-    // pulls start), instead of 640 sixteen-byte stores per row from the warp's lanes (~0.9 TB/s over the whole GPU, traced at
-    // EP16: the per-lane stores are latency-bound). The warp waits for its last store before the pull buffer is reused.
-    const auto rot_rearm_tma = [&](const uint32_t& c, void* ones_buf, const uint32_t& ones_bytes) {
-        const uint32_t gw = warp_idx * kNumSMs + sm_idx;
-        constexpr uint32_t kGW = kNumSMs * kNumDispatchWarps;
-        constexpr uint32_t kRowBytes = kHidden * 2;
-        constexpr uint32_t kSlotMask = kNumTopk >= 32 ? 0xffffffffu : (1u << kNumTopk) - 1u;
-        for (uint32_t u = lane_idx; u < ones_bytes / 16; u += 32)
-            ptx::st_shared(reinterpret_cast<uint4*>(ones_buf) + u, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
-        __syncwarp();
-        if (lane_idx == 0) {
-            cute::tma_store_fence();
-            for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
-                const uint32_t nt_prev = cute::min(static_cast<uint32_t>(kIBT), ptx::ld_volatile(rot_nt(c) + nr));
-                const auto pc_prev = ib_pcomb_c(ib_node_of_slot(nr), c);
-                const auto tab = rot_mask(c, nr);
-                for (uint32_t t = gw; t < nt_prev; t += kGW) {
-                    uint32_t m = ptx::ld_volatile(tab + t) & kSlotMask;
-                    while (m) {
-                        const uint32_t k = __ffs(m) - 1;
-                        m &= m - 1;
-                        const auto row = pc_prev + (static_cast<int64_t>(k) * kIBT + t) * kRowBytes;
-                        for (uint32_t off = 0; off < kRowBytes; off += ones_bytes)
-                            ptx::tma_store_1d(row + off, ones_buf, cute::min(ones_bytes, kRowBytes - off));
-                        cute::tma_store_arrive();
-                        ptx::tma_store_wait<2>();
-                    }
-                }
-            }
-            ptx::tma_store_wait<0>();
-        }
-        __syncwarp();
     };
     // DG_MEGA_MOE_IB_EARLY_REARM=1 (tail 3, end of kernel): the dispatch warps re-arm the mirrors BEFORE the cleanup barrier, as
     // soon as every node-local rank has published its combine-ready flag (= its L2 grid sync, so all its L1 pulls from our
@@ -1344,9 +1272,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kIBSSTNB or kNumExpertsPerRank < 255, "SST_NB keys");
     constexpr int64_t kNBStgStride = static_cast<int64_t>(kNumExperts) * 4 + kIBT * kNumTopk * 4;
     DG_STATIC_ASSERT(not kIBSSTNB or 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride <= kIBT * kIBTokBytes, "SST_NB staging fits in the x region");
-    const auto ib_nb_g = [&](const uint32_t& nr) {
-        return reinterpret_cast<uint32_t*>(ib_mirror(ib_parity, ib_my_node) + 64 * kIBT * 4 + layout::MegaMoESignals::kIBOMaxNodes * kNBStgStride) + static_cast<int64_t>(nr) * (kNBCap + 64); };
-    const auto ib_nb_stg = [&](const uint32_t& nr) { return ib_mirror(ib_parity, ib_my_node) + 64 * kIBT * 4 + static_cast<int64_t>(nr) * kNBStgStride; };
     DG_STATIC_ASSERT(kNumEpilogueWarps + 9 <= 28, "SENDER_TABLES scratch in the staging header slot");
     const auto ib_sort_smem = reinterpret_cast<uint8_t*>(&shared_storage.smem_d);
     const auto ib_whist = reinterpret_cast<uint32_t*>(ib_sort_smem + kIBSortSmemOff);
@@ -1454,32 +1379,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kIBNoOvDispatch = kIBNoOv == 1 or kIBNoOv == 2;
     constexpr bool kIBNoOvReturn = kIBNoOv == 1 or kIBNoOv == 3;
     constexpr uint32_t kIBNoOvLandedSlot = 16, kIBNoOvL2Slot = 40;
-    const auto ib_noov_push = [&](const uint32_t& slot) {  // one thread
-        for (uint32_t i = 0; i < ib_lsa; ++ i)
-            ptx::st_rel_sys(sym_buffer.map(&workspace.signals->ib_o_landed[ib_my_node][slot + sym_buffer.rank_idx % ib_lsa],
-                                           ib_my_node * ib_lsa + i), ib_epoch);
-    };
     const auto ib_noov_wait = [&](const uint32_t& slot) {  // whole warp
         if (lane_idx < ib_lsa)
             while (ptx::ld_acq_sys(&workspace.signals->ib_o_landed[ib_my_node][slot + lane_idx]) < ib_epoch);
-        __syncwarp();
-    };
-    const auto ib_noov_landed_check = [&]() {  // whole warp: every x row and the SF piece of every remote source we proxy
-        for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
-            const auto mir = ib_mirror(ib_parity, ib_node_of_slot(nr));
-            uint64_t h;
-            do { h = ptx::ld_volatile(reinterpret_cast<const uint64_t*>(mir + kIBOffHdr)); } while ((h >> 32) != (ib_epoch & 0xffffffffull));
-            const uint32_t nt = static_cast<uint32_t>(h & 0xffffffffull);
-            for (uint32_t r = lane_idx; r < nt; r += 32) {
-                const auto row = mir + static_cast<int64_t>(r) * kIBTokBytes;
-                while (ib_is_sentinel4(ib_ldv4(row)) or ib_is_sentinel4(ib_ldv4(row + kIBTokBytes - 16)));
-            }
-            if (nt > 0 and lane_idx == 0)
-                while (ib_is_sentinel4(ib_ldv4(mir + kIBOffSF + static_cast<int64_t>(nt) * kIBSFBytes - 16)));
-        }
-        __syncwarp();
-        if (lane_idx == 0)
-            ib_noov_push(kIBNoOvLandedSlot);
         __syncwarp();
     };
     const auto ib_forward_combine = [&](const uint32_t& global_warp, const uint32_t& num_global_warps, const bool& is_leader,

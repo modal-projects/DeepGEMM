@@ -424,6 +424,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 1)
             ib::reset_counters<IB>(ib_launch, thread_idx, kNumDispatchThreads);
         ib::trace::begin<IB>(ib_launch, num_tokens, sm_idx == 1 and thread_idx == 0);
+        ib::report_return_gaps<IB>(ib_launch, sm_idx == 1 and thread_idx == 0);
 #endif
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {

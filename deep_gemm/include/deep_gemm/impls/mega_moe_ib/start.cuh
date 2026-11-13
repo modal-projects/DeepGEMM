@@ -23,6 +23,22 @@
 
 namespace deep_gemm::ib {
 
+// Diagnostics, one thread at kernel start: positions the return orders of earlier launches left empty (I10)
+template <typename G>
+CUTLASS_DEVICE void report_return_gaps(const Launch& launch, const bool& is_printer) {
+    if constexpr (G::kDiag) {
+        if (not is_printer)
+            return;
+        #pragma unroll
+        for (uint32_t nr = 0; nr < G::kR; ++ nr) {
+            const uint32_t num_empty = atomicExch(launch.signals->return_gaps + nr, 0u);
+            if (num_empty > 0)
+                printf("DeepGEMM IB Error: a return order was not a permutation: rank=%u, node slot=%u, %u empty positions before epoch %llu\n",
+                       launch.rank, nr, num_empty, static_cast<unsigned long long>(launch.epoch));
+        }
+    }
+}
+
 template <typename G, uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kBarrierIdx>
 __device__ __noinline__ void start(const Launch launch, const layout::Workspace workspace,
                                    const layout::SymBuffer<kNumRanks>* sym_buffer,
@@ -248,10 +264,25 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
 
         if (is_proxy) {
             const auto return_perm = launch.signals->tables + G::kOffReturnPerm + G::slot_of_node(src_node, launch.my_node) * G::kTableT;
+            // Diagnostics: the return order must be a permutation of the tokens (the source adds the record at a
+            // token's position to that token). One store per token, so it is one iff no position stays empty
+            if constexpr (G::kDiag) {
+                for (uint32_t t = thread_idx; t < num_src_tokens; t += kNumThreads)
+                    return_perm[t] = ~0u;
+                sync();
+            }
             sort_by_key<kNumKeys, kNumThreads, kBarrierIdx>(keys, num_src_tokens, scratch, thread_idx,
                 [&](const uint32_t& token, const uint32_t& position) { return_perm[position] = token; });
             __threadfence();
             sync();
+            if constexpr (G::kDiag) {
+                // Counted, not trapped: `report_return_gaps` prints at the next launch
+                uint32_t num_empty = 0;
+                for (uint32_t t = thread_idx; t < num_src_tokens; t += kNumThreads)
+                    num_empty += return_perm[t] >= num_src_tokens ? 1u : 0u;
+                if (num_empty > 0)
+                    atomicAdd(launch.signals->return_gaps + G::slot_of_node(src_node, launch.my_node), num_empty);
+            }
             if (thread_idx == 0)
                 landing::raise(&launch.signals->order_ready[src_node], launch.epoch);
             trace::stamp<G>(launch, trace::kIntakeDone, thread_idx == 0);

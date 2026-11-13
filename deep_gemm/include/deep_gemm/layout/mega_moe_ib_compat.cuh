@@ -47,7 +47,8 @@ struct OldIBSignals {
     uint64_t epoch;
     uint8_t pad0[3328 - 8];
     uint64_t trace[48];
-    uint32_t hist[4][64];
+    uint32_t return_gaps[kMaxNodes];
+    uint8_t pad0a[4 * 64 * 4 - 4 * kMaxNodes];
     uint64_t sm_stage[256];
     uint32_t stage_dumped;
     // Flags the old kernel does not have live in old fields that no old kernel writes (epoch-tagged: stale or
@@ -68,7 +69,7 @@ struct OldIBSignals {
     uint64_t order_ready[kMaxSources];               // indexed by node here
     uint64_t rows_staged[kMaxNodes][kMaxStageChunks];  // the old landed flags (dead in every frozen old build)
 };
-DG_STATIC_ASSERT(offsetof(OldIBSignals, trace) == 3328 and offsetof(OldIBSignals, hist) == 3712 and
+DG_STATIC_ASSERT(offsetof(OldIBSignals, trace) == 3328 and offsetof(OldIBSignals, return_gaps) == 3712 and
                  offsetof(OldIBSignals, sm_stage) == 4736 and offsetof(OldIBSignals, stage_dumped) == 6784 and
                  offsetof(OldIBSignals, sort_shared) == 8192 and
                  offsetof(OldIBSignals, tables) == 865152 and offsetof(OldIBSignals, src_num_tokens) == 5583744 and

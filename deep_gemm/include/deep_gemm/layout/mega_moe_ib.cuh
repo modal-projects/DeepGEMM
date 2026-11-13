@@ -140,7 +140,7 @@ struct alignas(128) MegaMoEIBSignals {
     alignas(128) uint64_t sm_stage[256];  // per CTA: (epoch << 8) | stage, dumped by the grid-sync timeout
     uint32_t stage_dumped;
     alignas(128) uint64_t trace[48];
-    alignas(128) uint32_t hist[4][64];
+    alignas(128) uint32_t return_gaps[kMaxNodes];  // diagnostics build: empty positions of a return order, per node slot
 };
 #endif
 

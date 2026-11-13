@@ -17,6 +17,7 @@
 
 #include <deep_gemm/comm/gin.cuh>
 #include <deep_gemm/impls/mega_moe_ib/geometry.cuh>
+#include <deep_gemm/impls/mega_moe_ib/route.cuh>
 #include <deep_gemm/impls/mega_moe_ib/trace.cuh>
 #include <deep_gemm/impls/mega_moe_ib/sort.cuh>
 
@@ -102,6 +103,13 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         __syncwarp();
     }
 
+    // Sender tables: counts and slot entries for every remote node, built here and put as one message per node
+    if constexpr (G::kSenderTables) {
+        if (sm_idx >= G::kFirstBuildSM and sm_idx < G::kFirstReceiverSM)
+            build_tables<G, kNumThreads, kBarrierIdx>(launch, input, num_tokens, sm_idx - G::kFirstBuildSM, smem, num_smem_bytes, thread_idx,
+                [](const uint32_t&, const uint32_t& token) { return token; });
+    }
+
     // ---- Receiver ----
     if (sm_idx >= G::kFirstReceiverSM) {
         const uint32_t k = G::source_of_receiver(sm_idx, launch.rank);
@@ -111,6 +119,16 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         const auto mirror = sym_buffer->map(Slots<G>::mirror(launch, src_node), proxy);
         const auto topk_idx = reinterpret_cast<const uint64_t*>(mirror + G::buf().off_idx());
         const auto weights = reinterpret_cast<const uint32_t*>(mirror + G::buf().off_weights());
+
+        // Sender tables: every receiver copies its slice of the source's message; only the proxy goes on to the
+        // header and the top-k rows (token count, landing proof, return order)
+        if constexpr (G::kSenderTables) {
+            receive_tables<G, kNumThreads, kBarrierIdx>(launch, workspace, mirror, k, src_rank, counts, thread_idx,
+                [&]() { publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads); });
+            trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
+            if (not is_proxy)
+                return;
+        }
 
         // The header: one thread polls it, slowly (many threads spinning on memory a NIC writes slow the NIC down)
         if (thread_idx == 0) {
@@ -182,20 +200,24 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 const uint32_t local_expert = static_cast<uint32_t>(expert) % G::kNumExpertsPerRank;
                 if (is_proxy and G::node_of(expert_rank) == launch.my_node)
                     atomicMax(keys + i / G::kK, local_expert);
-                if (expert_rank == launch.rank) {
+                if (not G::kSenderTables and expert_rank == launch.rank) {
                     const uint32_t slot = atomicAdd_block(counts + local_expert, 1u);
                     *workspace.get_src_token_topk_idx_ptr(local_expert, src_rank, slot) = i | ((i / G::kK) << 16);
                 }
             }
         }
-        // Slot table before counts: a pull that sees the counts never waits for the table
-        __threadfence();
-        sync();
-        if (thread_idx == 0)
-            landing::raise(&launch.signals->tables_ready[k], launch.epoch);
-        publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
-        sync();
-        trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
+        if constexpr (not G::kSenderTables) {
+            // Slot table before counts: a pull that sees the counts never waits for the table
+            __threadfence();
+            sync();
+            if (thread_idx == 0)
+                landing::raise(&launch.signals->tables_ready[k], launch.epoch);
+            publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
+            sync();
+            trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
+        } else {
+            sync();
+        }
 
         if (is_proxy) {
             const auto return_perm = launch.signals->tables + G::kOffReturnPerm + G::slot_of_node(src_node, launch.my_node) * G::kTableT;

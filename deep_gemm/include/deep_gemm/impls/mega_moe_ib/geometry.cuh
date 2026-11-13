@@ -87,7 +87,10 @@ struct Geometry {
     static constexpr uint32_t kFirstProxySM = kNumSMs - kR;
     static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR * kNumRowIssuers;
     static constexpr uint32_t kEndPullSM = kSenderTables ? kFirstProxySM : kFirstReceiverSM;
-    DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs, "Not enough SMs for the start roles");
+    // Sender tables: the 8 SMs below the receivers build them (they join the pull when they are done)
+    static constexpr uint32_t kNumBuildSMs = kSenderTables ? layout::MegaMoEIBSignals::kMaxSortParts : 0;
+    static constexpr uint32_t kFirstBuildSM = kFirstReceiverSM - kNumBuildSMs;
+    DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs and kFirstBuildSM >= kFirstPullSM, "Not enough SMs for the start roles");
 
     // The remote source a receiver SM handles: the last kR SMs take this GPU's counterparts (node slot order from
     // the end), the SMs before them the other ranks of the remote nodes

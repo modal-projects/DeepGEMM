@@ -311,6 +311,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     cudaGridDependencySynchronize();
 
     // Task scheduler
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    // With the plan's tail policy, which follows the scheduler's five derived arguments
+    auto scheduler = sched::MegaMoEScheduler<
+        BLOCK_M, BLOCK_N, BLOCK_K, L1_SHAPE_N, L1_SHAPE_K, L2_SHAPE_N, L2_SHAPE_K,
+        kNumExpertsPerRank, kNumSMs, kNumRanks, kNumRingBlocks, kNumLocalityDomains, kNumSharedExperts,
+        math::constexpr_ceil_div(kNumExpertsPerRank, 32u), L1_SHAPE_N / BLOCK_N, L2_SHAPE_N / BLOCK_N,
+        L1_SHAPE_N / BLOCK_N / 2, L2_SHAPE_N / BLOCK_N / 2, typename IB::TailPolicy>(
+#else
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
@@ -319,6 +327,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSMs, kNumRanks,
         kNumRingBlocks, kNumLocalityDomains,
         kNumSharedExperts>(
+#endif
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -1525,6 +1534,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
         // All local L2 writes are done after this grid sync
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Join early: once this SM's warps have all left the task loop, only warp 0 waits for the other SMs; the
+        // others start on the proxy sum below. The barrier with the dispatch warps still holds everyone back
+        // from the combine until warp 0 is through.
+        if constexpr (IB::kJoinEarly) {
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if (epilogue_warp_idx == 0)
+                comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() { __syncwarp(); });
+        } else
+#endif
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }

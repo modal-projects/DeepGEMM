@@ -23,18 +23,6 @@
 
 namespace deep_gemm::ib {
 
-// Hand a remote source's per-expert counts to the stock scheduler, which waits until every source has added
-// its share of `kNumSMs` to each expert's sum (a node-local source adds it from its own SM 0)
-template <uint32_t kNumSMs>
-CUTLASS_DEVICE void publish_counts(const layout::Workspace& workspace, const uint32_t& src_rank, const uint32_t* counts,
-                                   const uint32_t& thread_idx, const uint32_t& num_threads) {
-    for (uint32_t i = thread_idx; i < workspace.num_experts_per_rank; i += num_threads) {
-        *workspace.get_expert_recv_count_ptr(src_rank, i) = counts[i];
-        __threadfence();
-        ptx::atomic_add(workspace.get_expert_recv_count_sum_ptr(i), (static_cast<uint64_t>(kNumSMs) << 32) | counts[i]);
-    }
-}
-
 template <typename G, uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kBarrierIdx>
 __device__ __noinline__ void start(const Launch launch, const layout::Workspace workspace,
                                    const layout::SymBuffer<kNumRanks>* sym_buffer,
@@ -246,50 +234,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             sync();
         }
 
-        // One pass over the source's top-k rows, a batch of loads in flight per thread, re-reading every entry of
-        // the batch that has not landed yet. An entry for one of this GPU's experts takes the next slot of that
-        // expert; the proxy also takes the return-order keys and proves the weights landed.
-        constexpr uint32_t kNumLoads = 16;
-        for (uint32_t i0 = thread_idx; i0 < num_entries; i0 += kNumThreads * kNumLoads) {
-            uint64_t entries[kNumLoads];
-            uint32_t entry_weights[kNumLoads];
-            const auto reload = [&](const bool& all) {
-                #pragma unroll
-                for (uint32_t u = 0; u < kNumLoads; ++ u) {
-                    const uint32_t i = i0 + u * kNumThreads;
-                    if (i < num_entries and (all or entries[u] == landing::kBlankIdx))
-                        entries[u] = ptx::ld_volatile(topk_idx + i);
-                    if (is_proxy and i < num_entries and (all or entry_weights[u] == landing::kBlankWord))
-                        entry_weights[u] = ptx::ld_volatile(weights + i);
-                }
-            };
-            #pragma unroll
-            for (uint32_t u = 0; u < kNumLoads; ++ u)
-                entries[u] = 0, entry_weights[u] = 0;
-            reload(true);
-            landing::spin<true>([&]() {
-                bool blank = false;
-                #pragma unroll
-                for (uint32_t u = 0; u < kNumLoads; ++ u)
-                    blank |= entries[u] == landing::kBlankIdx or entry_weights[u] == landing::kBlankWord;
-                return blank;
-            }, [&]() { reload(false); }, launch.site("start top-k", src_rank, i0));
-            #pragma unroll
-            for (uint32_t u = 0; u < kNumLoads; ++ u) {
-                const uint32_t i = i0 + u * kNumThreads;
-                const int expert = static_cast<int>(static_cast<int64_t>(entries[u]));
-                if (i >= num_entries or expert < 0)
-                    continue;
-                const uint32_t expert_rank = static_cast<uint32_t>(expert) / G::kNumExpertsPerRank;
-                const uint32_t local_expert = static_cast<uint32_t>(expert) % G::kNumExpertsPerRank;
-                if (is_proxy and G::node_of(expert_rank) == launch.my_node)
-                    atomicMax(keys + i / G::kK, local_expert);
-                if (not G::kSenderTables and expert_rank == launch.rank) {
-                    const uint32_t slot = atomicAdd_block(counts + local_expert, 1u);
-                    *workspace.get_src_token_topk_idx_ptr(local_expert, src_rank, slot) = i | ((i / G::kK) << 16);
-                }
-            }
-        }
+        scan_route<G, kNumThreads>(launch, workspace, topk_idx, weights, src_rank, num_entries, is_proxy, counts, keys, thread_idx);
         if constexpr (not G::kSenderTables) {
             // Slot table before counts: a pull that sees the counts never waits for the table
             __threadfence();

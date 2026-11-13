@@ -50,6 +50,16 @@ struct Geometry {
                      kNumRemoteSources <= layout::MegaMoEIBSignals::kMaxSources, "Too many nodes or ranks");
     DG_STATIC_ASSERT(not kPlan.first_need_order or kSenderTables, "First-need order needs sender tables");
 
+    // The plan's tail policy in the form the scheduler takes (sched::SchedulePolicy). A kernel that retires
+    // clusters also lets their epilogue warps start the proxy sum before the L2 grid sync (`kJoinEarly`).
+    struct TailPolicy {
+        static constexpr uint32_t kL1LeadCap = kPlan.l1_lead_cap;
+        static constexpr uint32_t kRetirePercent = kPlan.retire_percent, kRetireAtPercent = kPlan.retire_at_percent;
+        static constexpr bool kSharedL2Early = kPlan.shared_l2_early;
+    };
+    static constexpr bool kJoinEarly = kPlan.retire_percent > 0;
+    DG_STATIC_ASSERT(not kJoinEarly or kNumRanks <= 32, "One warp raises the combine-ready flags of all ranks");
+
     CUTLASS_DEVICE static uint32_t node_of(const uint32_t& rank) { return rank / kLsa; }
     CUTLASS_DEVICE static uint32_t counterpart(const uint32_t& rank, const uint32_t& node) { return node * kLsa + rank % kLsa; }
     CUTLASS_DEVICE static uint32_t node_of_slot(const uint32_t& nr, const uint32_t& my_node) { return nr < my_node ? nr : nr + 1; }

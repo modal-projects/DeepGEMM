@@ -267,7 +267,7 @@ static MegaMoEConfig get_mega_moe_config(
 // The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
 // Everything fitted is in the table below, each row with the measurement that set it (B300, 800G InfiniBand, 8
 // ranks per node; same-request A/B in both arm orders). `DG_MEGA_MOE_IB_PLAN="field=value,..."` overrides fields
-// for development (e.g. "routing=1,first_need_order=1,diagnostics=1").
+// for development (e.g. "ordered=1,diagnostics=1").
 static layout::IBPlan get_mega_moe_ib_plan(
     const int& num_ranks, const int& num_ranks_per_node,
     const int& num_tokens, const int& num_topk) {
@@ -300,8 +300,7 @@ static layout::IBPlan get_mega_moe_ib_plan(
     layout::IBPlan plan;
     plan.ranks_per_node = num_ranks_per_node;
     const bool is_ordered = num_nodes >= 2 and num_tokens >= fitted.min_ordered_tokens;
-    plan.routing = is_ordered ? layout::IBRouting::SenderTables : layout::IBRouting::ReceiverScan;
-    plan.first_need_order = is_ordered;
+    plan.ordered = is_ordered;
     if (is_ordered) {
         plan.l1_lead_cap = fitted.l1_lead_cap;
         plan.retire_percent = fitted.retire_percent;
@@ -326,8 +325,7 @@ static layout::IBPlan get_mega_moe_ib_plan(
             DG_HOST_ASSERT(eq != std::string::npos and eq < end);
             const std::string name = text.substr(begin, eq - begin);
             const auto value = static_cast<uint32_t>(std::stoul(text.substr(eq + 1, end - eq - 1)));
-            if (name == "routing") plan.routing = static_cast<layout::IBRouting>(value);
-            else if (name == "first_need_order") plan.first_need_order = value;
+            if (name == "ordered") plan.ordered = value;
             else if (name == "gin_backend") plan.gin_backend = value;
             else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
             else if (name == "retire_percent") plan.retire_percent = value;
@@ -340,18 +338,17 @@ static layout::IBPlan get_mega_moe_ib_plan(
             begin = end + 1;
         }
     }
-    DG_HOST_ASSERT(not plan.first_need_order or plan.routing == layout::IBRouting::SenderTables);
     return plan;
 }
 
 // The plan as the JIT source spells it (a designated initializer of layout::IBPlan, fields in declaration order)
 static std::string to_string(const layout::IBPlan& plan) {
     return std::format(
-        "{{.ranks_per_node = {}, .routing = deep_gemm::layout::IBRouting({}), .first_need_order = {}, "
+        "{{.ranks_per_node = {}, .ordered = {}, "
         ".gin_backend = {}, "
         ".l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
         ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
-        plan.ranks_per_node, static_cast<uint32_t>(plan.routing), plan.first_need_order,
+        plan.ranks_per_node, plan.ordered,
         plan.gin_backend, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
         plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }

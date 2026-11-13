@@ -86,7 +86,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 const uint64_t offset = static_cast<uint64_t>(t) * G::buf().token_bytes();
                 // First-need order: the rows of this put come from the stage, once their chunks are staged
                 const uint8_t* rows = input;
-                if constexpr (G::kPlan.first_need_order) {
+                if constexpr (G::kOrdered) {
                     rows = Slots<G>::row_stage(launch, nr);
                     for (uint32_t c = t / G::kNumRowsPerStage; c * G::kNumRowsPerStage < cute::min(num_tokens, t + G::kNumRowsPerPut); ++ c)
                         landing::await_raised(&launch.signals->rows_staged[nr][c], launch.epoch, launch.site("rows staged", nr, c));
@@ -104,7 +104,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
     // are idle now (each raises a flag per chunk; the poster above waits for them)
     constexpr uint32_t kNeedSort = 0;
     const auto need_keys = launch.signals->tables + G::kOffSortKeys + G::kFirstOrderSM * G::kTableT;  // the order SMs' key rows
-    if constexpr (G::kPlan.first_need_order) {
+    if constexpr (G::kOrdered) {
         const auto need_pos = launch.signals->tables + G::kOffNeedPos, need_inv = launch.signals->tables + G::kOffNeedInv;
         if (sm_idx >= G::kFirstOrderSM and sm_idx < G::kFirstBuildSM) {
             const uint32_t nr = sm_idx - G::kFirstOrderSM;
@@ -161,20 +161,18 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
     }
 
     // Sender tables: counts and slot entries for every remote node, built here and put as one message per node
-    if constexpr (G::kSenderTables) {
+    if constexpr (G::kOrdered) {
         if (sm_idx >= G::kFirstBuildSM and sm_idx < G::kFirstReceiverSM) {
             const auto need_pos = launch.signals->tables + G::kOffNeedPos;
             build_tables<G, kNumThreads, kBarrierIdx>(launch, input, num_tokens, sm_idx - G::kFirstBuildSM, smem, num_smem_bytes, thread_idx, need_keys,
                 [&](const uint32_t& nr, const uint32_t& token) {
-                    return G::kPlan.first_need_order ? __ldcg(need_pos + nr * G::kTableT + token) : token;
+                    return __ldcg(need_pos + nr * G::kTableT + token);
                 },
                 [&]() {
                     // The entries carry the rows: the order of every remote node must be there before the scatter
-                    if constexpr (G::kPlan.first_need_order) {
-                        if (thread_idx < G::kR)
-                            landing::await_raised(&launch.signals->sort_done[kNeedSort][thread_idx], launch.epoch, launch.site("need order", thread_idx));
-                        sync();
-                    }
+                    if (thread_idx < G::kR)
+                        landing::await_raised(&launch.signals->sort_done[kNeedSort][thread_idx], launch.epoch, launch.site("need order", thread_idx));
+                    sync();
                 });
         }
     }
@@ -191,7 +189,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
 
         // Sender tables: every receiver copies its slice of the source's message; only the proxy goes on to the
         // header and the top-k rows (token count, landing proof, return order)
-        if constexpr (G::kSenderTables) {
+        if constexpr (G::kOrdered) {
             receive_tables<G, kNumThreads, kBarrierIdx>(launch, workspace, mirror, k, src_rank, counts, thread_idx,
                 [&]() {
                     publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
@@ -235,7 +233,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         }
 
         scan_route<G, kNumThreads>(launch, workspace, topk_idx, weights, src_rank, num_entries, is_proxy, counts, keys, thread_idx);
-        if constexpr (not G::kSenderTables) {
+        if constexpr (not G::kOrdered) {
             // Slot table before counts: a pull that sees the counts never waits for the table
             __threadfence();
             sync();

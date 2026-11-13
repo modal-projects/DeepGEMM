@@ -94,6 +94,9 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #ifndef DG_MEGA_MOE_IBP_FIRST_NEED_ORDER
 #define DG_MEGA_MOE_IBP_FIRST_NEED_ORDER 0
 #endif
+#if (DG_MEGA_MOE_IBP_ROUTING != 0) != (DG_MEGA_MOE_IBP_FIRST_NEED_ORDER != 0)
+#error "The ordered regime is both: DG_MEGA_MOE_IBP_ROUTING=1 and DG_MEGA_MOE_IBP_FIRST_NEED_ORDER=1"
+#endif
 #ifndef DG_MEGA_MOE_IBP_L1_LEAD_CAP
 #define DG_MEGA_MOE_IBP_L1_LEAD_CAP 0
 #endif
@@ -129,8 +132,7 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #define DG_MEGA_MOE_IBP_GIN_BACKEND 0
 #endif
 #define DG_MEGA_MOE_IB_PLAN { \
-    .ranks_per_node = DG_MEGA_MOE_IBP_RANKS_PER_NODE, .routing = deep_gemm::layout::IBRouting(DG_MEGA_MOE_IBP_ROUTING), \
-    .first_need_order = DG_MEGA_MOE_IBP_FIRST_NEED_ORDER != 0, \
+    .ranks_per_node = DG_MEGA_MOE_IBP_RANKS_PER_NODE, .ordered = DG_MEGA_MOE_IBP_ROUTING != 0, \
     .gin_backend = DG_MEGA_MOE_IBP_GIN_BACKEND, .l1_lead_cap = DG_MEGA_MOE_IBP_L1_LEAD_CAP, \
     .retire_percent = DG_MEGA_MOE_IBP_RETIRE_PERCENT, .retire_at_percent = DG_MEGA_MOE_IBP_RETIRE_AT_PERCENT, \
     .shared_l2_early = DG_MEGA_MOE_IBP_SHARED_L2_EARLY != 0, .diagnostics = DG_MEGA_MOE_IBP_DIAGNOSTICS, \

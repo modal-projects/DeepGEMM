@@ -2,8 +2,8 @@
 
 // Mega MoE across NVLink domains: which pool row of an expert is which (source, token, top-k slot).
 //
-// Receivers route (`IBRouting::ReceiverScan`): every GPU scans the source's top-k rows in the proxy's mirror
-// (`scan_route`). It cannot start before they land. Or the sender routes (`SenderTables`): the source sorts its
+// Scan regime: the receivers route: every GPU scans the source's top-k rows in the proxy's mirror
+// (`scan_route`). It cannot start before they land. Ordered regime: the sender routes: the source sorts its
 // top-k entries by expert before anything is on the wire and puts, per remote node, one message
 //     [ counts u32[experts of the node] | entries u32[sum of the counts], expert-major ]
 // whose counts end exactly where the mirror's table region starts. Every GPU of that node then only copies its
@@ -80,7 +80,7 @@ CUTLASS_DEVICE void scan_route(const Launch& launch, const layout::Workspace& wo
             const uint32_t local_expert = static_cast<uint32_t>(expert) % G::kNumExpertsPerRank;
             if (is_proxy and G::node_of(expert_rank) == launch.my_node)
                 atomicMax(keys + i / G::kK, local_expert);
-            if (not G::kSenderTables and expert_rank == launch.rank) {
+            if (not G::kOrdered and expert_rank == launch.rank) {
                 const uint32_t slot = atomicAdd_block(counts + local_expert, 1u);
                 *workspace.get_src_token_topk_idx_ptr(local_expert, src_rank, slot) = i | ((i / G::kK) << 16);
             }
@@ -132,10 +132,8 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
     // 1. Count this part's slice (experts of this node are never counted, so their counts stay zero)
     for (uint32_t i = thread_idx; i < kNumWords; i += kNumThreads)
         counters[i] = 0;
-    if constexpr (G::kPlan.first_need_order) {
-        for (uint32_t q = begin / G::kK * G::kR + thread_idx; q < end / G::kK * G::kR; q += kNumThreads)
-            need_keys[(q % G::kR) * G::kTableT + q / G::kR] = G::kNumExpertsPerRank;
-    }
+    for (uint32_t q = begin / G::kK * G::kR + thread_idx; q < end / G::kK * G::kR; q += kNumThreads)
+        need_keys[(q % G::kR) * G::kTableT + q / G::kR] = G::kNumExpertsPerRank;
     sync();
     for (uint32_t i0 = begin + thread_idx; i0 < end; i0 += kNumThreads * kNumLoads) {
         uint64_t entries[kNumLoads];
@@ -147,9 +145,8 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
             const int expert = static_cast<int>(static_cast<int64_t>(entries[u]));
             if (is_remote_expert(expert)) {
                 atomicAdd_block(counters + expert / 2, 1u << (16 * (expert & 1)));
-                if constexpr (G::kPlan.first_need_order)
-                    atomicMin(need_keys + G::slot_of_node(static_cast<uint32_t>(expert) / kNodeExperts, launch.my_node) * G::kTableT
-                              + (i0 + u * kNumThreads) / G::kK, static_cast<uint32_t>(expert) % G::kNumExpertsPerRank);
+                atomicMin(need_keys + G::slot_of_node(static_cast<uint32_t>(expert) / kNodeExperts, launch.my_node) * G::kTableT
+                          + (i0 + u * kNumThreads) / G::kK, static_cast<uint32_t>(expert) % G::kNumExpertsPerRank);
             }
         }
     }

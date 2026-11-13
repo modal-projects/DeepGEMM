@@ -224,7 +224,7 @@ CUTLASS_DEVICE void rearm_mirrors(const Launch& launch, const uint32_t& gtid, co
         rearm<G::kDiag>(mirror + G::buf().off_weights(), num_entries * 4, blank_unit(), gtid, num_grid_threads, launch.site("rearm weights", node));
         if (gtid == 0)
             *reinterpret_cast<uint64_t*>(mirror + G::buf().off_header()) = ~0ull;
-        if constexpr (G::kSenderTables) {
+        if constexpr (G::kOrdered) {
             rearm<false>(mirror + G::buf().off_tables(), num_entries * 4, blank_unit(), gtid, num_grid_threads, launch.site("rearm tables", node));
             rearm<false>(mirror + G::buf().off_counts(), G::buf().counts_bytes(), blank_unit(), gtid, num_grid_threads, launch.site("rearm counts", node));
         }

@@ -30,7 +30,7 @@ template <uint32_t kNumRanks, uint32_t kNumSMs,
 struct Geometry {
     static constexpr layout::IBPlan kPlan = plan_t::value;
     static constexpr bool kDiag = kPlan.diagnostics > 0;
-    static constexpr bool kSenderTables = kPlan.routing == layout::IBRouting::SenderTables;
+    static constexpr bool kOrdered = kPlan.ordered;
 
     static constexpr uint32_t kT = kNumMaxTokens, kH = kHidden, kK = kNumTopk;
     // Zero-network measurement: the first two launches fill both buffer sets over the real network; from the
@@ -48,7 +48,6 @@ struct Geometry {
     DG_STATIC_ASSERT(kLsa > 0 and kNumRanks % kLsa == 0, "Ranks must fill whole nodes");
     DG_STATIC_ASSERT(kNumNodes <= layout::MegaMoEIBSignals::kMaxNodes and
                      kNumRemoteSources <= layout::MegaMoEIBSignals::kMaxSources, "Too many nodes or ranks");
-    DG_STATIC_ASSERT(not kPlan.first_need_order or kSenderTables, "First-need order needs sender tables");
 
     // The plan's tail policy in the form the scheduler takes (sched::SchedulePolicy). A kernel that retires
     // clusters also lets their epilogue warps start the proxy sum before the L2 grid sync (`kJoinEarly`).
@@ -96,17 +95,17 @@ struct Geometry {
     static constexpr uint32_t kFirstReceiverSM = kNumSMs - kNumReceiverSMs;
     static constexpr uint32_t kFirstProxySM = kNumSMs - kR;
     static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR;
-    static constexpr uint32_t kEndPullSM = kSenderTables ? kFirstProxySM : kFirstReceiverSM;
+    static constexpr uint32_t kEndPullSM = kOrdered ? kFirstProxySM : kFirstReceiverSM;
     // Sender tables: the 8 SMs below the receivers build them (they join the pull when they are done)
-    static constexpr uint32_t kNumBuildSMs = kSenderTables ? layout::MegaMoEIBSignals::kMaxSortParts : 0;
+    static constexpr uint32_t kNumBuildSMs = kOrdered ? layout::MegaMoEIBSignals::kMaxSortParts : 0;
     static constexpr uint32_t kFirstBuildSM = kFirstReceiverSM - kNumBuildSMs;
     // First-need order: one SM per remote node below the builders sorts the tokens; the rows are staged in
     // chunks of kNumRowsPerStage by the SMs from kFirstPullSM up (one chunk each, wrapping around)
-    static constexpr uint32_t kNumOrderSMs = kPlan.first_need_order ? kR : 0;
+    static constexpr uint32_t kNumOrderSMs = kOrdered ? kR : 0;
     static constexpr uint32_t kFirstOrderSM = kFirstBuildSM - kNumOrderSMs;
     static constexpr uint32_t kNumRowsPerStage = 32;
     static constexpr uint32_t kNumStageSMs = kFirstOrderSM - kFirstPullSM;
-    DG_STATIC_ASSERT(not kPlan.first_need_order or (kFirstOrderSM > kFirstPullSM and kNumRowsPerPut % kNumRowsPerStage == 0 and
+    DG_STATIC_ASSERT(not kOrdered or (kFirstOrderSM > kFirstPullSM and kNumRowsPerPut % kNumRowsPerStage == 0 and
                      math::constexpr_ceil_div(kNumMaxTokens, kNumRowsPerStage) <= layout::MegaMoEIBSignals::kMaxFwdChunks),
                      "Invalid first-need order plan");
     DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs and kFirstBuildSM >= kFirstPullSM, "Not enough SMs for the start roles");
@@ -187,7 +186,7 @@ struct Slots {
                                         - static_cast<int64_t>(G::buf().num_max_tokens) * G::buf().hidden * 4);
     }
     DG_STATIC_ASSERT(static_cast<int64_t>(G::kR) * G::buf().num_max_tokens * G::buf().hidden
-                     + G::buf().num_max_tokens * G::buf().hidden * 4 <= G::buf().proxy_combine_stride() or not G::kPlan.first_need_order,
+                     + G::buf().num_max_tokens * G::buf().hidden * 4 <= G::buf().proxy_combine_stride() or not G::kOrdered,
                      "Combine scratch must not reach the staged rows at the start of the own-node proxy-combine region");
 };
 

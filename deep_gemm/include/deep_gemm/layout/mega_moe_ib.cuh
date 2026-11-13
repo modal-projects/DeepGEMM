@@ -28,17 +28,18 @@ constexpr static uint32_t kNumIBExtraPtrs = 4;
 // Gin contexts the kernel spreads its puts over; Python requests as many when it creates the device communicator
 constexpr static uint32_t kNumIBGinContexts = 8;
 
-// Who builds the per-expert counts and slot tables of a remote source: the receivers, by scanning the top-k rows
-// in the proxy's mirror, or the sender, which then puts one table message per node
-enum class IBRouting : uint32_t { ReceiverScan = 0, SenderTables = 1 };
 
 // Every decision of an IB build that is not a template argument of the kernel. The host heuristics fill it
 // (`get_mega_moe_ib_plan`) and print it into the JIT source as `DG_MEGA_MOE_IB_PLAN`; the kernel reads it as a
 // constant. No header reads any other macro, so two builds differ exactly when their plans or shapes do.
 struct IBPlan {
     uint32_t ranks_per_node = 1;          // ranks per NVLink domain; remote nodes R = ranks / ranks_per_node - 1
-    IBRouting routing = IBRouting::ReceiverScan;
-    bool first_need_order = false;        // rows are staged and posted in first-need order (needs SenderTables)
+    // The regime. false = Scan: the receivers build the per-expert counts and slot tables of a remote source by
+    // scanning its top-k rows in the proxy's mirror; token rows travel in token order.
+    // true = Ordered: the sender builds them (one table message per node) and stages and posts its token rows
+    // in the order the receiving node first needs them. (Sender tables with rows in token order measured equal
+    // to the scan, so that combination does not exist.)
+    bool ordered = false;
     // The NCCL Gin backend of the communicator (ncclGinType_t: 2 proxy, 3 GDAKI, 4 GPI, 5 EFA GDA), known when it is
     // created; the kernel then compiles that backend's put only. The host must refuse a launch whose plan names
     // another backend than the communicator's: the kernel cannot check it before its puts run.

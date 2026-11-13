@@ -13,6 +13,8 @@ build or use the kernel; it exists so the tables can be reproduced and new chang
 | `devclient.py` | Client of the dev server: `status`, `ab`, `result`, `queue`, `cancel`, `stop`. |
 | `jobs/setup_deps.sh` | Sourced by the job: clones and builds DeepGEMM and DeepEP (the reference) once per container. |
 | `jobs/nccl_topo.py` | Writes an NCCL topology file for VM hosts whose GPUs and NICs share no PCIe path. |
+| `mkab.py` | Builds one header tree that holds several kernels, each selected by an arm's define, for a same-request comparison of trees. |
+| `gate1.sh` | Local check that the IB-off kernel compiles to the same PTX as upstream (front end only). |
 
 ## Deployment settings
 
@@ -111,13 +113,14 @@ Test-only arm variables handled by the server (not by the kernel):
 | `DG_MEGA_MOE_DEV_ALT_TOKENS=a_b_c` | test i of the check runs with the i-th token count of the list (cyclic) on the same warm buffer; `--tokens` is the largest count |
 | `DG_MEGA_MOE_DEV_ALT_RANK=1` | shift the list position by the rank index, so ranks differ within a launch |
 | `DG_MEGA_MOE_DEV_ALT_TIMING=1` | the timing launches cycle through the list as well (no reference run in between; its times are no benchmark) |
-| `DG_MEGA_MOE_DEV_TIME_NVL=1` | time the single-domain reference buffer instead (needs `DG_MEGA_MOE_IB_NVL_REF=1`) |
+| `DG_MEGA_MOE_DEV_TIME_NVL=1` | time the single-domain reference buffer instead (needs `DG_MEGA_MOE_IB_NVL_REF=1`). It did not take effect on the one server it was tried on: accept a result only if its code hash differs from the IB arm's |
 | `DG_MEGA_MOE_IB_ORACLE=2` | zero-network build. Must be alone in its request, with `--check 0`; the ranks restart before and after |
 | `--trace` | trace build: the kernel's trace lines come back in the result (the server matches the prefix `DG_IB_` and, for reference trees older than that rename, `OPUS_`) |
 
 Rules the harness enforces: an arm that sets an allocation-time variable to another value than the server's is
 refused; a zero-network arm cannot share a request; a failed check restarts the ranks; background compiles are
-stopped during check and timing.
+stopped during check and timing. A failure result carries the last log lines of every node and, where the container
+may read the kernel log, its `Xid` / `NVRM` lines (the fault address of a device fault).
 
 `python jobs/devserver.py selftest` runs the harness's own unit tests without a GPU.
 

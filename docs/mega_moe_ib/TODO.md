@@ -3,9 +3,10 @@
 State at commit `6ebf8b4` (13 Nov 2026). Design: `ARCHITECTURE.md`. Method and gates: `REPRODUCTION.md`.
 
 Conventions. Sizes are microseconds per launch, arm minus base in one request, on B300 unless GB200 is named.
-"2 x 8" and "4 x 8" are 2 and 4 nodes of 8 GPUs. "Evidence" names the entry of the campaign notes a number
-comes from; the notes are not part of this repository, so each item also states the request form that
-reproduces it. Commits named "unpublished" exist on local branches only.
+"2 x 8" and "4 x 8" are 2 and 4 nodes of 8 GPUs. Every number was measured on 13 Nov 2026 unless another
+date is given, with the method of `REPRODUCTION.md` (same request, both arm orders, twins), on the tag before
+this commit (`7863474`) unless stated. Arms are plan-field overrides unless a lead says it has code. "A
+candidate exists (not published)" means code was written and measured but is not in this repository.
 
 ## (a) Autotuner for the host hyperparameters
 
@@ -30,26 +31,26 @@ They were set on B300 with 800G links, at 2 and 4 nodes of 8, mostly on the top-
 - **Boundary, 4 x 8.** Ordered with the host's policy minus Scan, same request, twins within 0.2: top-19 at
   160 / 192 / 224 tokens: -1.1 / -5.8 / -11.4; top-25 at 192 / 224: -6.7 / -11.0; top-6 at 192 / 224:
   -8.2 / -11.7; at 128 Ordered still loses (+5.2). One constant, 256 to 192, gains 6 to 12 us at 192 to 224
-  tokens on every shape. Commit `c9c51a2` (unpublished, host only). Not adopted yet: it needs an Ordered soak
-  at 192 / 224 and a changing-count list across 192. Evidence: OPEN_LOG, "C1 RESULT".
+  tokens on every shape (4 x 8, 7 rounds). A candidate exists (not published; host only, one constant). Not
+  adopted yet: it needs an Ordered soak at 192 / 224 and a changing-count list across 192.
 - **Boundary, 2 x 8.** Nothing was measured between 257 and 511 tokens when 512 was set. Later sweep,
   Ordered + cap minus Scan: top-6 -3.1 / -5.5 at 384 / 448. The best boundary differs per shape: about 350
-  (top-19), 400 (top-25), 250 (top-6) by the model below. Evidence: MODEL_LOG, "TODO CANDIDATES" 3.
+  (top-19), 400 (top-25), 250 (top-6) by the model below.
 - **Lead cap.** On B300 4 x 8, top-19, 512 tokens: 7 +1.2, 9 0, 11 +3.5, off +9.8. On GB200 2 x 8 (400G): 7
   minus 9 = -3.2 / -5.4 / -5.6 (top-19, 512 / 768 / 1024), -2.3 / -3.4 / -3 to -7 (top-25),
   -3.2 / -8.6 / -6.6 (top-6). On B300 2 x 8: 7 equals 9 within 2.6 (top-19), 9 is better by 2 to 3 (top-25),
-  7 is better by 2 to 4.4 (top-6). Evidence: MODEL_LOG, "TODO CANDIDATES" 2.
+  7 is better by 2 to 4.4 (top-6).
 - **Retire.** With one remote node any retire loses 9 to 25 on top-19, but on top-6 at 2 x 8, 50 % at 84 %
   minus no retire is -1.1 / -6.9 at 512 / 1024. A rule "retire iff 10 x remote nodes > top-k" covers both.
-  Evidence: MODEL_LOG, "TODO CANDIDATES" 1.
 - **Shared L2 early.** Its measured gain (-3.3 at top-19, 4 x 8, 1024 tokens) comes from the scheduler's tail
   loop being compiled out, not from the schedule: with the loop kept and the schedule chosen at run time the
-  early schedule is +2.2 slower. Evidence: OPEN_LOG, "A1 RESULT"; unpublished measurement commit `db5f45c`.
+  early schedule is +2.2 slower. (Three arms in one request, twins within 0.1:
+  672.3 with the bit on, 673.3 off, 675.5 with the loop kept and the early schedule chosen at run time.)
 - **Records per put.** 8 against 32: -3 to -9 at 4 x 8; +1.1 / +4.3 / +4.3 at 2 x 8, 1024 tokens (top-19 /
   25 / 6). 16 at 2 x 8 reads -1.9 on top-6 on B300 and 0 to +4 on GB200.
 - **The top-6 shape is untuned.** Every top-6 number above was a spot check of values chosen on the other
   shapes. At 4 x 8 top-6 is wire-bound: 96 to 97 % of its distance to the single-domain time is network
-  exposure at every size. Evidence: ATTRIB_LOG, "FLASH EP32".
+  exposure at every size.
 
 ### Proposed design
 
@@ -60,8 +61,8 @@ They were set on B300 with 800G links, at 2 and 4 nodes of 8, mostly on the top-
    at 10 of 12 points, and today's table loses 14 to 17 us at 384 tokens there. The other four values are
    constants or topology rules in the model. The link rate can be read from sysfs
    (`/sys/class/infiniband/<dev>/ports/<n>/rate`, filtered by `link_layer`) when the communicator is created
-   and carried in the buffer handle; unreadable means 800G. Draft: unpublished commit `c6fd7dd`
-   (host +19 / -29 lines). Evidence: MODEL_LOG, phases 1 and 2. Known misses of the model: a top-k term of
+   and carried in the buffer handle; unreadable means 800G. A candidate exists (not published;
+   host +19 / -29 lines). Known misses of the model: a top-k term of
    about 0.45 us per top-k in the threshold; the lead cap (next point).
 2. **Search: a coordinate sweep by plan-field overrides.** Every hyperparameter except the fifth is already an
    override (`DG_MEGA_MOE_IBP_ORDERED`, `_L1_LEAD_CAP`, `_RETIRE_PERCENT`, `_RETIRE_AT_PERCENT`,
@@ -95,37 +96,38 @@ They were set on B300 with 800G links, at 2 and 4 nodes of 8, mostly on the top-
 
 Not built, or built and not adopted. Each with its measured size.
 
-| lead | size | state and evidence |
+| lead | size | state |
 |---|---|---|
-| Ordered boundary 256 to 192 with more than one remote node | -6 to -12 at 192 to 224 tokens, three shapes | commit `c9c51a2` unpublished; needs soak and crossing list; to be unified with the model's rule. OPEN_LOG "C1" |
-| Regime rule from the row stream's wire time | equal to the table at 800G; -14 to -17 at 384 tokens on GB200 2 x 8 | draft `c6fd7dd` unpublished. MODEL_LOG |
-| Top-k term in the regime threshold | up to -5.5, top-6 only | needs the sweep at three remote nodes. MODEL_LOG "TODO CANDIDATES" 3 |
-| Retire by remote nodes per top-k | -1.1 / -6.9 at top-6, 2 x 8, 512 / 1024 | needs 768 timed and the gates of that plan family. MODEL_LOG "TODO CANDIDATES" 1 |
-| Lead cap 7 on 400G | -3 to -8.6 on GB200 2 x 8 | blocked on the cause of the cliffs. MODEL_LOG "TODO CANDIDATES" 2 |
-| 16 records per put with one remote node | -1.9 at top-6, 1024, B300; 0 to +4 on GB200 | needs top-19 / 25 at 512 and 1024, Scan sizes, a soak. EXPERIMENTS row 19 |
-| The tail schedule of "shared L2 early = off" without the code cost of the tail loop | about -2 at top-19, 4 x 8, 1024 | not built. OPEN_LOG "A1 RESULT" |
-| Header as the first put of its Meta thread (today it follows the weights) | predicted -2 +- 1.5 at 4 x 8, 128 tokens; not measured in this form | not built; touches the same puts as item (d). OPEN_LOG, 128-token account |
-| Two row issuers per remote node in the Scan regime | -1.1 to -2.3 at 160 / 192 tokens, 4 x 8 | must stay one issuer in Ordered (+16 at 512). EXPERIMENTS row 11 |
-| This node's rows fill an expert's partial last pool block ("node rows last") | -5.1 at top-19 and -3.5 to -5.5 at top-25, 2 x 8, 1024; 0 to -1 at 4 x 8 | commit `731969d` unpublished, about 100 lines, default off; not adopted (one point, already under its reference). LH_LOG |
-| Proxy-sum batch re-poll (as the pull has) | predicted -2 +- 2; result not recorded | EXPERIMENTS row 7 |
+| Ordered boundary 256 to 192 with more than one remote node | -6 to -12 at 192 to 224 tokens, three shapes | a candidate exists (not published); needs soak and crossing list; to be unified with the model's rule |
+| Regime rule from the row stream's wire time | equal to the table at 800G; -14 to -17 at 384 tokens on GB200 2 x 8 | a candidate exists (not published); GB200 numbers on an earlier form of the item (d) candidate |
+| Top-k term in the regime threshold | up to -5.5, top-6 only | crossovers at one remote node: 15 / 22 / 25 us of wire time on B300 for top-6 / 19 / 25; needs the sweep at three remote nodes |
+| Retire by remote nodes per top-k | -1.1 / -6.9 at top-6, 2 x 8, 512 / 1024 | needs 768 timed and the gates of that plan family |
+| Lead cap 7 on 400G | -3 to -8.6 on GB200 2 x 8 | blocked on the cause of the cliffs (section (a), cautions) |
+| 16 records per put with one remote node | -1.9 at top-6, 1024, B300; 0 to +4 on GB200 | needs top-19 / 25 at 512 and 1024, Scan sizes, a soak |
+| The tail schedule of "shared L2 early = off" without the code cost of the tail loop | about -2 at top-19, 4 x 8, 1024 | not built; see "Shared L2 early" in section (a) |
+| Header as the first put of its Meta thread (today it follows the weights) | predicted -2 +- 1.5 at 4 x 8, 128 tokens; not measured in this form | not built; touches the same puts as item (d). Basis: at that point 17 of 35 us of exposure are at the start, where the counts wait for the header, and a thread's second put follows its first by about 5.7 us |
+| Two row issuers per remote node in the Scan regime | -1.1 to -2.3 at 160 / 192 tokens, 4 x 8 | must stay one issuer in Ordered (+16 at 512); measured on an earlier tree of 13 Nov |
+| This node's rows fill an expert's partial last pool block ("node rows last") | -5.1 at top-19 and -3.5 to -5.5 at top-25, 2 x 8, 1024; 0 to -1 at 4 x 8 | a candidate exists (not published; about 100 lines, default off); not adopted: it pays at one configuration only. Traced at 4 x 8: the freed CTAs wait on the next expert's full block instead |
+| Proxy-sum batch re-poll (as the pull has) | predicted -2 +- 2; not measured | a candidate exists (not published) |
 | Return order sent on the wire instead of sorted twice | not measured | would make invariant I10 hold by construction; a wire addition |
-| First-need front-loading at 4 x 8 on slow links | model: 59 / 143 us of row wait at 512 / 1024 on 400G | mechanisms listed, none built. MODEL_LOG |
+| First-need front-loading at 4 x 8 on slow links | model: 59 / 143 us of row wait at 512 / 1024 on 400G | none built. Model: a token has top-k / nodes experts on a node, so the share of a row stream needed through pool fraction x is 1 - (1 - x)^(top-k / nodes) |
 
 Closed with a cause, recorded so they are not tried again:
 
 | idea | result | cause |
 |---|---|---|
-| Local heads: an expert's partial block placed early in the pool, apart from its other blocks | +22 at top-19, 4 x 8, 512; +87 at 2 x 8, 1024 | separating an expert's blocks costs about 1.0 to 1.2 us per head. Rule for any pool layout: two blocks of one expert stay adjacent or at most 2 other pool blocks apart (step measured between 2 and 4). LH_LOG |
-| One wire format (sender tables) at every size | +10.4 at 4 x 8, 128; +8.5 at 2 x 8, 32 and 128 | the table chain sits in front of the counts. Scan cannot be dropped at small batch. OPEN_LOG |
-| Regime from the buffer's maximum token count | +12.2 at 2 x 8, 128 | same cause. OPEN_LOG |
-| A work-conserving L1 claim | no runnable unclaimed block in any sample | CTAs that wait, wait for rows. EXPERIMENTS M1 |
+| Local heads: an expert's partial block placed early in the pool, apart from its other blocks | +22 at top-19, 4 x 8, 512; +87 at 2 x 8, 1024 | separating an expert's blocks costs about 1.0 to 1.2 us per head. Rule for any pool layout: two blocks of one expert stay adjacent or at most 2 other pool blocks apart (step measured between 2 and 4 at 2 x 8, 1024 tokens: +4.8 at 2, +54.8 at 3, +66.7 at 4) |
+| One wire format (sender tables) at every size | +10.4 at 4 x 8, 128; +8.5 at 2 x 8, 32 and 128 | the table chain sits in front of the counts. Scan cannot be dropped at small batch |
+| Regime from the buffer's maximum token count | +12.2 at 2 x 8, 128 | same cause |
+| A work-conserving L1 claim | no runnable unclaimed block in any sample | CTAs that wait, wait for rows (sampled at top-19 and top-25, 4 x 8, 512 and 1024) |
 | Single-pass source combine | +5 to +8 at 1024 | `impls/mega_moe_ib/combine.cuh`, header comment |
 
 Where the remaining distance is, for whoever picks the next lead (top-19, 4 x 8, zero-network arms):
 the kernel without the wire is 25 to 41 us above the stock kernel on one B300 node at equal per-GPU work
 (first routed claim +8 to +20, row wait 8 to 11 us per CTA even with no network because rows go through the
 mirrors, tail +9 to +11); the tail policy costs nothing there. Network exposure on top is 35 us at 128 tokens
-and 57 to 88 at 512 to 1024. Evidence: ATTRIB_LOG, "Goal 1 FINAL" and the zero-network policy arms.
+and 57 to 88 at 512 to 1024. (Zero network, top-19, 1024: plan 590.6, no retire 590.1, no cap 584.8, neither
+599.4; stock on one node 549.0.)
 
 ## (c) Correctness and robustness
 
@@ -142,7 +144,7 @@ and 57 to 88 at 512 to 1024. Evidence: ATTRIB_LOG, "Goal 1 FINAL" and the zero-n
    product bug. The discriminating run is one dying tree on the in-repo host at 32 GPUs, and the fault address
    of one death from the node's kernel log (the harness collects Xid lines into a failure result). **Until
    this is closed, do not put a printf plus trap in `ib::start`: count, and report at the next launch**, as
-   `report_return_gaps` does. Evidence: OPEN_LOG, "A2: the family as it stands".
+   `report_return_gaps` does.
 2. **Gates on the in-repo host at 32 GPUs.** At this commit the 32-GPU diagnostics checks, soaks and
    back-to-back phase ran under the compat layer; on the in-repo host at 32 GPUs the mixed-regime lists and
    a first check ran. The full gate set there is open.
@@ -193,7 +195,7 @@ Status: **not usable from this tree; a candidate exists outside it.**
   diagnostics build, a per-put timer, put size, context mapping, the Gin backend, rail bandwidth (47.4 GB/s
   into each GPU, 95 % of nominal). One local reader of blank bulk memory is free; many local warps polling
   blank words inside a bulk region are not safe either (7 launches of +1.2 ms in 900).
-- Candidate (unpublished, commits `73a3de8` kernel and `9cb0722` host, on the previous tag; +80 / -4 lines):
+- A candidate exists (not published; on the previous tag; +80 / -4 lines):
   one plan field `gated`, default off; off is PTX-identical on 16 reference builds. On: a hint in front of
   each first read of bulk data (one watcher thread per source publishes rows landed, 16 at a time; one
   thread polls the last word of the index rows and of the tables; one flag word per return chunk), with
@@ -221,6 +223,5 @@ Status: **not usable from this tree; a candidate exists outside it.**
   bound by the wire. Leads recorded for it: the record flag inside the chunk's put (-10 / -16 / -23 at
   512 / 768 / 1024 by one table, with two hazards: the tail flag of a partial last chunk, and an in-bulk word
   polled by many warps); the regime boundary at 128 tokens for 4 x 8; lead cap 7; the header as a first put.
-  Evidence: GB200_LOG, final table and handover.
 - 2 x 8 and 1 x 8 on GB200: only controls and plan-field sweeps exist (on an earlier form of the candidate);
   no table for this tree.

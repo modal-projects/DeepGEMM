@@ -417,7 +417,7 @@ lists the warm-up item. Under CUDA graph capture the launch is not skipped.
 
 ## 10. Invariants
 
-Numbering follows the campaign's design note; the text is the state at this commit. Each line names where the
+The numbers are labels used in code review and in `TODO.md`; the text is the state at this commit. Each line names where the
 invariant is enforced.
 
 | # | invariant | where |

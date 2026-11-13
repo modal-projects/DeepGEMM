@@ -139,10 +139,34 @@ boundary is spelled out: `DG_MEGA_MOE_IBP_ORDERED=1,DG_MEGA_MOE_IBP_L1_LEAD_CAP=
 remote node, `DG_MEGA_MOE_IBP_RETIRE_PERCENT=50,DG_MEGA_MOE_IBP_RETIRE_AT_PERCENT=<90|92|71>,DG_MEGA_MOE_IBP_SHARED_L2_EARLY=1`
 (top-19 / 25 / 6 on four nodes).
 
-**Two trees in one request.** `--repo` sends the headers of one tree; all arms of the request share them. An
-A/B between two trees in one request needs a combined header tree in which each differing header dispatches on
-a macro one arm defines. The tool that builds such a tree is not part of this harness (section 10). Changes
-that are plan fields need no second tree.
+**Two trees.** `--repo` sends the headers of one tree; all arms of the request share them. Changes that are
+plan fields need no second tree. For two trees there are two cases:
+
+- *The host forwards arm variables into the JIT source as defines* (hosts built from the trees that preceded
+  this one did; that is how this kernel was timed against its predecessor, with the compat layer). Build one
+  combined header tree with `tools/mega_moe_ib/mkab.py OUT exp=<tree>:DG_MEGA_MOE_EXP base=<tag>`: identical
+  headers are copied once, differing ones become a dispatcher on the arm's define. The arms then run
+  interleaved in one request. Check that an arm's code hash from the combined tree is stable across requests;
+  it is not comparable with the hash from the arm's own tree, because the hash covers strings that hold
+  include paths.
+- *The in-repo host* prints only the plan into the JIT source, so a define cannot select a tree, and the JIT
+  keys a kernel by its source text and by include hashes it caches per process. Two trees are therefore two
+  requests, each on fresh ranks: start the server with `DEV_HDR_FRESH=1` (a request whose header set differs
+  from the live ranks' gets new rank processes and an empty JIT cache first) and keep `DEV_REQUIRE_VERIFIED=1`
+  (a variant that no node can prove was built from the request's headers is refused; without it a
+  header-only change silently ran the base cubin once on 13 Nov). Quote such a pair with the between-request
+  drift in mind: run each tree twice, alternating, and use twins.
+
+**Harness switches these rules rely on** (all in `tools/mega_moe_ib/jobs/devserver.py`; added on 13 Nov 2026):
+
+| switch | what it does | state |
+|---|---|---|
+| `DEV_HDR_FRESH=1` | one header set per rank process, own JIT cache per generation, no warm case | used for every in-repo-host number |
+| `DEV_REQUIRE_VERIFIED` (default 1) | refuses unverified variants | on |
+| `DEV_MAX_CASES` | live (shape, tokens) cases before the ranks restart; 8 was used on the in-repo-host servers, the default is 3 | each case holds its own communicator and progress threads |
+| `DG_MEGA_MOE_DEV_ALT_TIMING=1` with `DG_MEGA_MOE_DEV_ALT_TOKENS` (and `_ALT_RANK=1`) | the timing launches cycle through the token list, shifted per rank: back-to-back launches with different counts per rank | written, selftest only; not run on a server |
+| `DG_MEGA_MOE_DEV_TIME_NVL=1` | times the single-domain reference buffer instead of the IB buffer | did NOT take effect on the one server it was tried on (GB200, 32 GPUs: same code hashes and times as the IB arm). Treat a result as valid only if its code hash differs from the IB arm's |
+| fault-address capture | a failure result carries the node's `Xid` / `NVRM` kernel-log lines (`logs.<node>.xid`), where the container may read the kernel log | installed; whether it has captured a fault address: not measured |
 
 ## 6. Gate list
 
@@ -160,35 +184,20 @@ A tree's numbers count only if it passes all of these. "diag" = diagnostics on; 
 | 7 | host | first IB launch of a buffer (cold JIT cache); an unknown `DG_MEGA_MOE_IBP_*` name is refused with its name; a plan whose backend differs from the communicator's is refused |
 | 8 | experts per rank (Ordered, EP16) | diag check at 12, 24, 31, 32, 33, 38, 50, 76 experts per rank |
 
-Gate 1, local (front end only; needs nvcc, not a GPU). For each of the two instantiations, compile the same
-`kernel.cu` against the include tree of upstream and of the tree under test and compare:
+Gate 1 is local (front end only; needs nvcc, no GPU):
 
 ```bash
-cat > k.cu <<'EOT'
-#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
-using namespace deep_gemm;
-static void __instantiate_kernel() {
-    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
-        1024, 5120, 2304, 304, 1, 19,          // MegaSeek at 8 ranks; second shape: 96 experts, top-6
-        240, 128, 128, 24, 8, 256, 128,        // second shape: 192, 128, 128, 32, 32, 256, 128
-        15360, 16384, 4, 5120,                 // second shape: 15360, 20480, 4, 5120
-        128, 128, 256,
-        148, 8, 10.0f, true, cutlass::detail::float_e2m1_unpacksmem_t>);
-}
-EOT
-ptx() {  # ptx <include dir> -> normalised md5
-  nvcc -std=c++20 --gpu-architecture=compute_100a --ptx -o - k.cu -I"$1" -I<cutlass>/include -I<deep_jit>/include \
-      -I<nccl>/include --diag-suppress=39,161,174,177,186,940 --expt-relaxed-constexpr -O1 \
-  | grep -v '^//\|\.file\|\.loc' \
-  | sed -E 's/_ZN[0-9]+_INTERNAL_[0-9a-f]+_[0-9a-zA-Z_]+/_ZN_I/g; s/\$str[0-9$_a-zA-Z]*//g; s/_INTERNAL_[0-9a-f]+_[0-9a-zA-Z_]+//g' \
-  | grep -v '^.global .align 1 .b8 \[[0-9]*\] = {47, ' | md5sum
-}
-ptx <upstream>/deep_gemm/include; ptx <tree>/deep_gemm/include      # the two md5 must be equal
+UPSTREAM=<upstream checkout at 5081f85> REPO=<tree under test> NVIDIA=<site-packages/nvidia> tools/mega_moe_ib/gate1.sh
 ```
 
-The first `sed` expression matters: internal-linkage names carry the compiler's process id in a
-length-prefixed mangled name, and without it an unchanged tree changes md5 when the process id gains a digit.
-The last `grep` drops string constants that hold include paths.
+It instantiates the IB-off kernel for two shapes at 8 ranks (304 experts top-19; 96 experts top-6; 1,024
+tokens), compiles each to PTX against both include trees, normalises and compares md5. The normalisation
+removes debug lines, string constants that hold include paths, and compiler-generated internal names; these
+names carry the compiler's process id in a length-prefixed form, and without that step an unchanged tree
+changes md5 when the process id gains a digit. With the CUDA 13.2 toolkit wheels both trees read
+`f850b8e3b441` (top-19) and `d2fca7b8bc4e` (top-6) at this commit; the values depend on the compiler, their
+equality does not. nvcc may exit non-zero after writing the PTX if its assembler rejects the PTX version; the
+script judges by the PTX text.
 
 State of the gates for the tree at `6ebf8b4` (13 Nov 2026): gate 1 pass; gates 2 to 5 pass at EP32 on the
 earlier host ABI and at EP16 on the in-repo host; the mixed-regime lists of gate 3 pass at EP32 and EP16 on the
@@ -325,7 +334,7 @@ Server settings used there: `TEST_NODES=8`, `DG_MEGA_MOE_IB_VIRTUAL_LSA=8`, `DG_
 |---|---|
 | The harness outside Modal | `runner.py` is a Modal app: clustered functions with RDMA, Modal Queue / Dict / Volume as the control plane. On another scheduler the dev server (`jobs/devserver.py supervise` on every node, with `DEV_DICT_DIR` pointing at a shared directory instead of a Modal Dict) is the part to keep; that mode is used by the selftest only and was not run on a cluster |
 | The cluster hardware | 2 and 4 bare-metal B300 nodes with 800G InfiniBand and GPU-initiated RDMA enabled on the host (GDAKI) |
-| Comparisons with the kernel that preceded this tree | they were timed in one request through a combined header tree and the compat layer, on servers whose host extension was built from the earlier tree. The earlier kernel and the tool that builds combined trees are not in this repository |
+| Comparisons with the kernel that preceded this tree | they were timed in one request through a combined header tree (`mkab.py`) and the compat layer, on servers whose host extension was built from the earlier tree. The earlier kernel and its host are not in this repository |
 | The 32-GPU single-domain NVLink reference | needs a GB200 rack with 32 GPUs in one NVLink domain |
 | Absolute levels | a cubin's level moves by 3 to 13 us between requests and by several us between servers; only same-request differences reproduce |
 | Slow-launch rates | they depend on the host's CPU count and on pinning the Gin progress threads |

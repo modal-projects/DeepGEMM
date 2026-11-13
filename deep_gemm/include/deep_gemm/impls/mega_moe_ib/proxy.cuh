@@ -34,14 +34,17 @@ CUTLASS_DEVICE void store_partial(const Launch& launch, const layout::SymBuffer<
     *sym_buffer.map(dst, G::counterpart(src_rank, launch.my_node)) = packed;
 }
 
-// Zero this launch's work-queue counters. Run by one SM before the dispatch grid sync, which every claimant passes.
+// Zero the work-queue counters. Run by one SM before the dispatch grid sync, which every claimant of this launch
+// passes; the previous launch has ended, so nobody reads the other parity's rows either, and clearing both makes
+// a launch independent of whatever ran before it.
 template <typename G>
 CUTLASS_DEVICE void reset_counters(const Launch& launch, const uint32_t& thread_idx, const uint32_t& num_threads) {
-    for (uint32_t i = thread_idx; i < layout::MegaMoEIBSignals::kMaxNodes * layout::MegaMoEIBSignals::kMaxFwdChunks; i += num_threads)
-        launch.signals->fwd_chunk_done[launch.parity][0][i] = 0;
-    if (thread_idx < layout::MegaMoEIBSignals::kMaxNodes) {
-        launch.signals->fwd_item_claim[launch.parity][thread_idx] = 0;
-        launch.signals->fwd_chunks_returned[launch.parity][thread_idx] = 0;
+    constexpr uint32_t kNumNodes = layout::MegaMoEIBSignals::kMaxNodes;
+    for (uint32_t i = thread_idx; i < 2 * kNumNodes * layout::MegaMoEIBSignals::kMaxFwdChunks; i += num_threads)
+        launch.signals->fwd_chunk_done[0][0][i] = 0;
+    if (thread_idx < 2 * kNumNodes) {
+        launch.signals->fwd_item_claim[0][thread_idx] = 0;
+        launch.signals->fwd_chunks_returned[0][thread_idx] = 0;
     }
 }
 

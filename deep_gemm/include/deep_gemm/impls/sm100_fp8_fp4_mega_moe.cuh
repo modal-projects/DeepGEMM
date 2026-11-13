@@ -1406,11 +1406,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // meta header, tagged with the launch epoch. On the sender-table start the counts are published before that store, so a
     // warp with no pull work can get here first: it waits for this launch's tag instead of using the previous launch's count
     // (a different token count on the same buffer would make it claim tokens that do not exist).
-    // DG_MEGA_MOE_IB_NT_TAG=0 builds the old untagged form (timing control for this fix only; to be removed)
-#ifndef DG_MEGA_MOE_IB_NT_TAG
-#define DG_MEGA_MOE_IB_NT_TAG 1
-#endif
-    constexpr bool kIBNtTag = kIBSST and DG_MEGA_MOE_IB_NT_TAG;
+    constexpr bool kIBNtTag = kIBSST;
     DG_STATIC_ASSERT(kNumMaxTokensPerRank < 65536, "The token count shares its word with a 16-bit epoch tag");
     const auto ib_src_tokens = [&](const uint32_t& n) {
         // The scanning start stores the count before it publishes the counts every warp waits for: no tag needed there

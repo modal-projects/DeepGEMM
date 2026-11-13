@@ -100,14 +100,14 @@ CUTLASS_DEVICE float pull_row(const Launch& launch, const layout::SymBuffer<kNum
     if (is_remote)
         comm::landing::await<G::kDiag>(weight, weight_ptr, launch.site("pull weight", src_rank, src_token_topk_idx));
 
-    // Row
+    // Row. All of its units that are still blank are re-read together: a row caught in flight then costs one
+    // round trip after it lands, not one per unit (per-unit polling cost 15 us at 128 tokens on 32 GPUs)
+    if (is_remote)
+        comm::landing::await_all<G::kDiag, kNumUnits>(units, [&](const uint32_t& u) { return row + (u * 32 + lane_idx) * 16; },
+                                                      launch.site("pull row", src_rank, src_token_idx));
     #pragma unroll
-    for (uint32_t u = 0; u < kNumUnits; ++ u) {
-        const uint32_t offset = (u * 32 + lane_idx) * 16;
-        if (is_remote)
-            comm::landing::await<G::kDiag>(units[u], row + offset, launch.site("pull row", src_rank, src_token_idx));
-        *reinterpret_cast<uint4*>(dst_row + offset) = units[u];
-    }
+    for (uint32_t u = 0; u < kNumUnits; ++ u)
+        *reinterpret_cast<uint4*>(dst_row + (u * 32 + lane_idx) * 16) = units[u];
     // Generic stores, read by the GEMM's TMA loads
     asm volatile("fence.proxy.async.global;" ::: "memory");
 

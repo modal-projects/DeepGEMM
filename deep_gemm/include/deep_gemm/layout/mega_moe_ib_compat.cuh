@@ -94,15 +94,6 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #ifndef DG_MEGA_MOE_IBP_FIRST_NEED_ORDER
 #define DG_MEGA_MOE_IBP_FIRST_NEED_ORDER 0
 #endif
-#ifndef DG_MEGA_MOE_IBP_ROW_ISSUERS
-#define DG_MEGA_MOE_IBP_ROW_ISSUERS 1
-#endif
-#ifndef DG_MEGA_MOE_IBP_ROWS_PER_PUT
-#define DG_MEGA_MOE_IBP_ROWS_PER_PUT 128
-#endif
-#ifndef DG_MEGA_MOE_IBP_SCALE_FACTORS
-#define DG_MEGA_MOE_IBP_SCALE_FACTORS 0
-#endif
 #ifndef DG_MEGA_MOE_IBP_L1_LEAD_CAP
 #define DG_MEGA_MOE_IBP_L1_LEAD_CAP 0
 #endif
@@ -140,9 +131,6 @@ CUTLASS_HOST_DEVICE constexpr int64_t num_old_node_slot_extra_bytes(const int64_
 #define DG_MEGA_MOE_IB_PLAN { \
     .ranks_per_node = DG_MEGA_MOE_IBP_RANKS_PER_NODE, .routing = deep_gemm::layout::IBRouting(DG_MEGA_MOE_IBP_ROUTING), \
     .first_need_order = DG_MEGA_MOE_IBP_FIRST_NEED_ORDER != 0, \
-    .row_issuers = DG_MEGA_MOE_IBP_ROW_ISSUERS, \
-    .rows_per_put = DG_MEGA_MOE_IBP_ROWS_PER_PUT, \
-    .scale_factors = deep_gemm::layout::IBScaleFactors(DG_MEGA_MOE_IBP_SCALE_FACTORS), \
     .gin_backend = DG_MEGA_MOE_IBP_GIN_BACKEND, .l1_lead_cap = DG_MEGA_MOE_IBP_L1_LEAD_CAP, \
     .retire_percent = DG_MEGA_MOE_IBP_RETIRE_PERCENT, .retire_at_percent = DG_MEGA_MOE_IBP_RETIRE_AT_PERCENT, \
     .shared_l2_early = DG_MEGA_MOE_IBP_SHARED_L2_EARLY != 0, .diagnostics = DG_MEGA_MOE_IBP_DIAGNOSTICS, \

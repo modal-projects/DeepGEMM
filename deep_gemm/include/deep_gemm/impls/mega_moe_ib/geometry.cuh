@@ -76,16 +76,16 @@ struct Geometry {
     // (a function: device code cannot take the address of a static constexpr object)
     CUTLASS_HOST_DEVICE static constexpr layout::IBBufferLayout buf() { return {kNumMaxTokens, kHidden, kNumTopk, kNumExperts}; }
     static constexpr uint32_t kNumRecordsPerPut = 32;   // records per return put
-    static constexpr uint32_t kNumRowsPerPut = kPlan.rows_per_put;     // token rows per forward put
-    static constexpr uint32_t kNumRowIssuers = kPlan.row_issuers;      // posting threads (SMs) per remote node
-    DG_STATIC_ASSERT(kNumRowsPerPut > 0 and kNumRowIssuers > 0, "Invalid row posting plan");
+    static constexpr uint32_t kNumRowsPerPut = 128;     // token rows per forward put
     static constexpr uint32_t kNumMaxChunks = math::constexpr_ceil_div(kNumMaxTokens, kNumRecordsPerPut);
     DG_STATIC_ASSERT(kNumMaxChunks <= layout::MegaMoEIBSignals::kMaxFwdChunks, "Too many return chunks");
     DG_STATIC_ASSERT(buf().record_bytes() % 16 == 0 and kHidden % 512 == 0, "Rows and records are read in 16-byte units, a warp at a time");
 
     // Which SM does what before the first GEMM task (epilogue warps; they are idle until then).
     //   SM 0                    posts the meta (top-k indices, weights, header) to every remote node
-    //   SMs [1, 1 + kR x I)     post the scale factors and token rows, I = kNumRowIssuers SMs per remote node
+    //   SMs [1, 1 + kR)         post the scale factors and token rows of one remote node each: one thread per
+    //                           node, so its puts land in order (two threads per node cost 16 us in the ordered
+    //                           regime at 512 tokens: the rows needed first land at half the rate)
     //   the last kNumReceiverSMs  receive one remote source each (slice): its counts and slot table; the last kR
     //                           of them are the sources this GPU is the proxy of, and also do the proxy intake
     // An SM's dispatch warps wait for its epilogue warps before pulling, so SMs that are busy at the start take
@@ -95,7 +95,7 @@ struct Geometry {
     static constexpr uint32_t kNumReceiverSMs = kNumRemoteSources;
     static constexpr uint32_t kFirstReceiverSM = kNumSMs - kNumReceiverSMs;
     static constexpr uint32_t kFirstProxySM = kNumSMs - kR;
-    static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR * kNumRowIssuers;
+    static constexpr uint32_t kFirstPullSM = kFirstRowSM + kR;
     static constexpr uint32_t kEndPullSM = kSenderTables ? kFirstProxySM : kFirstReceiverSM;
     // Sender tables: the 8 SMs below the receivers build them (they join the pull when they are done)
     static constexpr uint32_t kNumBuildSMs = kSenderTables ? layout::MegaMoEIBSignals::kMaxSortParts : 0;
@@ -106,8 +106,7 @@ struct Geometry {
     static constexpr uint32_t kFirstOrderSM = kFirstBuildSM - kNumOrderSMs;
     static constexpr uint32_t kNumRowsPerStage = 32;
     static constexpr uint32_t kNumStageSMs = kFirstOrderSM - kFirstPullSM;
-    DG_STATIC_ASSERT(not kPlan.first_need_order or (kFirstOrderSM > kFirstPullSM and kPlan.row_issuers == 1 and
-                     kPlan.rows_per_put % kNumRowsPerStage == 0 and
+    DG_STATIC_ASSERT(not kPlan.first_need_order or (kFirstOrderSM > kFirstPullSM and kNumRowsPerPut % kNumRowsPerStage == 0 and
                      math::constexpr_ceil_div(kNumMaxTokens, kNumRowsPerStage) <= layout::MegaMoEIBSignals::kMaxFwdChunks),
                      "Invalid first-need order plan");
     DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs and kFirstBuildSM >= kFirstPullSM, "Not enough SMs for the start roles");

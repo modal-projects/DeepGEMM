@@ -327,9 +327,6 @@ static layout::IBPlan get_mega_moe_ib_plan(
             const auto value = static_cast<uint32_t>(std::stoul(text.substr(eq + 1, end - eq - 1)));
             if (name == "routing") plan.routing = static_cast<layout::IBRouting>(value);
             else if (name == "first_need_order") plan.first_need_order = value;
-            else if (name == "row_issuers") plan.row_issuers = value;
-            else if (name == "rows_per_put") plan.rows_per_put = value;
-            else if (name == "scale_factors") plan.scale_factors = static_cast<layout::IBScaleFactors>(value);
             else if (name == "gin_backend") plan.gin_backend = value;
             else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
             else if (name == "retire_percent") plan.retire_percent = value;
@@ -350,13 +347,11 @@ static layout::IBPlan get_mega_moe_ib_plan(
 static std::string to_string(const layout::IBPlan& plan) {
     return std::format(
         "{{.ranks_per_node = {}, .routing = deep_gemm::layout::IBRouting({}), .first_need_order = {}, "
-        ".row_issuers = {}, .rows_per_put = {}, "
-        ".scale_factors = deep_gemm::layout::IBScaleFactors({}), .gin_backend = {}, "
+        ".gin_backend = {}, "
         ".l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
         ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
         plan.ranks_per_node, static_cast<uint32_t>(plan.routing), plan.first_need_order,
-        plan.row_issuers, plan.rows_per_put,
-        static_cast<uint32_t>(plan.scale_factors), plan.gin_backend, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
+        plan.gin_backend, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
         plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }
 

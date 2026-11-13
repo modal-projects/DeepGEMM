@@ -53,8 +53,6 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             if (warp_idx == 0) {
                 if (num_tokens > 0)
                     gin.put(dst + G::buf().off_idx(), input + G::buf().off_idx(), num_entries * 8, peer);
-                if (num_tokens > 0 and G::kPlan.scale_factors == layout::IBScaleFactors::WithMeta)
-                    gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
             } else {
                 if (num_tokens > 0)
                     gin.put(dst + G::buf().off_weights(), input + G::buf().off_weights(), num_entries * 4, peer);
@@ -74,19 +72,14 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         }
         __threadfence();
         sync();
-    } else if (sm_idx < G::kFirstRowSM + G::kR * G::kNumRowIssuers) {
-        // Issuer j of a node takes the puts j, j + I, ...: each issuer's puts land in order
+    } else if (sm_idx < G::kFirstRowSM + G::kR) {
         if (thread_idx == 0 and num_tokens > 0) {
-            const uint32_t nr = (sm_idx - G::kFirstRowSM) / G::kNumRowIssuers, issuer = (sm_idx - G::kFirstRowSM) % G::kNumRowIssuers;
+            const uint32_t nr = sm_idx - G::kFirstRowSM;
             const uint32_t node = G::node_of_slot(nr, launch.my_node), peer = G::counterpart(launch.rank, node);
             const auto dst = Slots<G>::outbox_mirror(launch);
-            const auto gin = make_gin<G>(launch, Stream::Rows, nr, issuer);
-            const auto put_scale_factors = [&](const layout::IBScaleFactors& when) {
-                if (issuer == 0 and G::kPlan.scale_factors == when)
-                    gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
-            };
-            put_scale_factors(layout::IBScaleFactors::BeforeRows);
-            for (uint32_t t = issuer * G::kNumRowsPerPut; t < num_tokens; t += G::kNumRowsPerPut * G::kNumRowIssuers) {
+            const auto gin = make_gin<G>(launch, Stream::Rows, nr);
+            gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
+            for (uint32_t t = 0; t < num_tokens; t += G::kNumRowsPerPut) {
                 const uint64_t offset = static_cast<uint64_t>(t) * G::buf().token_bytes();
                 // First-need order: the rows of this put come from the stage, once their chunks are staged
                 const uint8_t* rows = input;
@@ -98,7 +91,6 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 gin.put(dst + offset, rows + offset,
                         static_cast<uint64_t>(cute::min(num_tokens - t, static_cast<uint32_t>(G::kNumRowsPerPut))) * G::buf().token_bytes(), peer);
             }
-            put_scale_factors(layout::IBScaleFactors::AfterRows);
             trace::stamp<G>(launch, trace::kRowsPosted);
         }
         __syncwarp();

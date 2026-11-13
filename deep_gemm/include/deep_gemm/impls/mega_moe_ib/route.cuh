@@ -93,10 +93,13 @@ constexpr uint32_t kBuildSort = 1;  // row of `sort_shared` / `sort_done` the ta
 
 // One part of the sender's table build. `row_of_token(nr, token)` is the mirror row an entry carries;
 // `before_scatter()` runs on every thread once the counts are staged (it may wait for what the rows depend on).
+// First-need order: the count sweep also takes `need_keys[nr][token]`, the smallest in-rank expert index among the
+// token's experts on remote node slot nr (`experts per rank` without one): when that node first needs the row.
+// The keys of all tokens are complete once every part has raised `sort_shared`.
 template <typename G, uint32_t kNumThreads, uint32_t kBarrierIdx, typename row_of_token_t, typename before_scatter_t>
 CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, const uint32_t& num_tokens,
                                  const uint32_t& part, uint32_t* const smem, const uint32_t& num_smem_bytes,
-                                 const uint32_t& thread_idx, const row_of_token_t& row_of_token,
+                                 const uint32_t& thread_idx, uint32_t* const need_keys, const row_of_token_t& row_of_token,
                                  const before_scatter_t& before_scatter) {
     using namespace comm;
     constexpr uint32_t kE = G::kNumExpertsPerRank * G::kNumNodes * G::kLsa;      // all experts
@@ -116,9 +119,8 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
     const auto starts = rows + kNumBuildParts * kNumWords + part * (kE + 1);          // this part's prefix over all experts
     const auto topk_idx = reinterpret_cast<const uint64_t*>(input + G::buf().off_idx());
     const auto staging = reinterpret_cast<uint32_t*>(Slots<G>::outbox_mirror(launch) + G::buf().off_counts());
-    const uint32_t num_entries = num_tokens * G::kK;
-    const uint32_t begin = static_cast<uint32_t>(static_cast<uint64_t>(num_entries) * part / kNumBuildParts);
-    const uint32_t end = static_cast<uint32_t>(static_cast<uint64_t>(num_entries) * (part + 1) / kNumBuildParts);
+    // A part takes whole tokens
+    const uint32_t begin = num_tokens * part / kNumBuildParts * G::kK, end = num_tokens * (part + 1) / kNumBuildParts * G::kK;
     if (thread_idx == 0 and (kNumWords + kNumThreads / 32) * 4 > num_smem_bytes) {
         printf("DeepGEMM IB: the table build does not fit this layout (smem %u bytes)\n", num_smem_bytes);
         DG_DEVICE_ASSERT(false);
@@ -130,6 +132,10 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
     // 1. Count this part's slice (experts of this node are never counted, so their counts stay zero)
     for (uint32_t i = thread_idx; i < kNumWords; i += kNumThreads)
         counters[i] = 0;
+    if constexpr (G::kPlan.first_need_order) {
+        for (uint32_t q = begin / G::kK * G::kR + thread_idx; q < end / G::kK * G::kR; q += kNumThreads)
+            need_keys[(q % G::kR) * G::kTableT + q / G::kR] = G::kNumExpertsPerRank;
+    }
     sync();
     for (uint32_t i0 = begin + thread_idx; i0 < end; i0 += kNumThreads * kNumLoads) {
         uint64_t entries[kNumLoads];
@@ -139,8 +145,12 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
         #pragma unroll
         for (uint32_t u = 0; u < kNumLoads; ++ u) {
             const int expert = static_cast<int>(static_cast<int64_t>(entries[u]));
-            if (is_remote_expert(expert))
+            if (is_remote_expert(expert)) {
                 atomicAdd_block(counters + expert / 2, 1u << (16 * (expert & 1)));
+                if constexpr (G::kPlan.first_need_order)
+                    atomicMin(need_keys + G::slot_of_node(static_cast<uint32_t>(expert) / kNodeExperts, launch.my_node) * G::kTableT
+                              + (i0 + u * kNumThreads) / G::kK, static_cast<uint32_t>(expert) % G::kNumExpertsPerRank);
+            }
         }
     }
     sync();

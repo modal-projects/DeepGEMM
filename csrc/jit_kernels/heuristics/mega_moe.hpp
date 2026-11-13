@@ -285,18 +285,6 @@ static layout::IBPlan get_mega_moe_ib_plan(
     plan.routing = is_ordered ? layout::IBRouting::SenderTables : layout::IBRouting::ReceiverScan;
     plan.first_need_order = is_ordered;
 
-    // DERIVED: a lane gets its loads back in one round up to ~10 in flight, so a token's top-k is split over the
-    // smallest power-of-two lane group that respects it. The 8 sort SMs give ceil(tokens / 8) tokens their lanes
-    // out of 256 epilogue threads; when the group does not fit, one lane per token (two lanes with 13 loads each
-    // measured worse than one at top-k 25).
-    constexpr int kNumSortSMs = 8, kNumMaxLoadsPerLane = 10, kNumEpilogueThreads = 256;
-    int key_lanes = 1;
-    while (key_lanes * kNumMaxLoadsPerLane < num_topk)
-        key_lanes *= 2;
-    if (key_lanes * ceil_div(num_tokens, kNumSortSMs) > kNumEpilogueThreads)
-        key_lanes = 1;
-    plan.key_lanes = is_ordered ? key_lanes : 1;
-
     // FITTED tail policy of the ordered regime: L1 leads L2 by at most 9 pool blocks (-7 .. -8 us), half of the
     // clusters stop claiming at 90% of the routed L2 (-10 .. -17); both only pay with the network in the loop.
     // Shared L2 before the routed tasks: -6 .. -7 us at 512 .. 768 with top-k 19, +9 at 1024 with top-k 25.
@@ -318,7 +306,6 @@ static layout::IBPlan get_mega_moe_ib_plan(
             const auto value = static_cast<uint32_t>(std::stoul(text.substr(eq + 1, end - eq - 1)));
             if (name == "routing") plan.routing = static_cast<layout::IBRouting>(value);
             else if (name == "first_need_order") plan.first_need_order = value;
-            else if (name == "key_lanes") plan.key_lanes = value;
             else if (name == "row_issuers") plan.row_issuers = value;
             else if (name == "rows_per_put") plan.rows_per_put = value;
             else if (name == "contexts_per_node") plan.contexts_per_node = value;
@@ -342,12 +329,12 @@ static layout::IBPlan get_mega_moe_ib_plan(
 static std::string to_string(const layout::IBPlan& plan) {
     return std::format(
         "{{.ranks_per_node = {}, .routing = deep_gemm::layout::IBRouting({}), .first_need_order = {}, "
-        ".key_lanes = {}, .row_issuers = {}, .rows_per_put = {}, .contexts_per_node = {}, "
+        ".row_issuers = {}, .rows_per_put = {}, .contexts_per_node = {}, "
         ".scale_factors = deep_gemm::layout::IBScaleFactors({}), "
         ".l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
         ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
         plan.ranks_per_node, static_cast<uint32_t>(plan.routing), plan.first_need_order,
-        plan.key_lanes, plan.row_issuers, plan.rows_per_put, plan.contexts_per_node,
+        plan.row_issuers, plan.rows_per_put, plan.contexts_per_node,
         static_cast<uint32_t>(plan.scale_factors), plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
         plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }

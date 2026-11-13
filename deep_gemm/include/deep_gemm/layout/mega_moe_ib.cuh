@@ -43,7 +43,6 @@ struct IBPlan {
     uint32_t ranks_per_node = 1;          // ranks per NVLink domain; remote nodes R = ranks / ranks_per_node - 1
     IBRouting routing = IBRouting::ReceiverScan;
     bool first_need_order = false;        // rows are staged and posted in first-need order (needs SenderTables)
-    uint32_t key_lanes = 1;               // lanes per token in the key pass of the token sort (1, 2 or 4)
     uint32_t row_issuers = 1;             // threads (one SM each) that post a remote node's token rows; each keeps its puts in order
     uint32_t rows_per_put = 128;          // token rows per forward put
     bool contexts_per_node = false;       // Gin contexts by (stream, remote node) instead of by stream (comm/gin.cuh)

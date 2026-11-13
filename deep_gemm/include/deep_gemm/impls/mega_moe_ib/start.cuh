@@ -104,16 +104,18 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         __syncwarp();
     }
 
-    // First-need order: sort the tokens per remote node by when that node first needs them; stage the rows in that
-    // order, 32 at a time on SMs that are idle now (each raises a flag per chunk; the poster above waits for them)
+    // First-need order: sort the tokens per remote node by when that node first needs them (one SM per node, on
+    // the keys the table build takes in its count sweep); stage the rows in that order, 32 at a time on SMs that
+    // are idle now (each raises a flag per chunk; the poster above waits for them)
     constexpr uint32_t kNeedSort = 0;
+    const auto need_keys = launch.signals->tables + G::kOffSortKeys + G::kFirstOrderSM * G::kTableT;  // the order SMs' key rows
     if constexpr (G::kPlan.first_need_order) {
         const auto need_pos = launch.signals->tables + G::kOffNeedPos, need_inv = launch.signals->tables + G::kOffNeedInv;
         if (sm_idx >= G::kFirstOrderSM and sm_idx < G::kFirstBuildSM) {
             const uint32_t nr = sm_idx - G::kFirstOrderSM;
-            build_return_keys<G, kNumThreads, kBarrierIdx, true>(
-                keys, reinterpret_cast<const uint64_t*>(input + G::buf().off_idx()), num_tokens,
-                G::node_of_slot(nr, launch.my_node), thread_idx);
+            if (thread_idx < kNumBuildParts)
+                landing::await_raised(&launch.signals->sort_shared[kBuildSort][thread_idx], launch.epoch, launch.site("need keys", thread_idx));
+            sync();
             sort_by_key<kNumKeys, kNumThreads, kBarrierIdx>(keys, num_tokens, scratch, thread_idx,
                 [&](const uint32_t& token, const uint32_t& position) {
                     need_pos[nr * G::kTableT + token] = position;
@@ -167,7 +169,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
     if constexpr (G::kSenderTables) {
         if (sm_idx >= G::kFirstBuildSM and sm_idx < G::kFirstReceiverSM) {
             const auto need_pos = launch.signals->tables + G::kOffNeedPos;
-            build_tables<G, kNumThreads, kBarrierIdx>(launch, input, num_tokens, sm_idx - G::kFirstBuildSM, smem, num_smem_bytes, thread_idx,
+            build_tables<G, kNumThreads, kBarrierIdx>(launch, input, num_tokens, sm_idx - G::kFirstBuildSM, smem, num_smem_bytes, thread_idx, need_keys,
                 [&](const uint32_t& nr, const uint32_t& token) {
                     return G::kPlan.first_need_order ? __ldcg(need_pos + nr * G::kTableT + token) : token;
                 },

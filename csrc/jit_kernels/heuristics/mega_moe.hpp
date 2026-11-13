@@ -268,46 +268,38 @@ static MegaMoEConfig get_mega_moe_config(
 }
 
 // The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
-// Everything fitted is in the table below, each row with the measurement that set it (B300, 800G InfiniBand, 8
-// ranks per node; same-request A/B in both arm orders).
+// One physical quantity decides the regime: how long the token rows of a rank are on the wire,
+//   row_us = remote nodes x tokens x hidden bytes / link rate per GPU.
+// In the receiver scan (rows in token order) no expert's first block is complete before that stream ends; the
+// ordered regime (the sender routes and posts rows in first-need order) hides it behind the GEMM and pays a
+// fixed chain of sender tables in front of the counts. Ordered pays from 26.2 us of rows on the wire (512 tokens
+// of 5,120-byte rows to one remote node at 800G), whatever the node count, link or top-k: 512 / 256 / 171 tokens
+// on 2 / 3 / 4 nodes at 800G, 256 / 128 / 86 at 400G. Measured crossovers (same-request A/B, ordered + policy against the scan):
+//   800G (B300), one remote node: 15 / 22 / 25 us (top-6 / 19 / 25; +5 / +2 / -1 us at 320 / 384 / 448 tokens,
+//     -13 at 512, top-19); three remote nodes: ~25 us (+5 at 128 tokens, -1 / -6 / -11 at 160 / 192 / 224, -36 /
+//     -87 at 512 / 1024, top-19).
+//   400G (GB200), one remote node: 22 / 26 / 29 us (+6 / -1 / -17 at 192 / 256 / 384 tokens, top-19).
+// `link_gbps` is the communicator's (deep_gemm/mega/ib.py); 0 = unknown, planned as 800G.
 static layout::IBPlan get_mega_moe_ib_plan(
     const int& num_ranks, const int& num_ranks_per_node,
     const int& num_tokens, const int& num_topk,
-    const int& gin_backend = 0) {
+    const int& gin_backend, const int& hidden, const int& link_gbps) {
     DG_HOST_ASSERT(num_ranks_per_node > 0 and num_ranks % num_ranks_per_node == 0 and num_ranks >= num_ranks_per_node);
     const int num_nodes = num_ranks / num_ranks_per_node;
-
-    struct Fitted {
-        // The ordered regime (the sender routes and posts rows in first-need order) from this many tokens per rank
-        int min_ordered_tokens;
-        // L1 leads L2 by at most this many pool blocks in the ordered regime
-        int l1_lead_cap;
-        // Share of the clusters that stop claiming tasks near the end of the routed L2 (0: none)
-        int retire_percent;
-    };
-    //                                 tokens  cap  retire
-    constexpr Fitted kOneRemoteNode  = {512,    9,   0};
-    constexpr Fitted kMoreNodes      = {256,    9,   50};
-    // kOneRemoteNode (16 GPUs), ordered + cap against the receiver scan: top-19 +5 us at 256, -13 at 512, -17 at
-    //   1024; top-25 -3 at 512, -15 at 768, 0 at 1024 (25,600 rows per GPU: the GEMM is the bound, the last task
-    //   ends 390 us after the last row either way); top-6 -1 at 256, -7 at 512, -23 at 1024. The cap alone is
-    //   -4 .. -8 of that from 512 tokens. Retiring clusters loses at every trigger (+9 .. +25 at top-19, 1024
-    //   tokens): its prize is a loaded return wire, which one remote node does not have.
-    // kMoreNodes (32 GPUs), ordered against the scan: top-19 -8 / -36 / -88 us at 256 / 512 / 1024 (all of it is
-    //   the order of the rows: sender tables with rows in token order equal the scan); top-6 +1 at 128, -10 / -40 /
-    //   -40 at 256 / 512 / 1024. Cap and retire together -14 (top-19) / -10 (top-25) at 512 and -29 / -24 at
-    //   1024; -1 / -6 with top-6. Below 256 the scan wins at 160 on every model and the crossover is near 190
-    //   tokens (top-19) / 210 (top-25); not moved: the tail policy changes sign between the two there.
-    const Fitted& fitted = num_nodes == 2 ? kOneRemoteNode : kMoreNodes;
+    const double row_us = static_cast<double>(num_nodes - 1) * num_tokens * hidden / ((link_gbps > 0 ? link_gbps : 800) * 125.0);
 
     layout::IBPlan plan;
     plan.ranks_per_node = num_ranks_per_node;
     plan.gin_backend = static_cast<uint32_t>(gin_backend);  // the communicator's (0: unknown, generic dispatch)
-    const bool is_ordered = num_nodes >= 2 and num_tokens >= fitted.min_ordered_tokens;
+    const bool is_ordered = num_nodes >= 2 and row_us >= 26.2;  // us: what the sender-table chain costs
     plan.ordered = is_ordered;
     if (is_ordered) {
-        plan.l1_lead_cap = fitted.l1_lead_cap;
-        plan.retire_percent = fitted.retire_percent;
+        // L1 leads L2 by at most this many pool blocks: -4 .. -8 us with one remote node, -10 .. -18 with three
+        // (7 = 9, 11 is 3 worse); a scheduler constant, no link term
+        plan.l1_lead_cap = 9;
+        // Half of the clusters stop claiming tasks near the end of the routed L2 and feed the proxy sum, which
+        // serves nodes - 1 return streams: -3 .. -9 us with three remote nodes, +9 .. +25 with one
+        plan.retire_percent = num_nodes > 2 ? 50 : 0;
         // The trigger: the share of the routed L2 after which a retiring cluster stops. The later, the more
         // nodes share a token's experts (fewer of its partial sums are still missing near the end):
         // 100 x 0.6^(nodes / top-k) = 90 at top-19, 92 at top-25 and 71 at top-6 on four nodes (measured: 92

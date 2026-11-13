@@ -12,6 +12,7 @@ Environment:
                                  IB path runs on one node
   DG_MEGA_MOE_IB_FORCE=1         tests: build the IB kernel even when all ranks share one NVLink domain
 """
+import glob
 import os
 import types
 
@@ -21,6 +22,7 @@ import torch.distributed as dist
 from .. import _C
 
 _ext = None
+_link_gbps = None
 IB_MAGIC = 0x1B1B1B1B1B1B1B1B
 # The kernel's puts skip the send-queue credit check (comm/gin.cuh), which needs a deep send queue. NCCL reads this
 # when the communicator is created.
@@ -181,6 +183,22 @@ def ranks_per_domain(group: dist.ProcessGroup) -> int:
     return virtual_lsa or min(group.size(), torch.cuda.device_count())
 
 
+def link_gbps_per_gpu(num_gpus: int, root: str = '/sys/class/infiniband') -> int:
+    """Gb/s of InfiniBand per GPU of this node: the mean rate of its fastest active InfiniBand ports, one per GPU
+    (ports of another link layer, ports that are down and slower management or storage ports do not count; fewer
+    rails than GPUs are shared). 0 when sysfs does not say: the plan then assumes 800 and its JIT source says so."""
+    rates = []
+    for port in glob.glob(os.path.join(root, '*', 'ports', '*')):
+        try:
+            read = lambda name: open(os.path.join(port, name)).read().strip()
+            if read('link_layer') == 'InfiniBand' and 'ACTIVE' in read('state'):
+                rates.append(int(float(read('rate').split()[0])))  # "800 Gb/sec (4X XDR)"
+        except (OSError, ValueError, IndexError):
+            pass
+    num_gpus = max(num_gpus, 1)
+    return sum(sorted(rates, reverse=True)[:num_gpus]) // num_gpus
+
+
 def allocate(group: dist.ProcessGroup, num_bytes: int):
     """Allocate the Mega MoE symmetric buffer as one NCCL window. Returns (tensor, handle namespace)."""
     ext = _load()
@@ -193,6 +211,9 @@ def allocate(group: dist.ProcessGroup, num_bytes: int):
         uid[0], rank, world, num_bytes, _C.get_ib_num_gin_contexts_for_mega_moe(), gin_type, virtual_lsa)
     tensor = ext.as_tensor(ptr, num_bytes, torch.cuda.current_device())
     force = os.environ.get('DG_MEGA_MOE_IB_FORCE', '0') == '1'
-    buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa, gin_backend] if (num_lsa < world or force) else [])
+    global _link_gbps
+    if _link_gbps is None:  # read once per process
+        _link_gbps = link_gbps_per_gpu(torch.cuda.device_count())
+    buffer_ptrs = list(lsa_ptrs) + ([IB_MAGIC, dev_comm, window, num_lsa, gin_backend | (_link_gbps << 8)] if (num_lsa < world or force) else [])
     handle = types.SimpleNamespace(buffer_ptrs=buffer_ptrs, ib_state=state, num_lsa_ranks=num_lsa)
     return tensor, handle

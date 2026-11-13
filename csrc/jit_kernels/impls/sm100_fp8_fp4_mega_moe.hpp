@@ -26,8 +26,13 @@ static bool& mega_moe_launch_skipped() {
 }
 
 // What an IB build is compiled with: the switch and the plan (layout::IBPlan). Its headers read nothing else.
-static std::string get_mega_moe_ib_defines(const layout::IBPlan& plan) {
-    return std::format("#define DG_MEGA_MOE_IB 1\n#define DG_MEGA_MOE_IB_PLAN {}\n", to_string(plan));
+// DG_PRINT_CONFIGS=1 prints every plan once, with the link rate it was planned for.
+static std::string get_mega_moe_ib_defines(const layout::IBPlan& plan, const int& link_gbps) {
+    const auto rate = std::format("{} Gb/s per GPU{}", link_gbps > 0 ? link_gbps : 800, link_gbps > 0 ? "" : " (link rate unknown)");
+    static std::unordered_set<std::string> printed;
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS") and printed.insert(to_string(plan)).second)
+        std::cout << "MegaMoEIBPlan(planned for " << rate << "): " << to_string(plan) << std::endl;
+    return std::format("#define DG_MEGA_MOE_IB 1\n#define DG_MEGA_MOE_IB_PLAN {}\n// planned for {}\n", to_string(plan), rate);
 }
 
 static void sm100_fp8_fp4_mega_moe(
@@ -170,7 +175,9 @@ static void sm100_fp8_fp4_mega_moe(
     const auto make_code = [&](const MegaMoEConfig& c, const int& tokens) {
     const auto ib_defines = not is_ib ? std::string() : get_mega_moe_ib_defines(get_mega_moe_ib_plan(
         num_ranks, static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs)), tokens, num_topk,
-        static_cast<int>(layout::IBHandles::gin_backend_of(sym_buffer_ptrs))));
+        static_cast<int>(layout::IBHandles::gin_backend_of(sym_buffer_ptrs)), hidden,
+        static_cast<int>(layout::IBHandles::link_gbps_of(sym_buffer_ptrs))),
+        static_cast<int>(layout::IBHandles::link_gbps_of(sym_buffer_ptrs)));
     return ib_defines + std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 

@@ -265,33 +265,54 @@ static MegaMoEConfig get_mega_moe_config(
 }
 
 // The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
-// Derived quantities are computed here; everything fitted is in this one function, each line with the measurement
-// that set it (B300, 800G; REFACTOR_DESIGN.md section 5). `DG_MEGA_MOE_IB_PLAN="field=value,..."` overrides fields
+// Everything fitted is in the table below, each row with the measurement that set it (B300, 800G InfiniBand, 8
+// ranks per node; same-request A/B in both arm orders). `DG_MEGA_MOE_IB_PLAN="field=value,..."` overrides fields
 // for development (e.g. "routing=1,first_need_order=1,diagnostics=1").
 static layout::IBPlan get_mega_moe_ib_plan(
     const int& num_ranks, const int& num_ranks_per_node,
     const int& num_tokens, const int& num_topk) {
     DG_HOST_ASSERT(num_ranks_per_node > 0 and num_ranks % num_ranks_per_node == 0 and num_ranks >= num_ranks_per_node);
-    const int num_remote_nodes = num_ranks / num_ranks_per_node - 1;
+    const int num_nodes = num_ranks / num_ranks_per_node;
+
+    struct Fitted {
+        // The ordered regime (the sender routes and posts rows in first-need order) from this many tokens per rank
+        int min_ordered_tokens;
+        // ... and from this top-k
+        int min_ordered_topk;
+        // L1 leads L2 by at most this many pool blocks in the ordered regime
+        int l1_lead_cap;
+        // Share of the clusters that stop claiming tasks near the end of the routed L2 (0: none)
+        int retire_percent;
+    };
+    //                                 tokens  top-k  cap  retire
+    constexpr Fitted kOneRemoteNode  = {512,    1,     9,   0};
+    constexpr Fitted kMoreNodes      = {256,    8,     9,   50};
+    // kOneRemoteNode (16 GPUs), ordered + cap against the receiver scan: top-19 +5 us at 256, -13 at 512, -29 at
+    //   1024; top-25 -3 at 512, -23 at 768; top-6 -1 at 256, -7 at 512, -24 at 1024. The cap alone is -5 .. -8 of
+    //   that from 512 tokens. Retiring clusters loses at every trigger (+9 .. +25 at top-19, 1024 tokens): its
+    //   prize is a loaded return wire, which one remote node does not have.
+    // kMoreNodes (32 GPUs): ordered against the scan -9 .. -46 us at 256 .. 1024 (top-19 / top-25); cap and
+    //   retire together -14 (top-19) / -10 (top-25) at 512 and -29 / -24 at 1024. Top-k below 8 is checked but
+    //   not timed there, and stays on the scan.
+    const Fitted& fitted = num_nodes == 2 ? kOneRemoteNode : kMoreNodes;
 
     layout::IBPlan plan;
     plan.ranks_per_node = num_ranks_per_node;
-
-    // FITTED: the sender routes and posts rows in first-need order from 256 tokens with two or more remote nodes
-    // (EP32: -9 .. -46 us against the receiver scan at 256 .. 1024); with one remote node it loses 17-55 us
-    // Small top-k (top-6: 18% of tokens have no expert on a given remote node) stays on the receiver scan until
-    // the ordered regime is validated for it
-    const bool is_ordered = num_remote_nodes >= 2 and num_tokens >= 256 and num_topk >= 8;
+    const bool is_ordered = num_nodes >= 2 and num_tokens >= fitted.min_ordered_tokens and num_topk >= fitted.min_ordered_topk;
     plan.routing = is_ordered ? layout::IBRouting::SenderTables : layout::IBRouting::ReceiverScan;
     plan.first_need_order = is_ordered;
-
-    // FITTED tail policy of the ordered regime: L1 leads L2 by at most 9 pool blocks (-7 .. -8 us), half of the
-    // clusters stop claiming at 90% of the routed L2 (-10 .. -17); both only pay with the network in the loop.
-    // Shared L2 before the routed tasks: -6 .. -7 us at 512 .. 768 with top-k 19, +9 at 1024 with top-k 25.
     if (is_ordered) {
-        plan.l1_lead_cap = 9;
-        plan.retire_percent = 50, plan.retire_at_percent = 90;
-        plan.shared_l2_early = num_topk > 8 and num_topk < 24;
+        plan.l1_lead_cap = fitted.l1_lead_cap;
+        plan.retire_percent = fitted.retire_percent;
+        // The trigger: the share of the routed L2 after which a retiring cluster stops. The later, the more
+        // nodes share a token's experts (fewer of its partial sums are still missing near the end):
+        // 100 x 0.6^(nodes / top-k) = 90 at top-19 and 92 at top-25 on four nodes (measured: 92 against 90 is
+        // -9 us at top-25, 1024 tokens, and -3 at 768).
+        if (plan.retire_percent > 0)
+            plan.retire_at_percent = static_cast<uint32_t>(std::lround(100.0 * std::pow(0.6, static_cast<double>(num_nodes) / num_topk)));
+        // FITTED: the shared expert's L2 before the routed tasks: -6 .. -7 us at 512 .. 768 with top-19, +9 at
+        // 1024 with top-25 (four nodes); +8 with one remote node
+        plan.shared_l2_early = plan.retire_percent > 0 and num_topk > 8 and num_topk < 24;
     }
 
     // Development overrides

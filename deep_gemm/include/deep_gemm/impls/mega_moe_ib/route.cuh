@@ -25,11 +25,13 @@ namespace deep_gemm::ib {
 constexpr uint32_t kNumBuildParts = layout::MegaMoEIBSignals::kMaxSortParts;
 constexpr uint32_t kBuildSort = 1;  // row of `sort_shared` / `sort_done` the table build uses
 
-// One part of the sender's table build. `row_of_token(nr, token)` is the mirror row an entry carries.
-template <typename G, uint32_t kNumThreads, uint32_t kBarrierIdx, typename row_of_token_t>
+// One part of the sender's table build. `row_of_token(nr, token)` is the mirror row an entry carries;
+// `before_scatter()` runs on every thread once the counts are staged (it may wait for what the rows depend on).
+template <typename G, uint32_t kNumThreads, uint32_t kBarrierIdx, typename row_of_token_t, typename before_scatter_t>
 CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, const uint32_t& num_tokens,
                                  const uint32_t& part, uint32_t* const smem, const uint32_t& num_smem_bytes,
-                                 const uint32_t& thread_idx, const row_of_token_t& row_of_token) {
+                                 const uint32_t& thread_idx, const row_of_token_t& row_of_token,
+                                 const before_scatter_t& before_scatter) {
     using namespace comm;
     constexpr uint32_t kE = G::kNumExpertsPerRank * G::kNumNodes * G::kLsa;      // all experts
     constexpr uint32_t kNodeExperts = G::kNumExpertsPerRank * G::kLsa;
@@ -143,6 +145,8 @@ CUTLASS_DEVICE void build_tables(const Launch& launch, uint8_t* const input, con
             }
         }
     }
+
+    before_scatter();
 
     // 5. Scatter this part's slice: the entry with global position p goes to staging[(nr + 1) * count_words + p]
     for (uint32_t i0 = begin + thread_idx; i0 < end; i0 += kNumThreads * kNumLoads) {

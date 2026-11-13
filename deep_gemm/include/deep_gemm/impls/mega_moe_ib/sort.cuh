@@ -20,14 +20,16 @@ struct SortScratch {
     uint32_t key_starts[kNumKeys];
 };
 
-// keys[t] = max over token t's top-k entries on `node` of (expert % experts per rank), 0 without one.
+// Return order: keys[t] = max over token t's top-k entries on `node` of (expert % experts per rank), 0 without one
+// (when the node finishes the token). First-need order (`kFirstNeed`): the min instead, `experts per rank` without
+// one (when the node first needs the token's row).
 // The whole CTA role (`kNumThreads` threads on barrier `kBarrierIdx`) runs it; `topk_idx` must have landed.
-template <typename G, uint32_t kNumThreads, uint32_t kBarrierIdx>
+template <typename G, uint32_t kNumThreads, uint32_t kBarrierIdx, bool kFirstNeed = false>
 CUTLASS_DEVICE void build_return_keys(uint32_t* keys, const uint64_t* topk_idx, const uint32_t& num_tokens,
                                       const uint32_t& node, const uint32_t& thread_idx) {
     constexpr uint32_t kNumLoads = 8;
     for (uint32_t t = thread_idx; t < num_tokens; t += kNumThreads)
-        keys[t] = 0;
+        keys[t] = kFirstNeed ? G::kNumExpertsPerRank : 0u;
     ptx::sync_aligned(kNumThreads, kBarrierIdx);
     const uint32_t num_entries = num_tokens * G::kK;
     for (uint32_t i0 = thread_idx; i0 < num_entries; i0 += kNumThreads * kNumLoads) {
@@ -38,8 +40,12 @@ CUTLASS_DEVICE void build_return_keys(uint32_t* keys, const uint64_t* topk_idx, 
         #pragma unroll
         for (uint32_t u = 0; u < kNumLoads; ++ u) {
             const int expert = static_cast<int>(static_cast<int64_t>(entries[u]));
-            if (expert >= 0 and G::node_of(static_cast<uint32_t>(expert) / G::kNumExpertsPerRank) == node)
-                atomicMax(keys + (i0 + u * kNumThreads) / G::kK, static_cast<uint32_t>(expert) % G::kNumExpertsPerRank);
+            if (expert >= 0 and G::node_of(static_cast<uint32_t>(expert) / G::kNumExpertsPerRank) == node) {
+                if constexpr (kFirstNeed)
+                    atomicMin(keys + (i0 + u * kNumThreads) / G::kK, static_cast<uint32_t>(expert) % G::kNumExpertsPerRank);
+                else
+                    atomicMax(keys + (i0 + u * kNumThreads) / G::kK, static_cast<uint32_t>(expert) % G::kNumExpertsPerRank);
+            }
         }
     }
     ptx::sync_aligned(kNumThreads, kBarrierIdx);

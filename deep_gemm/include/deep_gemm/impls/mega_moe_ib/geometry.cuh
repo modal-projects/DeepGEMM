@@ -90,6 +90,16 @@ struct Geometry {
     // Sender tables: the 8 SMs below the receivers build them (they join the pull when they are done)
     static constexpr uint32_t kNumBuildSMs = kSenderTables ? layout::MegaMoEIBSignals::kMaxSortParts : 0;
     static constexpr uint32_t kFirstBuildSM = kFirstReceiverSM - kNumBuildSMs;
+    // First-need order: one SM per remote node below the builders sorts the tokens; the rows are staged in
+    // chunks of kNumRowsPerStage by the SMs from kFirstPullSM up (one chunk each, wrapping around)
+    static constexpr uint32_t kNumOrderSMs = kPlan.first_need_order ? kR : 0;
+    static constexpr uint32_t kFirstOrderSM = kFirstBuildSM - kNumOrderSMs;
+    static constexpr uint32_t kNumRowsPerStage = 32;
+    static constexpr uint32_t kNumStageSMs = kFirstOrderSM - kFirstPullSM;
+    DG_STATIC_ASSERT(not kPlan.first_need_order or (kFirstOrderSM > kFirstPullSM and kPlan.row_issuers == 1 and
+                     kPlan.rows_per_put % kNumRowsPerStage == 0 and
+                     math::constexpr_ceil_div(kNumMaxTokens, kNumRowsPerStage) <= layout::MegaMoEIBSignals::kMaxFwdChunks),
+                     "Invalid first-need order plan");
     DG_STATIC_ASSERT(kFirstPullSM < kEndPullSM and kEndPullSM <= kNumSMs and kFirstBuildSM >= kFirstPullSM, "Not enough SMs for the start roles");
 
     // The remote source a receiver SM handles: the last kR SMs take this GPU's counterparts (node slot order from
@@ -162,6 +172,10 @@ struct Slots {
     //   combine_scratch  the last T x H x 4 bytes of its proxy-combine region: fp32 sums of the source combine
     CUTLASS_DEVICE static uint8_t* outbox_mirror(const Launch& launch) { return mirror(launch, launch.my_node); }
     CUTLASS_DEVICE static uint8_t* outbox_ret(const Launch& launch) { return ret(launch, launch.my_node); }
+    //   row_stage(nr)    the start of its proxy-combine region: the rows for remote node slot nr in first-need order
+    CUTLASS_DEVICE static uint8_t* row_stage(const Launch& launch, const uint32_t& nr) {
+        return proxy_combine(launch, launch.my_node) + static_cast<int64_t>(nr) * G::buf().num_max_tokens * G::buf().token_bytes();
+    }
     CUTLASS_DEVICE static float* combine_scratch(const Launch& launch) {
         return reinterpret_cast<float*>(proxy_combine(launch, launch.my_node) + G::buf().proxy_combine_stride()
                                         - static_cast<int64_t>(G::buf().num_max_tokens) * G::buf().hidden * 4);

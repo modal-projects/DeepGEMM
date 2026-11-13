@@ -95,7 +95,14 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 gin.put(dst + G::buf().off_sf(), input + G::buf().off_sf(), static_cast<uint64_t>(num_tokens) * G::buf().sf_bytes(), peer);
             for (uint32_t t = issuer * G::kNumRowsPerPut; t < num_tokens; t += G::kNumRowsPerPut * G::kNumRowIssuers) {
                 const uint64_t offset = static_cast<uint64_t>(t) * G::buf().token_bytes();
-                gin.put(dst + offset, input + offset,
+                // First-need order: the rows of this put come from the stage, once their chunks are staged
+                const uint8_t* rows = input;
+                if constexpr (G::kPlan.first_need_order) {
+                    rows = Slots<G>::row_stage(launch, nr);
+                    for (uint32_t c = t / G::kNumRowsPerStage; c * G::kNumRowsPerStage < cute::min(num_tokens, t + G::kNumRowsPerPut); ++ c)
+                        landing::await_raised(&launch.signals->rows_staged[nr][c], launch.epoch, launch.site("rows staged", nr, c));
+                }
+                gin.put(dst + offset, rows + offset,
                         static_cast<uint64_t>(cute::min(num_tokens - t, static_cast<uint32_t>(G::kNumRowsPerPut))) * G::buf().token_bytes(), peer);
             }
             trace::stamp<G>(launch, trace::kRowsPosted);
@@ -103,11 +110,81 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         __syncwarp();
     }
 
+    // First-need order: sort the tokens per remote node by when that node first needs them; stage the rows in that
+    // order, 32 at a time on SMs that are idle now (each raises a flag per chunk; the poster above waits for them)
+    constexpr uint32_t kNeedSort = 0;
+    if constexpr (G::kPlan.first_need_order) {
+        const auto need_pos = launch.signals->tables + G::kOffNeedPos, need_inv = launch.signals->tables + G::kOffNeedInv;
+        if (sm_idx >= G::kFirstOrderSM and sm_idx < G::kFirstBuildSM) {
+            const uint32_t nr = sm_idx - G::kFirstOrderSM;
+            build_return_keys<G, kNumThreads, kBarrierIdx, true>(
+                keys, reinterpret_cast<const uint64_t*>(input + G::buf().off_idx()), num_tokens,
+                G::node_of_slot(nr, launch.my_node), thread_idx);
+            sort_by_key<kNumKeys, kNumThreads, kBarrierIdx>(keys, num_tokens, scratch, thread_idx,
+                [&](const uint32_t& token, const uint32_t& position) {
+                    need_pos[nr * G::kTableT + token] = position;
+                    need_inv[nr * G::kTableT + position] = token;
+                });
+            __threadfence();
+            sync();
+            if (thread_idx == 0)
+                landing::raise(&launch.signals->sort_done[kNeedSort][nr], launch.epoch);
+        }
+        if (sm_idx >= G::kFirstPullSM and sm_idx < G::kFirstOrderSM) {
+            constexpr uint32_t kNumRowUnits = G::kH / 16, kNumLoads = 10;
+            const uint32_t num_chunks = math::ceil_div(num_tokens, G::kNumRowsPerStage);
+            const auto tokens = smem;  // [32] the tokens of this chunk's rows
+            for (uint32_t q = sm_idx - G::kFirstPullSM; q < G::kR * num_chunks; q += G::kNumStageSMs) {
+                const uint32_t nr = q / num_chunks, chunk = q % num_chunks;
+                const uint32_t first_row = chunk * G::kNumRowsPerStage;
+                const uint32_t num_rows = cute::min(num_tokens - first_row, static_cast<uint32_t>(G::kNumRowsPerStage));
+                if (thread_idx == 0)
+                    landing::await_raised(&launch.signals->sort_done[kNeedSort][nr], launch.epoch, launch.site("need order", nr));
+                sync();
+                if (thread_idx < num_rows)
+                    tokens[thread_idx] = __ldcg(need_inv + nr * G::kTableT + first_row + thread_idx);
+                sync();
+                const auto stage = Slots<G>::row_stage(launch, nr) + static_cast<int64_t>(first_row) * G::buf().token_bytes();
+                for (uint32_t u0 = thread_idx; u0 < num_rows * kNumRowUnits; u0 += kNumThreads * kNumLoads) {
+                    uint4 units[kNumLoads];
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kNumLoads; ++ b) {
+                        const uint32_t u = u0 + b * kNumThreads;
+                        if (u < num_rows * kNumRowUnits)
+                            units[b] = __ldcg(reinterpret_cast<const uint4*>(input + static_cast<int64_t>(tokens[u / kNumRowUnits]) * G::buf().token_bytes()) + u % kNumRowUnits);
+                    }
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kNumLoads; ++ b) {
+                        const uint32_t u = u0 + b * kNumThreads;
+                        if (u < num_rows * kNumRowUnits)
+                            reinterpret_cast<uint4*>(stage)[u] = units[b];
+                    }
+                }
+                __threadfence();
+                sync();
+                if (thread_idx == 0)
+                    landing::raise(&launch.signals->rows_staged[nr][chunk], launch.epoch);
+            }
+        }
+    }
+
     // Sender tables: counts and slot entries for every remote node, built here and put as one message per node
     if constexpr (G::kSenderTables) {
-        if (sm_idx >= G::kFirstBuildSM and sm_idx < G::kFirstReceiverSM)
+        if (sm_idx >= G::kFirstBuildSM and sm_idx < G::kFirstReceiverSM) {
+            const auto need_pos = launch.signals->tables + G::kOffNeedPos;
             build_tables<G, kNumThreads, kBarrierIdx>(launch, input, num_tokens, sm_idx - G::kFirstBuildSM, smem, num_smem_bytes, thread_idx,
-                [](const uint32_t&, const uint32_t& token) { return token; });
+                [&](const uint32_t& nr, const uint32_t& token) {
+                    return G::kPlan.first_need_order ? __ldcg(need_pos + nr * G::kTableT + token) : token;
+                },
+                [&]() {
+                    // The entries carry the rows: the order of every remote node must be there before the scatter
+                    if constexpr (G::kPlan.first_need_order) {
+                        if (thread_idx < G::kR)
+                            landing::await_raised(&launch.signals->sort_done[kNeedSort][thread_idx], launch.epoch, launch.site("need order", thread_idx));
+                        sync();
+                    }
+                });
+        }
     }
 
     // ---- Receiver ----

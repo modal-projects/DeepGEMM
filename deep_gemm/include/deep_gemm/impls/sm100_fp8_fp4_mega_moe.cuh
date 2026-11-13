@@ -296,10 +296,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // DG_MEGA_MOE_IB_ORACLE=2: also no puts from epoch 3 on (no NIC traffic at all: the GB200 NIC-vs-NVLink-read
     // contention cannot show up; slightly optimistic, the put issue cost is gone too)
     const bool ib_gin_active = not (kIBOracle and DG_MEGA_MOE_IB_ORACLE >= 2 and ib_epoch > 2);
+    // DG_MEGA_MOE_IB_LSA=L: the number of ranks per NVLink domain (node) as a compile-time constant. Without it ib_lsa and
+    // ib_num_nodes are run-time values (sym_buffer.num_lsa_ranks), so every loop over the remote nodes is compiled for up to
+    // kNumRanks - 1 of them: the forward-combine node loop is unrolled 31 times at both of its call sites at 32 ranks, which
+    // is about 4/5 of the kernel's code. A launch whose allocation has a different domain size traps (a wrong value would
+    // route silently to the wrong ranks). Unset: the run-time form.
+#if defined(DG_MEGA_MOE_IB_LSA) and DG_MEGA_MOE_IB_LSA
+    constexpr uint32_t ib_lsa = DG_MEGA_MOE_IB_LSA;
+    DG_STATIC_ASSERT(ib_lsa <= kNumRanks and kNumRanks % ib_lsa == 0, "DG_MEGA_MOE_IB_LSA must divide the number of ranks");
+    constexpr uint32_t ib_num_nodes = kNumRanks / ib_lsa;
+    const uint32_t ib_my_node = sym_buffer.rank_idx / ib_lsa;
+    const auto is_remote = [&](const uint32_t& r) { return r / ib_lsa != ib_my_node; };
+    if (sm_idx == 0 and thread_idx == 0 and sym_buffer.num_lsa_ranks != ib_lsa) {
+        printf("DeepGEMM IB: built for DG_MEGA_MOE_IB_LSA=%u ranks per node, launched with %u (rank %u)\n",
+               ib_lsa, sym_buffer.num_lsa_ranks, sym_buffer.rank_idx);
+        asm volatile("trap;");
+    }
+#else
     const uint32_t ib_lsa = sym_buffer.num_lsa_ranks;
     const uint32_t ib_my_node = sym_buffer.rank_idx / ib_lsa;
     const uint32_t ib_num_nodes = kNumRanks / ib_lsa;
     const auto is_remote = [&](const uint32_t& r) { return not sym_buffer.is_lsa(r); };
+#endif
     const auto ib_cp = [&](const uint32_t& r, const uint32_t& n) { return n * ib_lsa + r % ib_lsa; };  // counterpart of r on node n
     const auto ib_node_of_slot = [&](const uint32_t& nr) { return nr < ib_my_node ? nr : nr + 1; };     // nr-th remote node
     const auto make_gin = [&](const uint32_t& ctx) { auto g = comm::GinIB(ib_dev_comm, ib_window, sym_buffer.base, ctx); g.active = ib_gin_active; return g; };

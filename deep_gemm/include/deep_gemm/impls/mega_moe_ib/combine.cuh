@@ -76,6 +76,7 @@ CUTLASS_DEVICE void add_records(const Launch& launch, const int64_t* topk_idx, v
             const auto value_ptr = [&](const uint32_t& j) { return reinterpret_cast<uint64_t*>(record + first_col + (j * 32 + lane_idx) * 8); };
             const auto scale_ptr = [&](const uint32_t& j) { return reinterpret_cast<uint32_t*>(record + G::kH + (first_col + (j * 32 + lane_idx) * 8) / 128 * 4); };
 
+            gate<G>(launch, [&]() { return ptx::ld_volatile(reinterpret_cast<const uint32_t*>(Slots<G>::ret(launch, node) + G::kOffRecordFlags + 8 * (position / G::kNumRecordsPerPut))) != static_cast<uint32_t>(launch.epoch); }, "record flag", node, token_idx);
             // All loads of the record's part first; then, as a warp, re-read whatever has not landed
             uint64_t values[kNumUnits];
             uint32_t scales[kNumUnits];

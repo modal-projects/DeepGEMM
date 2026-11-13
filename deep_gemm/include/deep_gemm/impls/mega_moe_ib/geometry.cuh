@@ -87,6 +87,13 @@ struct Geometry {
     // at 1024 tokens (top-19 / 25 / 6), all of it before the last GEMM task.
     static constexpr uint32_t kNumRecordsPerPut = kR > 1 ? 8 : 32;
     static constexpr uint32_t kNumRowsPerPut = 128;     // token rows per forward put
+    // Gated loads (`IBPlan::gated`): threads do not load NIC-written bulk that is still blank. Hints for speed,
+    // never proofs (every poll of comm/landing.cuh stays). A put lands in address order, so its last word tells:
+    // one thread polls it (`gate`), slowly. Token rows: one thread per source (`watch_rows`) publishes a count.
+    // Return records: a flag word (the epoch) is put behind each chunk, on its queue pair.
+    static constexpr bool kGated = kPlan.gated;
+    static constexpr uint32_t kNumRowsPerHint = 16;
+    static constexpr int64_t kOffRecordFlags = kNumMaxTokens * buf().record_bytes();    // behind the packed records
     static constexpr uint32_t kNumMaxChunks = math::constexpr_ceil_div(kNumMaxTokens, kNumRecordsPerPut);
     DG_STATIC_ASSERT(kNumMaxChunks <= layout::MegaMoEIBSignals::kMaxReturnChunks and
                      kNumNodes <= layout::MegaMoEIBSignals::kMaxReturnNodes, "Too many return chunks or nodes");
@@ -173,6 +180,20 @@ struct Launch {
 template <typename G>
 CUTLASS_DEVICE comm::GinOf<G::kPlan.gin_backend> make_gin(const Launch& launch, const comm::Stream& stream, const uint32_t& nr, const uint32_t& lane = 0) {
     return comm::GinOf<G::kPlan.gin_backend>(launch.handles, launch.base, comm::Gin::context_of(stream, stream == comm::Stream::Return ? lane + nr : lane), launch.network);
+}
+
+// Gated loads: wait while `missing()`, by name and bounded; entered only when the first look fails
+template <typename G, typename missing_t>
+CUTLASS_DEVICE void gate(const Launch& launch, const missing_t& missing, const char* name, const uint32_t& a = 0, const uint32_t& b = 0) {
+    if constexpr (G::kGated)
+        if (launch.network and missing())
+            comm::landing::spin<true>(missing, [&]() { __nanosleep(200); }, launch.site(name, a, b));
+}
+// Gated loads: rows of source node `node` that have landed in this GPU's mirror, all ones when complete; 0 while
+// the word holds another launch's epoch. Written by `watch_rows`.
+CUTLASS_DEVICE uint32_t rows_landed(const Launch& launch, const uint64_t* word) {
+    const uint64_t v = ptx::ld_volatile(word);
+    return (v >> 32) == (launch.epoch & 0xffffffffull) ? static_cast<uint32_t>(v) : 0u;
 }
 
 // Node slot `node` of this GPU's tail, and the regions in it (see layout::IBBufferLayout)

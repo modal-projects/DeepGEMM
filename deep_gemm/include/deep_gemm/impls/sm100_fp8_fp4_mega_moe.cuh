@@ -506,6 +506,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Gated loads: the dispatch warps of the row posters' SMs do not pull; one thread of each watches rows land
+        if (IB::kGated and sm_idx >= IB::kFirstRowSM and sm_idx < IB::kFirstRowSM + IB::kR and thread_idx == 0)
+            ib::watch_rows<IB>(ib_launch, sm_idx - IB::kFirstRowSM);
+#endif
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
@@ -517,7 +522,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // SMs whose epilogue warps are busy at the start (posters, receivers) take no part in the pull
         constexpr uint32_t kNumGlobalWarps = (IB::kEndPullSM - IB::kFirstPullSM) * kNumDispatchWarps;
-        uint64_t ib_tables_seen = 0;
+        uint64_t ib_tables_seen = 0, ib_rows_done = 0;
         for (uint32_t token_idx = (sm_idx - IB::kFirstPullSM) * kNumDispatchWarps + warp_idx;
              sm_idx >= IB::kFirstPullSM and sm_idx < IB::kEndPullSM; token_idx += kNumGlobalWarps) {
 #else
@@ -639,7 +644,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<uint8_t>(),
                 buffer.l1_sf_buffer.get_base_ptr<uint32_t>() + (pool_block_idx % kNumRingBlocks) * SF_BLOCK_M
                     + transform_sf_token_idx(token_idx_in_expert % BLOCK_M),
-                kNumSFRingTokens, lane_idx);
+                kNumSFRingTokens, lane_idx, ib_rows_done);
 #else
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);

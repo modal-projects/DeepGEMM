@@ -91,6 +91,7 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
         }
         const uint32_t num_items = num_tokens * kNumQuarters;
         const auto mirror = Slots<G>::mirror(launch, node);
+        gate<G>(launch, [&]() { return rows_landed(launch, signals->rows_landed + node) != ~0u; }, "rows complete", node);
         const auto partials = Slots<G>::proxy_combine(launch, node);
         const auto stage = Slots<G>::fwd_stage(launch, node);
         const auto topk_idx = reinterpret_cast<const uint64_t*>(mirror + G::buf().off_idx());
@@ -188,6 +189,8 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
                     const int64_t offset = static_cast<int64_t>(chunk) * G::kNumRecordsPerPut * kNumRecordBytes;
                     make_gin<G>(launch, comm::Stream::Return, nr, chunk)
                         .put(ret_dst + offset, stage + offset, static_cast<uint64_t>(num_records) * kNumRecordBytes, source);
+                    if constexpr (G::kGated)    // the chunk's flag: records are re-armed as they are read, so their own words cannot tell
+                        make_gin<G>(launch, comm::Stream::Return, nr, chunk).put_value(reinterpret_cast<uint32_t*>(ret_dst + G::kOffRecordFlags + 8 * chunk), static_cast<uint32_t>(launch.epoch), source);
                     trace::stamp<G>(launch, trace::kLastChunkPut);
                 }
             }

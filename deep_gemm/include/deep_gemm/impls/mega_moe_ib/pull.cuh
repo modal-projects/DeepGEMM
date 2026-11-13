@@ -40,7 +40,7 @@ CUTLASS_DEVICE float pull_row(const Launch& launch, const layout::SymBuffer<kNum
                               const layout::MegaMoEBuffer& buffer,
                               const uint32_t& src_rank, const uint32_t& entry,
                               uint8_t* dst_row, uint32_t* dst_sf, const uint32_t& dst_sf_stride,
-                              const uint32_t& lane_idx) {
+                              const uint32_t& lane_idx, uint64_t& rows_done) {
     constexpr uint32_t kNumUnits = G::kH / (32 * 16);
     constexpr uint32_t kNumSFWords = G::kH / 128;
     constexpr uint32_t kNumSFLoads = math::constexpr_ceil_div(kNumSFWords, 32u);
@@ -61,6 +61,14 @@ CUTLASS_DEVICE float pull_row(const Launch& launch, const layout::SymBuffer<kNum
         reinterpret_cast<uint32_t*>(mirror + G::buf().off_weights()) + src_token_topk_idx :
         buffer.input_topk_weights_buffer.template get_base_ptr<uint32_t>() + src_token_topk_idx, holder);
 
+    // Gated loads: wait until the watcher has seen the row; one bit of `rows_done` per source seen complete
+    if (G::kGated and is_remote and not ((rows_done >> G::source_of(src_rank, launch.my_node)) & 1)) {
+        const auto word = sym_buffer.map(launch.signals->rows_landed + G::node_of(src_rank), holder);
+        uint32_t rows = 0;
+        gate<G>(launch, [&]() { return (rows = rows_landed(launch, word)) <= (entry >> 16); }, "row hint", src_rank, entry >> 16);
+        rows_done |= static_cast<uint64_t>(rows == ~0u) << G::source_of(src_rank, launch.my_node);
+    }
+
     // Issue everything
     uint32_t sf_words[kNumSFLoads];
     #pragma unroll
@@ -71,6 +79,15 @@ CUTLASS_DEVICE float pull_row(const Launch& launch, const layout::SymBuffer<kNum
     #pragma unroll
     for (uint32_t u = 0; u < kNumUnits; ++ u)
         units[u] = comm::landing::load(row + (u * 32 + lane_idx) * 16);
+
+    if constexpr (G::kGated and G::kDiag) {     // the hint was early for this row: must stay 0 (printed by the next launch)
+        bool blank = false;
+        #pragma unroll
+        for (uint32_t u = 0; u < kNumUnits; ++ u)
+            blank |= comm::landing::is_blank(units[u]);
+        if (is_remote and blank)
+            atomicAdd(&launch.signals->early_row_hints, 1u);
+    }
 
     // Weight (polled here in every build: no other reader is ahead of the pull for every source)
     if (is_remote)
@@ -101,6 +118,23 @@ CUTLASS_DEVICE float pull_row(const Launch& launch, const layout::SymBuffer<kNum
     trace::stamp<G>(launch, trace::kFirstRemoteRow, is_remote and lane_idx == 0);
     trace::stamp<G>(launch, trace::kLastRow, lane_idx == 0);
     return __uint_as_float(weight);
+}
+
+// Gated loads, one thread per source node on the proxy (of an SM that takes no part in the pull): publish how many
+// of the source's rows have landed, kNumRowsPerHint at a time (rows are put in mirror order on one queue pair)
+template <typename G>
+CUTLASS_DEVICE void watch_rows(const Launch& launch, const uint32_t& nr) {
+    const uint32_t node = G::node_of_slot(nr, launch.my_node);
+    const auto mirror = Slots<G>::mirror(launch, node);
+    uint64_t header = 0;                    // stays 0 in a zero-network launch: nobody waits
+    gate<G>(launch, [&]() { return (header = ptx::ld_volatile(reinterpret_cast<const uint64_t*>(mirror + G::buf().off_header()))) == ~0ull or (header >> 32) != (launch.epoch & 0xffffffffull); }, "watch header", node);
+    const uint32_t num_tokens = static_cast<uint32_t>(header) & ~G::kHeaderOrdered;
+    uint32_t rows = 0;
+    do {
+        rows = cute::min(rows + G::kNumRowsPerHint, num_tokens);
+        gate<G>(launch, [&]() { return rows and comm::landing::is_blank(comm::landing::load(mirror + static_cast<int64_t>(rows) * G::buf().token_bytes() - 16)); }, "watch rows", node, rows);
+        ptx::st_rel(launch.signals->rows_landed + node, launch.epoch << 32 | (rows < num_tokens ? rows : ~0u));
+    } while (rows < num_tokens);
 }
 
 } // namespace deep_gemm::ib

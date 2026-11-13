@@ -278,8 +278,10 @@ CUTLASS_DEVICE void receive_tables(const Launch& launch, const layout::Workspace
     const auto base = offsets + kEr;            // entries of the ranks below this one
     const uint32_t my_idx = launch.rank % G::kLsa;
 
-    if (thread_idx == 0)
+    if (thread_idx == 0) {
         *base = 0;
+        gate<G>(launch, [&]() { return ptx::ld_volatile(msg_entries - 1) == landing::kBlankWord; }, "table counts");
+    }
     sync();
     uint32_t below = 0;
     for (uint32_t q = thread_idx; q < kNodeExperts; q += kNumThreads) {
@@ -299,6 +301,7 @@ CUTLASS_DEVICE void receive_tables(const Launch& launch, const layout::Workspace
         for (uint32_t e = 0; e < kEr; ++ e)
             offsets[e] = offset, offset += counts[e];
         counts[kEr] = offset;                   // this rank's entries in total (the slot of the token count is free here)
+        gate<G>(launch, [&]() { return offset and ptx::ld_volatile(msg_entries + *base + offset - 1) == landing::kBlankWord; }, "table entries");
     }
     publish();
     sync();

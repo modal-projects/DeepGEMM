@@ -34,6 +34,10 @@ CUTLASS_DEVICE void report_return_gaps(const Launch& launch, const bool& is_prin
         if (const uint32_t num_late = atomicExch(&launch.signals->late_headers, 0u); num_late > 0)
             printf("DeepGEMM IB note: rank=%u, %u receivers had the tables before the header, before epoch %llu\n",
                    launch.rank, num_late, static_cast<unsigned long long>(launch.epoch));
+        if constexpr (G::kGated)
+            if (const uint32_t num_early = atomicExch(&launch.signals->early_row_hints, 0u); num_early > 0)
+                printf("DeepGEMM IB Error: the row hint was early for %u row loads, rank=%u, before epoch %llu\n",
+                       num_early, launch.rank, static_cast<unsigned long long>(launch.epoch));
         #pragma unroll
         for (uint32_t nr = 0; nr < G::kR; ++ nr) {
             const uint32_t num_empty = atomicExch(launch.signals->return_gaps + nr, 0u);
@@ -235,6 +239,12 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 const auto table_counts = reinterpret_cast<const uint32_t*>(mirror + G::buf().off_tables()) - G::kNumExpertsPerRank * G::kLsa;
                 if ((static_cast<uint32_t>(header) & G::kHeaderOrdered) and ptx::ld_volatile(table_counts) != landing::kBlankWord)
                     atomicAdd(&launch.signals->late_headers, 1u);
+            }
+            // Gated loads: the top-k rows are another put than the header; read by a scan source's scan and by the proxy
+            if constexpr (G::kGated) {
+                const uint32_t num_header_tokens = static_cast<uint32_t>(header) & ~G::kHeaderOrdered;
+                if (is_proxy or not (static_cast<uint32_t>(header) & G::kHeaderOrdered))
+                    gate<G>(launch, [&]() { return num_header_tokens and ptx::ld_volatile(topk_idx + num_header_tokens * G::kK - 1) == landing::kBlankIdx; }, "index rows");
             }
             trace::stamp<G>(launch, trace::kFirstHeaderSeen);
             trace::stamp<G>(launch, trace::kHeadersSeen);

@@ -45,6 +45,9 @@ struct IBPlan {
     // another backend than the communicator's: the kernel cannot check it before its puts run.
     // 0 = unknown: every put dispatches over all backends at run time (39% of a scan build's code)
     uint32_t gin_backend = 0;
+    // Gated loads (ib::Geometry::kGated), for NICs where bulk that many threads load before it has landed lands
+    // milliseconds late (GB200 / ConnectX-7 at 400G: 10 ms per launch at 128 tokens; not ConnectX-8 at 800G)
+    bool gated = false;
     // Tail policy, see sched::SchedulePolicy
     uint32_t l1_lead_cap = 0, retire_percent = 0, retire_at_percent = 100;
     bool shared_l2_early = false;
@@ -140,11 +143,14 @@ struct alignas(128) MegaMoEIBSignals {
     alignas(128) uint32_t tables[kNumTableWords];
 
     // Diagnostics (hang forensics and the trace build)
-    alignas(128) uint64_t sm_stage[256];  // per CTA: (epoch << 8) | stage, dumped by the grid-sync timeout
+    // Gated loads: (epoch << 32) | rows of source node n landed in this GPU's mirror (ib::watch_rows); then free words
+    alignas(128) uint64_t rows_landed[kMaxNodes];
+    uint64_t free_words[256 - kMaxNodes];
     uint32_t stage_dumped;
     alignas(128) uint64_t trace[48];
     alignas(128) uint32_t return_gaps[kMaxNodes];  // diagnostics build: empty positions of a return order, per node slot
     uint32_t late_headers;                         // diagnostics build: receivers whose tables landed before the header
+    uint32_t early_row_hints;                      // diagnostics build, gated loads: rows loaded blank after their hint
 };
 
 // Geometry of the IB tail of the symmetric buffer. One instance per (max tokens, hidden, top-k, experts); the

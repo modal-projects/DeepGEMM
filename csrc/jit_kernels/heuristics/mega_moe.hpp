@@ -303,6 +303,8 @@ static layout::IBPlan get_mega_moe_ib_plan(
     layout::IBPlan plan;
     plan.ranks_per_node = num_ranks_per_node;
     plan.gin_backend = static_cast<uint32_t>(gin_backend);  // the communicator's (0: unknown, generic dispatch)
+    // Gated loads for 400G-class NICs (IBPlan::gated); an unknown rate plans the ungated path, like 800G
+    plan.gated = link_gbps > 0 and link_gbps <= 400;
     const bool is_ordered = num_nodes >= 2 and row_us >= 26.2;  // us: what the sender-table chain costs
     plan.ordered = is_ordered;
     if (is_ordered) {
@@ -340,6 +342,7 @@ static layout::IBPlan get_mega_moe_ib_plan(
         const auto value = static_cast<uint32_t>(std::stoul(digits));
         if (name == "ORDERED") plan.ordered = value;
         else if (name == "GIN_BACKEND") plan.gin_backend = value;
+        else if (name == "GATED") plan.gated = value;
         else if (name == "L1_LEAD_CAP") plan.l1_lead_cap = value;
         else if (name == "RETIRE_PERCENT") plan.retire_percent = value;
         else if (name == "RETIRE_AT_PERCENT") plan.retire_at_percent = value;
@@ -362,11 +365,12 @@ static layout::IBPlan get_mega_moe_ib_plan(
 static std::string to_string(const layout::IBPlan& plan) {
     return std::format(
         "{{.ranks_per_node = {}, .ordered = {}, "
-        ".gin_backend = {}, "
+        ".gin_backend = {}, {}"
         ".l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
         ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
         plan.ranks_per_node, plan.ordered,
-        plan.gin_backend, plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
+        plan.gin_backend, plan.gated ? ".gated = true, " : "",     // spelt only when on: other plans keep their text
+        plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
         plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }
 

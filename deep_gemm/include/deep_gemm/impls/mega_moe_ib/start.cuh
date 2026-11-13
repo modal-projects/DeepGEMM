@@ -224,9 +224,12 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 header = ptx::ld_volatile(header_ptr);
                 if (not launch.network and header != ~0ull)
                     return true;
-                if ((header >> 32) != (launch.epoch & 0xffffffffull))
+                // A blank header is all ones: without the first test it would pass as this launch's header
+                // (with 2^32 - 1 tokens) once in 2^32 launches of a buffer. A real header has a token count < 2^32 - 1
+                const bool is_landed = header != ~0ull and (header >> 32) == (launch.epoch & 0xffffffffull);
+                if (not is_landed)
                     __nanosleep(200);
-                return (header >> 32) == (launch.epoch & 0xffffffffull);
+                return is_landed;
             }, [&]() {
                 printf("DeepGEMM IB header timeout: rank=%u, source=%u, proxy=%u, header=%llx, epoch=%llu\n",
                        launch.rank, src_rank, proxy, static_cast<unsigned long long>(header), static_cast<unsigned long long>(launch.epoch));

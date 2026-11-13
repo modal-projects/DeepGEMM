@@ -1402,6 +1402,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             while (ptx::ld_acq_sys(&workspace.signals->ib_o_landed[ib_my_node][slot + lane_idx]) < ib_epoch);
         __syncwarp();
     };
+    // Token count of the source this GPU proxies for node n. The proxy's receiver thread stores it once it has the source's
+    // meta header, tagged with the launch epoch. On the sender-table start the counts are published before that store, so a
+    // warp with no pull work can get here first: it waits for this launch's tag instead of using the previous launch's count
+    // (a different token count on the same buffer would make it claim tokens that do not exist).
+    // DG_MEGA_MOE_IB_NT_TAG=0 builds the old untagged form (timing control for this fix only; to be removed)
+#ifndef DG_MEGA_MOE_IB_NT_TAG
+#define DG_MEGA_MOE_IB_NT_TAG 1
+#endif
+    constexpr bool kIBNtTag = kIBSST and DG_MEGA_MOE_IB_NT_TAG;
+    DG_STATIC_ASSERT(kNumMaxTokensPerRank < 65536, "The token count shares its word with a 16-bit epoch tag");
+    const auto ib_src_tokens = [&](const uint32_t& n) {
+        // The scanning start stores the count before it publishes the counts every warp waits for: no tag needed there
+        if constexpr (not kIBNtTag)
+            return ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+        uint32_t v;
+        do { v = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]); } while ((v >> 16) != static_cast<uint32_t>(ib_epoch & 0xffffu));
+        return v & 0xffffu;
+    };
     const auto ib_forward_combine = [&](const uint32_t& global_warp, const uint32_t& num_global_warps, const bool& is_leader,
                                         auto batch_tag, const bool& from_epilogue) {
         if constexpr (kIBNoOvReturn)
@@ -1421,7 +1439,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kFiSplit = kIBRetGroups > 0 ? kIBRetGroups : 4;
             for (uint32_t q = 0; q < fi_R; ++ q) {
                 const uint32_t qn = ib_node_of_slot(q);
-                const uint32_t qnt = ptx::ld_volatile(&workspace.signals->ib_o_nt[qn]);
+                const uint32_t qnt = ib_src_tokens(qn);
                 fi_max = cute::max(fi_max, qnt * kFiSplit);
                 if (qnt == 0 and is_leader)  // zero-token nodes: their header now, once
                     make_gin_site(16, ctx_rhdr(q, q), q, ib_xbase).put_value(reinterpret_cast<uint64_t*>(ib_ret(ib_parity, ib_my_node) + kIBRetHdr),
@@ -1459,7 +1477,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (kIBFwdRotate and nr >= fi_R) nr -= fi_R;
             const uint32_t n = ib_node_of_slot(nr);
             const uint32_t s = ib_cp(sym_buffer.rank_idx, n);
-            const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+            const uint32_t nt = ib_src_tokens(n);
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             const auto ret_dst = ib_ret(ib_parity, ib_my_node);
             if (nt == 0 or (fi_on and fi_g / fi_R >= nt * (kIBRetGroups > 0 ? kIBRetGroups : 4))) {
@@ -2374,7 +2392,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // forward-combine polled every row (fdone), so every byte the NIC wrote this launch has landed (rule A)
         for (uint32_t nr = 0; nr + 1 < ib_num_nodes; ++ nr) {
             const uint32_t n = ib_node_of_slot(nr);
-            const uint32_t nt = ptx::ld_volatile(&workspace.signals->ib_o_nt[n]);
+            const uint32_t nt = ib_src_tokens(n);
             const uint32_t nchunks = (nt + kIBChunk - 1) / kIBChunk;
             if (thread_idx == 0)
                 IB_POLL(ptx::ld_acq(&workspace.signals->ib_o_fdone[ib_parity][n]) < nchunks * (kIBRetGroups > 0 ? kIBRetGroups : 1u), (void) 0, "e_fdone", n, nchunks);
@@ -3837,7 +3855,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t i = epilogue_thread_idx; i < kNumExpertsPerRank; i += kNumEpilogueThreads)
                     cnt[i] = 0, cnt2[i] = 0;
                 if (proxy == sym_buffer.rank_idx and epilogue_thread_idx == 0 and scan_j == 0)
-                    workspace.signals->ib_o_nt[r / ib_lsa] = nt;  // the proxy's forward-combine and re-arm need it
+                    workspace.signals->ib_o_nt[r / ib_lsa] = kIBNtTag ? (static_cast<uint32_t>(ib_epoch & 0xffffu) << 16) | nt : nt;  // read through ib_src_tokens()
                 if (kIBScanSlices > 1 and ib_P > 1) {
                     const uint32_t t0 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * scan_j / ib_P);
                     const uint32_t t1 = static_cast<uint32_t>(static_cast<uint64_t>(nt) * (scan_j + 1) / ib_P);

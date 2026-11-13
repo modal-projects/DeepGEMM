@@ -1,15 +1,17 @@
 #pragma once
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <format>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
+
+#include <unistd.h>
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/mega_moe_ib.cuh>
@@ -319,24 +321,25 @@ static layout::IBPlan get_mega_moe_ib_plan(
     }
 
     // Development overrides, one variable per field: DG_MEGA_MOE_IBP_<FIELD>=value (what the development servers
-    // pass per arm). Their switch names for a trace and a zero-network run also apply.
-    const auto set_field = [&](const std::string& name, const uint32_t& value) {
-        if (name == "ordered") plan.ordered = value;
-        else if (name == "gin_backend") plan.gin_backend = value;
-        else if (name == "l1_lead_cap") plan.l1_lead_cap = value;
-        else if (name == "retire_percent") plan.retire_percent = value;
-        else if (name == "retire_at_percent") plan.retire_at_percent = value;
-        else if (name == "shared_l2_early") plan.shared_l2_early = value;
-        else if (name == "diagnostics") plan.diagnostics = value;
-        else if (name == "trace") plan.trace = value;
-        else if (name == "zero_network") plan.zero_network = value;
-    };
-    for (const char* field: {"ordered", "gin_backend", "l1_lead_cap", "retire_percent", "retire_at_percent",
-                             "shared_l2_early", "diagnostics", "trace", "zero_network"}) {
-        std::string variable = std::string("DG_MEGA_MOE_IBP_") + field;
-        std::transform(variable.begin(), variable.end(), variable.begin(), [](unsigned char ch) { return std::toupper(ch); });
-        if (const char* value = std::getenv(variable.c_str()); value != nullptr)
-            set_field(field, static_cast<uint32_t>(std::stoul(value)));
+    // pass per arm; a name that is no field is refused: a misspelt arm must not run the default plan). Their
+    // switch names for a trace and a zero-network run also apply.
+    for (char** entry = environ; *entry != nullptr; ++ entry) {
+        constexpr std::string_view kPrefix = "DG_MEGA_MOE_IBP_";
+        const std::string_view variable(*entry);
+        if (not variable.starts_with(kPrefix) or variable.find('=') == std::string_view::npos)
+            continue;
+        const auto name = variable.substr(kPrefix.size(), variable.find('=') - kPrefix.size());
+        const auto value = static_cast<uint32_t>(std::stoul(std::string(variable.substr(variable.find('=') + 1))));
+        if (name == "ORDERED") plan.ordered = value;
+        else if (name == "GIN_BACKEND") plan.gin_backend = value;
+        else if (name == "L1_LEAD_CAP") plan.l1_lead_cap = value;
+        else if (name == "RETIRE_PERCENT") plan.retire_percent = value;
+        else if (name == "RETIRE_AT_PERCENT") plan.retire_at_percent = value;
+        else if (name == "SHARED_L2_EARLY") plan.shared_l2_early = value;
+        else if (name == "DIAGNOSTICS") plan.diagnostics = value;
+        else if (name == "TRACE") plan.trace = value;
+        else if (name == "ZERO_NETWORK") plan.zero_network = value;
+        else DG_HOST_UNREACHABLE(std::format("Unknown Mega MoE IB plan override: {}", variable));
     }
     if (const char* value = std::getenv("DG_MEGA_MOE_IB_TRACE"); value != nullptr and std::stoul(value) != 0)
         plan.trace = true;

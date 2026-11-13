@@ -31,6 +31,10 @@ struct Geometry {
     static constexpr layout::IBPlan kPlan = plan_t::value;
     static constexpr bool kDiag = kPlan.diagnostics > 0;
     static constexpr bool kOrdered = kPlan.ordered;
+    // A source's header is (epoch << 32) | regime of the build that sent it | its token count. Ranks choose their
+    // regime from their own token count, so a receiver takes every source in the regime its header announces
+    static constexpr uint32_t kHeaderOrdered = 1u << 31;
+    DG_STATIC_ASSERT(kNumMaxTokens < kHeaderOrdered - 1, "A header's low word is never all ones: token counts stay below the regime bit");
 
     static constexpr uint32_t kT = kNumMaxTokens, kH = kHidden, kK = kNumTopk;
     // Zero-network measurement: the first two launches fill both buffer sets over the real network; from the

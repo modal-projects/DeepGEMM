@@ -9,9 +9,10 @@
 //   SMs 1 .. kR      one thread per remote node on the Rows stream: scale factors, then the token rows in puts of
 //                    kNumRowsPerPut rows, in order.
 // Receiver (this GPU as a host and as a proxy), one remote source per SM of the last SMs:
-//   every receiver   learns the source's token count from the header in the proxy's mirror, counts the source's
-//                    top-k entries for this GPU's experts, writes the slot table, raises `tables_ready`, and hands
-//                    the counts to the stock scheduler;
+//   every receiver   learns the source's token count and regime from the header in the proxy's mirror; for a scan
+//                    source it counts the source's top-k entries for this GPU's experts and writes the slot table,
+//                    for an ordered source it copies its slice of the source's tables; then it raises
+//                    `tables_ready` and hands the counts to the stock scheduler;
 //   the proxy's SM   (the source's counterpart is this GPU) also publishes the token count, polls every weight
 //                    (with the indices: the landing proof of the Meta stream), and writes the return order.
 
@@ -23,12 +24,16 @@
 
 namespace deep_gemm::ib {
 
-// Diagnostics, one thread at kernel start: positions the return orders of earlier launches left empty (I10)
+// Diagnostics, one thread at kernel start: positions the return orders of earlier launches left empty (I10), and
+// receivers of ordered sources that found the tables landed when the header arrived (the header wait held them)
 template <typename G>
 CUTLASS_DEVICE void report_return_gaps(const Launch& launch, const bool& is_printer) {
     if constexpr (G::kDiag) {
         if (not is_printer)
             return;
+        if (const uint32_t num_late = atomicExch(&launch.signals->late_headers, 0u); num_late > 0)
+            printf("DeepGEMM IB note: rank=%u, %u receivers had the tables before the header, before epoch %llu\n",
+                   launch.rank, num_late, static_cast<unsigned long long>(launch.epoch));
         #pragma unroll
         for (uint32_t nr = 0; nr < G::kR; ++ nr) {
             const uint32_t num_empty = atomicExch(launch.signals->return_gaps + nr, 0u);
@@ -72,7 +77,8 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             } else {
                 if (num_tokens > 0)
                     gin.put(dst + G::buf().off_weights(), input + G::buf().off_weights(), num_entries * 4, peer);
-                gin.put_value(reinterpret_cast<uint64_t*>(dst + G::buf().off_header()), (launch.epoch << 32) | num_tokens, peer);
+                gin.put_value(reinterpret_cast<uint64_t*>(dst + G::buf().off_header()),
+                              (launch.epoch << 32) | (G::kOrdered ? G::kHeaderOrdered : 0u) | num_tokens, peer);
             }
         }
         __syncwarp();
@@ -203,19 +209,6 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
         const auto topk_idx = reinterpret_cast<const uint64_t*>(mirror + G::buf().off_idx());
         const auto weights = reinterpret_cast<const uint32_t*>(mirror + G::buf().off_weights());
 
-        // Sender tables: every receiver copies its slice of the source's message; only the proxy goes on to the
-        // header and the top-k rows (token count, landing proof, return order)
-        if constexpr (G::kOrdered) {
-            receive_tables<G, kNumThreads, kBarrierIdx>(launch, workspace, mirror, k, src_rank, counts, thread_idx,
-                [&]() {
-                    publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
-                    trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
-                });
-            trace::stamp<G>(launch, trace::kTablesDone, thread_idx == 0);
-            if (not is_proxy)
-                return;
-        }
-
         // The header: one thread polls it, slowly (many threads spinning on memory a NIC writes slow the NIC down)
         if (thread_idx == 0) {
             const auto header_ptr = reinterpret_cast<const uint64_t*>(mirror + G::buf().off_header());
@@ -235,24 +228,46 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                        launch.rank, src_rank, proxy, static_cast<unsigned long long>(header), static_cast<unsigned long long>(launch.epoch));
             });
             counts[G::kNumExpertsPerRank] = static_cast<uint32_t>(header);
+            if constexpr (G::kDiag) {
+                // An ordered source's receivers poll its tables only after its header: count the ones that waited.
+                // `table_counts` = the first count word of the source's table message for this node (the message's
+                // counts end where the mirror's table region starts: route.cuh)
+                const auto table_counts = reinterpret_cast<const uint32_t*>(mirror + G::buf().off_tables()) - G::kNumExpertsPerRank * G::kLsa;
+                if ((static_cast<uint32_t>(header) & G::kHeaderOrdered) and ptx::ld_volatile(table_counts) != landing::kBlankWord)
+                    atomicAdd(&launch.signals->late_headers, 1u);
+            }
             trace::stamp<G>(launch, trace::kFirstHeaderSeen);
             trace::stamp<G>(launch, trace::kHeadersSeen);
         }
         for (uint32_t i = thread_idx; i < G::kNumExpertsPerRank; i += kNumThreads)
             counts[i] = 0;
         sync();
-        const uint32_t num_src_tokens = counts[G::kNumExpertsPerRank];
+        const bool is_src_ordered = counts[G::kNumExpertsPerRank] & G::kHeaderOrdered;
+        const uint32_t num_src_tokens = counts[G::kNumExpertsPerRank] & ~G::kHeaderOrdered;
         const uint32_t num_entries = num_src_tokens * G::kK;
+
+        // An ordered source: every receiver copies its slice of the source's message; only the proxy goes on to
+        // the top-k rows (landing proof, return order)
+        if (is_src_ordered) {
+            receive_tables<G, kNumThreads, kBarrierIdx>(launch, workspace, mirror, k, src_rank, counts, thread_idx,
+                [&]() {
+                    publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
+                    trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
+                });
+            trace::stamp<G>(launch, trace::kTablesDone, thread_idx == 0);
+            if (not is_proxy)
+                return;
+        }
         if (is_proxy) {
             for (uint32_t t = thread_idx; t < num_src_tokens; t += kNumThreads)
                 keys[t] = 0;
             if (thread_idx == 0)
-                launch.signals->src_num_tokens[src_node] = num_src_tokens;
+                launch.signals->src_num_tokens[src_node] = num_src_tokens | (is_src_ordered ? G::kHeaderOrdered : 0u);
             sync();
         }
 
-        scan_route<G, kNumThreads>(launch, workspace, topk_idx, weights, src_rank, num_entries, is_proxy, counts, keys, thread_idx);
-        if constexpr (not G::kOrdered) {
+        scan_route<G, kNumThreads>(launch, workspace, topk_idx, weights, src_rank, num_entries, is_proxy, not is_src_ordered, counts, keys, thread_idx);
+        if (not is_src_ordered) {
             // Slot table before counts: a pull that sees the counts never waits for the table
             __threadfence();
             sync();

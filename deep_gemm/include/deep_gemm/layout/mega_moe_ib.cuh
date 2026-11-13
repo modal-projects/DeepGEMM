@@ -118,7 +118,8 @@ struct alignas(128) MegaMoEIBSignals {
     // so a late write of the previous launch can never be taken for a write of this one.
     alignas(128) uint64_t epoch;
 
-    // Proxy side, per source node: tokens of the source this GPU proxies (written by the proxy SM)
+    // Proxy side, per source node: tokens of the source this GPU proxies, with the regime bit of its header
+    // (ib::Geometry::kHeaderOrdered) above the count (written by the proxy SM)
     alignas(128) uint32_t src_num_tokens[kMaxNodes];
     // Forward-combine bookkeeping, by parity and remote node: items claimed, records done per chunk, chunks returned
     alignas(128) uint32_t fwd_item_claim[2][kMaxNodes];
@@ -141,6 +142,7 @@ struct alignas(128) MegaMoEIBSignals {
     uint32_t stage_dumped;
     alignas(128) uint64_t trace[48];
     alignas(128) uint32_t return_gaps[kMaxNodes];  // diagnostics build: empty positions of a return order, per node slot
+    uint32_t late_headers;                         // diagnostics build: receivers whose tables landed before the header
 };
 #endif
 

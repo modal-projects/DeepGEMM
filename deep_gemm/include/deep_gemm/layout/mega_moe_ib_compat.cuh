@@ -48,7 +48,8 @@ struct OldIBSignals {
     uint8_t pad0[3328 - 8];
     uint64_t trace[48];
     uint32_t return_gaps[kMaxNodes];
-    uint8_t pad0a[4 * 64 * 4 - 4 * kMaxNodes];
+    uint32_t late_headers;
+    uint8_t pad0a[4 * 64 * 4 - 4 * kMaxNodes - 4];
     uint64_t sm_stage[256];
     uint32_t stage_dumped;
     // Flags the old kernel does not have live in old fields that no old kernel writes (epoch-tagged: stale or

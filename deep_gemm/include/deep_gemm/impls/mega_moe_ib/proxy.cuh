@@ -81,7 +81,7 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
 
         // The intake of this source is done: its token count and return order are there, its top-k rows landed
         comm::landing::await_raised(&signals->order_ready[node], launch.epoch, launch.site("order_ready", node));
-        const uint32_t num_tokens = signals->src_num_tokens[node];
+        const uint32_t num_tokens = signals->src_num_tokens[node] & ~G::kHeaderOrdered;
         if (num_tokens == 0) {
             // Nothing to return; the source still waits for a header (every byte written is read)
             if (is_leader)
@@ -206,7 +206,8 @@ CUTLASS_DEVICE void rearm_mirrors(const Launch& launch, const uint32_t& gtid, co
     #pragma unroll
     for (uint32_t nr = 0; nr < G::kR; ++ nr) {
         const uint32_t node = G::node_of_slot(nr, launch.my_node);
-        const uint32_t num_tokens = ptx::ld_volatile(&launch.signals->src_num_tokens[node]);
+        const uint32_t src_header = ptx::ld_volatile(&launch.signals->src_num_tokens[node]);
+        const uint32_t num_tokens = src_header & ~G::kHeaderOrdered;
         const uint32_t num_chunks = math::ceil_div(num_tokens, G::kNumRecordsPerPut);
         if (is_waiter) {
             const auto returned_ptr = &launch.signals->fwd_chunks_returned[launch.parity][node];
@@ -225,7 +226,7 @@ CUTLASS_DEVICE void rearm_mirrors(const Launch& launch, const uint32_t& gtid, co
         rearm<G::kDiag>(mirror + G::buf().off_weights(), num_entries * 4, blank_unit(), gtid, num_grid_threads, launch.site("rearm weights", node));
         if (gtid == 0)
             *reinterpret_cast<uint64_t*>(mirror + G::buf().off_header()) = ~0ull;
-        if constexpr (G::kOrdered) {
+        if (src_header & G::kHeaderOrdered) {
             rearm<false>(mirror + G::buf().off_tables(), num_entries * 4, blank_unit(), gtid, num_grid_threads, launch.site("rearm tables", node));
             rearm<false>(mirror + G::buf().off_counts(), G::buf().counts_bytes(), blank_unit(), gtid, num_grid_threads, launch.site("rearm counts", node));
         }

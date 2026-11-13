@@ -36,13 +36,13 @@ CUTLASS_DEVICE void publish_counts(const layout::Workspace& workspace, const uin
 }
 
 // The receiver's pass over a source's top-k rows in the proxy's mirror, a batch of loads in flight per thread,
-// re-reading every entry of the batch that has not landed yet. When receivers route, an entry for one of this
-// GPU's experts takes the next slot of that expert (`counts`). The proxy of the source also takes the return-order
+// re-reading every entry of the batch that has not landed yet. For a scan source (`routes`) an entry for one of
+// this GPU's experts takes the next slot of that expert (`counts`). The proxy of the source also takes the return-order
 // keys and proves that the weights landed (in every regime: the landing proof of the Meta stream).
 template <typename G, uint32_t kNumThreads>
 CUTLASS_DEVICE void scan_route(const Launch& launch, const layout::Workspace& workspace,
                                const uint64_t* topk_idx, const uint32_t* weights,
-                               const uint32_t& src_rank, const uint32_t& num_entries, const bool& is_proxy,
+                               const uint32_t& src_rank, const uint32_t& num_entries, const bool& is_proxy, const bool& routes,
                                uint32_t* const counts, uint32_t* const keys, const uint32_t& thread_idx) {
     using namespace comm;
     constexpr uint32_t kNumLoads = 16;
@@ -80,7 +80,7 @@ CUTLASS_DEVICE void scan_route(const Launch& launch, const layout::Workspace& wo
             const uint32_t local_expert = static_cast<uint32_t>(expert) % G::kNumExpertsPerRank;
             if (is_proxy and G::node_of(expert_rank) == launch.my_node)
                 atomicMax(keys + i / G::kK, local_expert);
-            if (not G::kOrdered and expert_rank == launch.rank) {
+            if (routes and expert_rank == launch.rank) {
                 const uint32_t slot = atomicAdd_block(counts + local_expert, 1u);
                 *workspace.get_src_token_topk_idx_ptr(local_expert, src_rank, slot) = i | ((i / G::kK) << 16);
             }

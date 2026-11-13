@@ -24,6 +24,9 @@ namespace deep_gemm::layout {
 constexpr static int64_t kIBMagic = 0x1B1B1B1B1B1B1B1Bll;
 constexpr static uint32_t kNumIBExtraPtrs = 4;
 
+// Gin contexts the kernel spreads its puts over; Python requests as many when it creates the device communicator
+constexpr static uint32_t kNumIBGinContexts = 8;
+
 struct IBHandles {
     int64_t gin_dev_comm = 0;    // device pointer to ncclDevComm_t
     int64_t gin_window = 0;      // ncclWindow_t of the whole symmetric buffer

@@ -26,7 +26,7 @@ struct Gin {
     int64_t base;
 
     __device__ __forceinline__
-    Gin(const layout::IBHandles& handles, const int64_t& base, const uint32_t& context_idx, const uint32_t& num_contexts):
+    Gin(const layout::IBHandles& handles, const int64_t base, const uint32_t context_idx, const uint32_t num_contexts):
         gin(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm), static_cast<int>(context_idx % num_contexts),
             NCCL_GIN_RESOURCE_SHARING_GPU),
         world(ncclTeamWorld(*reinterpret_cast<const ncclDevComm_t*>(handles.gin_dev_comm))),

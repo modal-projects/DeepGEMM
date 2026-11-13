@@ -9,6 +9,7 @@
 //   * a remote source's row is read from its counterpart's mirror on this node, and the load is the poll.
 
 #include <deep_gemm/impls/mega_moe_ib/geometry.cuh>
+#include <deep_gemm/impls/mega_moe_ib/trace.cuh>
 
 namespace deep_gemm::ib {
 
@@ -121,6 +122,8 @@ CUTLASS_DEVICE float pull_row(const Launch& launch, const layout::SymBuffer<kNum
         }
     }
     __syncwarp();
+    trace::stamp<G>(launch, trace::kFirstRemoteRow, is_remote and lane_idx == 0);
+    trace::stamp<G>(launch, trace::kLastRow, lane_idx == 0);
     return __uint_as_float(weight);
 }
 

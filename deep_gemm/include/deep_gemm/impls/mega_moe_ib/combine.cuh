@@ -11,6 +11,7 @@
 #include <cuda_fp8.h>
 
 #include <deep_gemm/impls/mega_moe_ib/geometry.cuh>
+#include <deep_gemm/impls/mega_moe_ib/trace.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 
 namespace deep_gemm::ib {
@@ -46,6 +47,7 @@ CUTLASS_DEVICE void add_records(const Launch& launch, const int64_t* topk_idx, v
     constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
     DG_STATIC_ASSERT(kNumUnits * 32 * 16 == kNumChunkBytes, "Invalid combine chunk");
     const auto scratch = Slots<G>::combine_scratch(launch);
+    trace::stamp<G>(launch, trace::kFirstRecords, lane_idx == 0);
 
     for (uint32_t token_chunk_idx = first_token_chunk; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += token_chunk_stride) {
         const uint32_t token_idx = token_chunk_idx / kNumChunks, chunk_idx = token_chunk_idx % kNumChunks;
@@ -141,6 +143,10 @@ CUTLASS_DEVICE void add_records(const Launch& launch, const int64_t* topk_idx, v
             cute::tma_store_arrive();
         }
         __syncwarp();
+    }
+    if constexpr (G::kPlan.trace) {
+        ptx::tma_store_wait<0>();
+        trace::stamp<G>(launch, trace::kEnd, lane_idx == 0);
     }
 }
 

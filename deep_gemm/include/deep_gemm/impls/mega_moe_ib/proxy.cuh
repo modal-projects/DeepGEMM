@@ -12,6 +12,7 @@
 
 #include <deep_gemm/comm/gin.cuh>
 #include <deep_gemm/impls/mega_moe_ib/geometry.cuh>
+#include <deep_gemm/impls/mega_moe_ib/trace.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm::ib {
@@ -68,6 +69,7 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
     DG_STATIC_ASSERT(kNumItemUnits * kNumQuarters * 32 * 16 == G::kH * 2 and kNumItemXUnits * 16 * kNumQuarters == G::kH, "Invalid hidden size");
     DG_STATIC_ASSERT(G::buf().sf_bytes() <= 32 * 16, "Scale factors of a token must fit one load per lane");
     const auto signals = launch.signals;
+    trace::stamp<G>(launch, trace::kFirstReduce, lane_idx == 0);
 
     #pragma unroll
     for (uint32_t i = 0; i < G::kR; ++ i) {
@@ -185,6 +187,7 @@ CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, con
                     const int64_t offset = static_cast<int64_t>(chunk) * G::kNumRecordsPerPut * kNumRecordBytes;
                     comm::Gin(launch.handles, launch.base, comm::Stream::Return, chunk + nr, launch.network)
                         .put(ret_dst + offset, stage + offset, static_cast<uint64_t>(num_records) * kNumRecordBytes, source);
+                    trace::stamp<G>(launch, trace::kLastChunkPut);
                 }
             }
             __syncwarp();

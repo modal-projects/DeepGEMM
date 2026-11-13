@@ -17,6 +17,7 @@
 
 #include <deep_gemm/comm/gin.cuh>
 #include <deep_gemm/impls/mega_moe_ib/geometry.cuh>
+#include <deep_gemm/impls/mega_moe_ib/trace.cuh>
 #include <deep_gemm/impls/mega_moe_ib/sort.cuh>
 
 namespace deep_gemm::ib {
@@ -70,6 +71,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             }
         }
         __syncwarp();
+        trace::stamp<G>(launch, trace::kMetaPosted, thread_idx == 0);
         // The return order of this source's tokens on each remote node (read by the source combine)
         for (uint32_t nr = 0; nr < G::kR; ++ nr) {
             build_return_keys<G, kNumThreads, kBarrierIdx>(
@@ -92,6 +94,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                 gin.put(dst + offset, input + offset,
                         static_cast<uint64_t>(cute::min(num_tokens - t, static_cast<uint32_t>(G::kNumRowsPerPut))) * G::buf().token_bytes(), peer);
             }
+            trace::stamp<G>(launch, trace::kRowsPosted);
         }
         __syncwarp();
     }
@@ -122,6 +125,8 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
                        launch.rank, src_rank, proxy, static_cast<unsigned long long>(header), static_cast<unsigned long long>(launch.epoch));
             });
             counts[G::kNumExpertsPerRank] = static_cast<uint32_t>(header);
+            trace::stamp<G>(launch, trace::kFirstHeaderSeen);
+            trace::stamp<G>(launch, trace::kHeadersSeen);
         }
         for (uint32_t i = thread_idx; i < G::kNumExpertsPerRank; i += kNumThreads)
             counts[i] = 0;
@@ -187,6 +192,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             landing::raise(&launch.signals->tables_ready[k], launch.epoch);
         publish_counts<kNumSMs>(workspace, src_rank, counts, thread_idx, kNumThreads);
         sync();
+        trace::stamp<G>(launch, trace::kCountsPublished, thread_idx == 0);
 
         if (is_proxy) {
             const auto return_perm = launch.signals->tables + G::kOffReturnPerm + G::slot_of_node(src_node, launch.my_node) * G::kTableT;
@@ -196,6 +202,7 @@ __device__ __noinline__ void start(const Launch launch, const layout::Workspace 
             sync();
             if (thread_idx == 0)
                 landing::raise(&launch.signals->order_ready[src_node], launch.epoch);
+            trace::stamp<G>(launch, trace::kIntakeDone, thread_idx == 0);
         }
     }
 }

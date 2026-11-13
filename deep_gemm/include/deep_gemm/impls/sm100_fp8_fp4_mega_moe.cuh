@@ -396,6 +396,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // The proxy work queues of this launch start empty
         if (sm_idx == 1)
             ib::reset_counters<IB>(ib_launch, thread_idx, kNumDispatchThreads);
+        ib::trace::begin<IB>(ib_launch, num_tokens, sm_idx == 1 and thread_idx == 0);
 #endif
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -1539,6 +1540,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
 #if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
         // This SM's GEMM tasks are done: help with the proxy sum
+        ib::trace::stamp<IB>(ib_launch, ib::trace::kLastTask, epilogue_thread_idx == 0);
         ib::reduce<IB, decltype(scheduler)>(ib_launch, (epilogue_warp_idx * kNumSMs + sm_idx) % cute::max(IB::kR, 1u), false, lane_idx);
 #endif
 

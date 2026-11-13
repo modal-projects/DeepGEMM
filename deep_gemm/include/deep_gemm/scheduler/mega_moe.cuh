@@ -316,9 +316,6 @@ struct MegaMoEScheduler {
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters);
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
-#if defined(DG_MEGA_MOE_L2_COLMAJOR) and DG_MEGA_MOE_L2_COLMAJOR
-        num_sched_l1_waves = num_total_l1_waves;  // column-major L2 touches every M block at once: all L1 first
-#endif
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -410,17 +407,6 @@ struct MegaMoEScheduler {
 #endif
                     break;
                 }
-#if defined(DG_MEGA_MOE_L2_COLMAJOR) and DG_MEGA_MOE_L2_COLMAJOR
-                {
-                    // DG_MEGA_MOE_L2_COLMAJOR=1: the same task set, column-major within each locality domain (all M blocks
-                    // of a column cluster before the next column), so whole column groups of every token finish early
-                    constexpr uint32_t kLocal = kNumL2Clusters / kNumLocalityDomains;
-                    const uint32_t domain = n_cluster_idx / kLocal;
-                    const uint32_t idx = m_block_idx * kLocal + n_cluster_idx % kLocal;  // the row-major local index
-                    m_block_idx = idx % num_total_m_blocks;
-                    n_cluster_idx = domain * kLocal + idx / num_total_m_blocks;
-                }
-#endif
 
                 // The next task should be L1
 #if defined(DG_MEGA_MOE_L2_PRIO) and DG_MEGA_MOE_L2_PRIO
@@ -504,19 +490,12 @@ struct MegaMoEScheduler {
 #else
         const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
 #endif
-#if defined(DG_MEGA_MOE_ROUTED_FIRST) and DG_MEGA_MOE_ROUTED_FIRST
-        // DG_MEGA_MOE_ROUTED_FIRST=1: routed tasks get priority over the shared expert. Shared L1 tasks fill the count wait
-        // only; once every count is known the scheduler stops claiming them, runs the routed tasks, then claims the rest of
-        // the shared L1 and all shared L2 at the tail (where SMs otherwise wait on the combine / network).
-        constexpr bool kRoutedFirst = true;
-#else
         constexpr bool kRoutedFirst = false;
-#endif
         if constexpr (kHasShared) {
             // Shared expert L1 tasks do not depend on dispatch.
             shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
                 num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr(), kRoutedFirst);
-            if (is_shared_l2_early and not kRoutedFirst)
+            if (is_shared_l2_early)
                 shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }
@@ -565,7 +544,7 @@ struct MegaMoEScheduler {
             if (kRoutedFirst)  // remaining shared L1 claims (the counter continues where the yield left it)
                 shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr());
-            if (not is_shared_l2_early or kRoutedFirst)
+            if (not is_shared_l2_early)
                 shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }

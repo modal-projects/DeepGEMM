@@ -3,8 +3,7 @@
 // Mega MoE across NVLink domains: time stamps of a trace build (`IBPlan::trace`). A normal build compiles none of
 // this. Stamps are %globaltimer values kept in the IB signals: the latest (or earliest) thread to pass a point
 // wins. The launch after a traced one prints them, relative to the traced launch's start, every 16th launch:
-//   IB_TRACE rank epoch tokens | one value per stamp, in us
-// (the line also starts with OPUS_ so that the development servers collect it).
+//   DG_IB_TRACE rank epoch tokens | one value per stamp, in us
 
 #include <deep_gemm/impls/mega_moe_ib/geometry.cuh>
 
@@ -63,7 +62,7 @@ CUTLASS_DEVICE void begin(const Launch& launch, const uint32_t& num_tokens, cons
             const auto us = [&](const uint32_t& i) {
                 return t[i] == 0 or t[i] == ~0ull ? -1.0 : static_cast<double>(static_cast<int64_t>(t[i] - t[kBegin])) / 1e3;
             };
-            printf("OPUS_IB_TRACE rank=%u epoch=%llu tokens=%u | meta_posted=%.1f rows_posted=%.1f need_order=%.1f tables_posted=%.1f first_header=%.1f headers=%.1f "
+            printf("DG_IB_TRACE rank=%u epoch=%llu tokens=%u | meta_posted=%.1f rows_posted=%.1f need_order=%.1f tables_posted=%.1f first_header=%.1f headers=%.1f "
                    "counts=%.1f tables_done=%.1f intake=%.1f first_remote_row=%.1f last_row=%.1f first_reduce=%.1f last_task=%.1f "
                    "last_chunk_put=%.1f first_records=%.1f end=%.1f\n",
                    launch.rank, static_cast<unsigned long long>(launch.epoch - 1), num_tokens,

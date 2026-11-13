@@ -70,7 +70,7 @@ static void sm100_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4);
+        MmaKind::MXFP8FP4, is_ib);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -255,7 +255,7 @@ static void __instantiate_kernel() {{
                     num_ranks, num_experts, num_experts_per_rank,
                     num_max_tokens_per_rank, tokens, num_topk, hidden, intermediate_hidden,
                     num_ring_tokens, num_sf_ring_tokens,
-                    MmaKind::MXFP8FP4), tokens);
+                    MmaKind::MXFP8FP4, is_ib), tokens);
                 if (family.insert(other).second)
                     launched_kernels.insert(jit->compile("sm100_fp8_fp4_mega_moe", other).get());
             }

@@ -16,7 +16,6 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe_ib_compat.cuh>  // TEMPORARY
 
 namespace deep_gemm::layout {
 
@@ -108,9 +107,6 @@ struct IBHandles {
 };
 
 // IB signals: GPU-local words only (other nodes never write here; they put into the node slots).
-#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
-using MegaMoEIBSignals = ib_compat::OldIBSignals;  // TEMPORARY
-#else
 struct alignas(128) MegaMoEIBSignals {
     static constexpr uint32_t kMaxNodes = 16;
     static constexpr uint32_t kMaxReturnNodes = kMaxNodes;  // nodes with return-chunk counters
@@ -150,7 +146,6 @@ struct alignas(128) MegaMoEIBSignals {
     alignas(128) uint32_t return_gaps[kMaxNodes];  // diagnostics build: empty positions of a return order, per node slot
     uint32_t late_headers;                         // diagnostics build: receivers whose tables landed before the header
 };
-#endif
 
 // Geometry of the IB tail of the symmetric buffer. One instance per (max tokens, hidden, top-k, experts); the
 // kernel builds it from its template arguments and the host from the call's arguments, so the two cannot drift.
@@ -202,28 +197,16 @@ struct IBBufferLayout {
     CUTLASS_HOST_DEVICE constexpr int64_t off_proxy_combine() const { return 2 * mirror_stride() + 2 * ret_stride(); }
     CUTLASS_HOST_DEVICE constexpr int64_t off_fwd_stage() const { return off_proxy_combine() + proxy_combine_stride(); }
     CUTLASS_HOST_DEVICE constexpr int64_t node_stride() const {
-#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
-        return off_fwd_stage() + fwd_stage_stride() + ib_compat::num_old_node_slot_extra_bytes(num_max_tokens, num_experts);  // TEMPORARY
-#else
         return math::constexpr_align<int64_t>(off_fwd_stage() + fwd_stage_stride(), 128);
-#endif
     }
 
     // Offsets inside the tail, and its size. `signals()` is where the IB signals of a GPU live, given its stock
     // signals and the start of its tail.
     CUTLASS_HOST_DEVICE constexpr int64_t off_node(const int64_t& node) const {
-#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
-        return node * node_stride();  // TEMPORARY
-#else
         return math::constexpr_align<int64_t>(sizeof(MegaMoEIBSignals), 128) + node * node_stride();
-#endif
     }
     CUTLASS_HOST_DEVICE static MegaMoEIBSignals* signals(void* stock_signals, void* tail) {
-#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
-        return reinterpret_cast<MegaMoEIBSignals*>(static_cast<uint8_t*>(stock_signals) + ib_compat::kNumStockSignalBytes);  // TEMPORARY
-#else
         return static_cast<MegaMoEIBSignals*>(tail);
-#endif
     }
     CUTLASS_HOST_DEVICE constexpr int64_t num_bytes(const int64_t& num_nodes) const { return off_node(num_nodes); }
 

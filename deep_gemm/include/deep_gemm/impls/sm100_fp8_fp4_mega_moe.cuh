@@ -63,11 +63,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
-#if defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
-                            const __grid_constant__ layout::ib_compat::OldSymBuffer<kNumRanks> sym_buffer,  // TEMPORARY
-#else
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
-#endif
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -86,15 +82,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and not (defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
                             const __grid_constant__ layout::IBHandles ib_handles,
 #endif
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB and defined(DG_MEGA_MOE_IB_COMPAT_ABI) and DG_MEGA_MOE_IB_COMPAT_ABI
-    // TEMPORARY (layout/mega_moe_ib_compat.cuh): the old host passes the Gin handles inside its SymBuffer
-    const layout::IBHandles ib_handles(sym_buffer.gin_dev_comm, sym_buffer.gin_window);
-#endif
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
@@ -228,18 +220,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         task_info_t task_infos[kNumScheduleStages];
-#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
-        // The barrier an IB build's scheduler waits for before its first claim (sched::SchedulePolicy::
-        // kClaimAfterStart). It takes the place of the first pull barrier, which an IB build does not have
-        // (register pull), because the hosts in service sum this struct member by member from their own copy:
-        // a member of its own would need 8 more bytes than they allocate. It becomes a separate member in the
-        // commit that removes the compat layer (every host then sizes the struct from this tree).
-        union {
-            Barrier dispatch_barriers[kNumDispatchWarps];
-            Barrier start_barrier;
-        };
-#else
         Barrier dispatch_barriers[kNumDispatchWarps];
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // What an IB build's scheduler waits for before its first claim (sched::SchedulePolicy::kClaimAfterStart);
+        // the host adds its 8 bytes (get_pipeline_config_for_mega_moe)
+        Barrier start_barrier;
 #endif
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];

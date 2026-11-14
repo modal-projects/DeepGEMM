@@ -112,7 +112,9 @@ Result on v2.0, 2 nodes x 8 B300, plain environment (no `DG_MEGA_MOE_DEV`), 14 N
 128 / 1024 and MegaSeek 128 / 1024, 20 correctness tests each, largest `calc_diff` 1.69e-4 to 1.77e-4. The
 test's own timing read 152 / 292 / 312 / 697 us, in line with the 154 / 294 / 312 / 698 of the harness on the
 same hardware. Every rank printed `MegaMoEIBPlan(planned for 800 Gb/s per GPU)`: the link-rate reader works in
-the B300 container. A 4-node run of the same job: not measured at the time of writing.
+the B300 container. The same job on 4 nodes x 8 B300 (32 ranks):
+**pass** for the same four configurations, largest `calc_diff` 2.48e-4 to 2.55e-4, timing 153 / 397 / 240 / 681 us
+(Flash 128 / 1024, MegaSeek 128 / 1024; 153 / 393 / 232 / 672 in section 8).
 
 A single-node form exists for hardware where all ranks share one NVLink domain: `DG_MEGA_MOE_IB_VIRTUAL_LSA=4`
 splits 8 GPUs into two virtual domains and `DG_MEGA_MOE_IB_NVL_REF=1` makes the reference the same kernel on a

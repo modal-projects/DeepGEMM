@@ -61,8 +61,8 @@ CUTLASS_DEVICE void reset_counters(const Launch& launch, const uint32_t& thread_
 // `first_slot` rotates the node order per warp so that all return streams advance together.
 template <typename G, typename sched_t>
 CUTLASS_DEVICE void reduce(const Launch& launch, const uint32_t& first_slot, const bool& is_leader, const uint32_t& lane_idx) {
-    constexpr uint32_t kNumQuarters = 4;
     constexpr uint32_t kNumRowUnits = G::kH * 2 / (32 * 16);          // 16-byte bf16 units per lane over a partial row
+    constexpr uint32_t kNumQuarters = kNumRowUnits % 4 == 0 ? 4 : 2;  // items per token: halves if hidden is not a multiple of 1024
     constexpr uint32_t kNumItemUnits = kNumRowUnits / kNumQuarters;
     constexpr uint32_t kNumItemXUnits = G::kH / 16 / kNumQuarters;    // 16-byte fp8 units of the token row per item
     constexpr uint32_t kNumXLoads = math::constexpr_ceil_div(kNumItemXUnits, 32u);

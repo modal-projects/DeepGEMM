@@ -12,6 +12,7 @@ build or use the kernel; it exists so the tables can be reproduced and new chang
 | `jobs/devserver.sh`, `jobs/devserver.py` | The dev server job: builds one DeepGEMM tree, keeps the ranks and their buffers warm, and answers A/B requests. |
 | `devclient.py` | Client of the dev server: `status`, `ab`, `result`, `queue`, `cancel`, `stop`. |
 | `jobs/setup_deps.sh` | Sourced by the job: clones and builds DeepGEMM and DeepEP (the reference) once per container. |
+| `jobs/inrepo_test.sh` | Runs `tests/test_mega_moe.py` across the nodes of a cluster in a plain environment (no dev server, no development switch). |
 | `jobs/nccl_topo.py` | Writes an NCCL topology file for VM hosts whose GPUs and NICs share no PCIe path. |
 | `mkab.py` | Builds one header tree that holds several kernels, each selected by an arm's define, for a same-request comparison of trees. |
 | `gate1.sh` | Local check that the IB-off kernel compiles to the same PTX as upstream (front end only). |
@@ -27,6 +28,7 @@ All of them come from the environment. None has a deployment-specific default.
 | `FUSED_IB_CLOUDS` | `runner.py` | JSON object `{cluster: cloud}`: pins a cluster function to one cloud | `{}` (not pinned) |
 | `FUSED_IB_MODAL_PROFILE` | `devclient.py` | if set, the client refuses to run under another `MODAL_PROFILE` | unset (no check) |
 | `DEV_MODAL_ENV` | `jobs/devserver.py` (in the container) | Modal environment of the state objects | the container's own |
+| `DG_NCCL_INCLUDE_DIR` | the DeepGEMM JIT, in every rank process | include directory of the NCCL in use: the JIT compiles kernels that include `<nccl.h>`, and without it every launch across NVLink domains fails at its first compile | set by `jobs/devserver.sh` and `jobs/inrepo_test.sh` to the `nvidia-nccl-cu13` wheel's `include`; set it yourself in any other launcher |
 
 State lives in three Modal objects of that environment: Queue `fused-ib-jobs` (one partition per cluster; the
 dev server adds `fused-ib-devq`), Dict `fused-ib-state` (heartbeat, current job, exit codes, dev-server
@@ -62,7 +64,7 @@ git -C <checkout> diff 5081f85 $BASE > jobs/devserver_tree.patch
 python submit.py --cluster b300_2n_b --script jobs/devserver.sh \
     --file jobs/devserver.py --file jobs/setup_deps.sh --file jobs/nccl_topo.py --file jobs/devserver_tree.patch \
     --env PATCH=devserver_tree.patch --env DEV_BASE_COMMIT=$BASE --env TEST_NODES=2 \
-    --env DG_MEGA_MOE_DEV=1 --env DG_MEGA_MOE_IB_GIN_TYPE=3 --env DEV_HDR_FRESH=1 --env DEV_MAX_CASES=8 \
+    --env DG_MEGA_MOE_IB_GIN_TYPE=3 --env DEV_HDR_FRESH=1 --env DEV_MAX_CASES=8 \
     --env DEV_HOURS=15 --env DEV_WARM=megaseek:1024 --timeout 57600 --no-wait --name devserver
 python devclient.py --cluster b300_2n_b status
 ```
@@ -72,7 +74,7 @@ Server-side switches (all `--env` of the job; the full list is in the two `jobs/
 | variable | meaning |
 |---|---|
 | `PATCH`, `DEV_BASE_COMMIT` | the tree; `devclient.py ab --repo` sends every header that differs from `DEV_BASE_COMMIT` |
-| `DG_MEGA_MOE_DEV=1` | required: the host refuses plan overrides, trace, zero-network and compile-only switches without it, and the server uses the compile-only switch for every request. It is fixed for the server's lifetime; an arm cannot set or unset it |
+| `DG_MEGA_MOE_DEV` | `jobs/devserver.sh` exports `DG_MEGA_MOE_DEV=1` by default: the host refuses plan overrides, trace, zero-network and compile-only switches without it, and the server uses the compile-only switch for every request. `--env DG_MEGA_MOE_DEV=0` overrides it (every such switch is then refused by name). It is fixed for the server's lifetime; an arm cannot set or unset it |
 | `TEST_NODES` | nodes that take part (2 on a 4-node cluster gives a 16-GPU server) |
 | `DG_MEGA_MOE_IB_GIN_TYPE` | NCCL Gin backend: 3 (GDAKI) on the InfiniBand clusters, 0 = any |
 | `DG_MEGA_MOE_IB_VIRTUAL_LSA=n` | treat groups of n consecutive ranks as NVLink domains (GB200: 8 = two trays per logical node) |

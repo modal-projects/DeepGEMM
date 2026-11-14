@@ -1,11 +1,11 @@
 # Mega MoE across NVLink domains: open work
 
-State at commit `adac520` (14 Nov 2026). Design: `ARCHITECTURE.md`. Method, gates and tables: `REPRODUCTION.md`.
+State at tag `fused-ib-base-v2.0` (commit `adac520`, 14 Nov 2026), called v2.0 below. Design: `ARCHITECTURE.md`. Method, gates and tables: `REPRODUCTION.md`.
 
 Conventions. Sizes are microseconds per launch, arm minus base in one request, on B300 unless GB200 is named.
 "2 x 8" and "4 x 8" are 2 and 4 nodes of 8 GPUs; top-6 / top-19 / top-25 are the Flash / MegaSeek / GigaSeek
 shapes. Every number was measured on 13 or 14 Nov 2026 with the method of `REPRODUCTION.md` (same request,
-both arm orders, twins), on v1.1 or v1.2 unless a line says "this tree". Arms are plan-field overrides unless a
+both arm orders, twins), on v1.1 or v1.2 unless a line says v2.0. Arms are plan-field overrides unless a
 lead says it has code. "A candidate exists (not published)" means code was written and measured but is not in
 this repository.
 
@@ -33,7 +33,7 @@ how far each carries:
   time, top-6 / top-19 / top-25: B300 2 x 8: 15 / 22 / 25 us; GB200 2 x 8: 16 / 24 / 30 us; B300 4 x 8, top-19:
   about 25 us. Points behind the 4 x 8 boundary on 800G (Ordered with policy minus Scan): top-19 at 128 / 160 /
   176 / 192 / 224 tokens: +5.2 / -1.1 / -1.9 / -5.8 / -11.4; top-25 at 192 / 224: -6.7 / -11.0; top-6: -8.2 /
-  -11.7. On 400G at 4 x 8 (this tree, boundary 86): at 96 / 128 / 192 tokens top-19 +1.1 / -8.9 / -27.9, top-6
+  -11.7. On 400G at 4 x 8 (v2.0, boundary 86): at 96 / 128 / 192 tokens top-19 +1.1 / -8.9 / -27.9, top-6
   -3.2 / -11.8 / -18.7, but **top-25 +6.9 / -1.6 / -24.9: at 96 tokens the rule loses 6.9 us** (its crossover is
   near 120 tokens, 37 us of wire time). Residuals elsewhere: top-6 at B300 2 x 8 is up to 5.5 us late between
   300 and 511 tokens (-3.1 / -5.5 at 384 / 448 for Ordered); top-25 at GB200 2 x 8, 256 tokens: +4.2. A top-k
@@ -56,7 +56,7 @@ how far each carries:
   the bit on, 673.3 off, 675.5 with the loop kept and the early schedule chosen at run time.
 - **Records per put.** 8 against 32: -3 to -9 at 4 x 8; +1.1 / +4.3 / +4.3 at 2 x 8, 1024 tokens (top-19 /
   25 / 6). 16 at 2 x 8 reads -1.9 on top-6 on B300 and 0 to +4 on GB200.
-- **Gating has a small-batch cost on 400G.** At 32 tokens (top-19, GB200 4 x 8, this tree) the gated plan reads
+- **Gating has a small-batch cost on 400G.** At 32 tokens (top-19, GB200 4 x 8, v2.0) the gated plan reads
   196.4 and the ungated one 187.9: 8.5 us where the bulk is small. At 128 tokens ungated is 12,517. A token
   floor for gating is a sixth candidate parameter.
 - **The top-6 shape is untuned.** Every top-6 number above was a spot check of values chosen on the other
@@ -130,7 +130,7 @@ Closed with a cause, recorded so they are not tried again:
 | Earlier retire on 400G, to fill the idle rail | 50 % at 80 / 70 / 60 %: +1.6 / +27 / +62 (top-19, GB200 4 x 8, 1024) | records are not ready earlier: a token's record needs its last expert on the node |
 | A rows-landed count as the landing proof (instead of a hint) | hang and fault on GB200; on B300 rows were read blank after their count | the count runs ahead of what remote readers see; hence "a hint is never a proof" (invariant I21) |
 | One landing protocol for both NIC classes (a flag behind every bulk put, no read before it) | +5.6 / +19.7 / +26.2 at 128 / 512 / 1024 on B300 4 x 8 | the first rows of a put wait for its last byte; gating is selected by link rate instead |
-| A launch fault, CUDA error 700 with no message, in some builds that added code (32 GPUs, Ordered regime) | three independent additions died within 10 s; the same trees pass 30 of 30 on the in-repo host | a defect of the compatibility layer for hosts built from earlier trees, which this tree no longer has. What that host lacked was not found. A device trap is error 719, not 700 |
+| A launch fault, CUDA error 700 with no message, in some builds that added code (32 GPUs, Ordered regime) | three independent additions died within 10 s; the same trees pass 30 of 30 on the in-repo host | a defect of the compatibility layer for hosts built from earlier trees, which v2.0 no longer has. What that host lacked was not found. A device trap is error 719, not 700 |
 
 Where the remaining distance is, for whoever picks the next lead (top-19, 4 x 8, zero-network arms):
 the kernel without the wire is 25 to 41 us above the stock kernel on one B300 node at equal per-GPU work
@@ -143,40 +143,35 @@ and 57 to 88 at 512 to 1024. (Zero network, top-19, 1024: plan 590.6, no retire 
 
 ### Open
 
-1. **Final gate table on B300.** This tree's kernels are new cubins everywhere (the start barrier moved in
-   shared memory). Its full gate set on B300 at 16 and 32 GPUs was still running when this was written;
-   `REPRODUCTION.md` section 6 holds the placeholder. The in-repo test command (`REPRODUCTION.md` section 4) has
-   not been run.
-2. **Ranks with a few tokens beside busy ranks.** A rank with zero tokens now takes the tile of a quarter of
-   the buffer's maximum (`ARCHITECTURE.md` section 8): list `1024_0` at 4 x 8, top-19, 1,321.8 us before and
-   564.6 after; top-25 1,707 and 676; top-6 486 and 424. A rank with 1 to 20 tokens still takes the smallest
-   tile and slows the group the same way: **8 tokens next to 1,024: 1,331.5 us** (64 next to 1,024: 591).
-   Raising every small count's tile costs equal small batches 8 to 10 us (measured at 32 and 64 tokens), and a
-   tile rule must stay a function of the public block-size query's arguments, because callers lay the shared
-   expert's scale factors out by it. The stock kernel has the same behaviour inside one NVLink domain.
-3. **No cross-rank plan check.** Ranks build their plans independently. The regime is safe per source (regime
+1. **Ranks with a few tokens beside busy ranks.** A rank with zero tokens takes the tile of a quarter of the
+   buffer's maximum (`ARCHITECTURE.md` section 8). That fix is gated on v2.0 at 2 x 8 and, with the same
+   kernels, at 4 x 8 and on GB200 4 x 8 (`REPRODUCTION.md` sections 6, 8 and 9): list `1024_0` at 4 x 8 reads
+   560 / 683 / 412 us for top-19 / 25 / 6 against 1,322 / 1,707 / 486 before. **Still open:** a rank with 1 to
+   20 tokens takes the smallest tile and slows the group the same way: 8 tokens next to 1,024 read 1,333 /
+   1,730 / 488 us (64 next to 1,024: 591 on top-19). Raising every small count's tile costs equal small batches
+   8 to 10 us (measured at 32 and 64 tokens), and a tile rule must stay a function of the public block-size
+   query's arguments, because callers lay the shared expert's scale factors out by it. The stock kernel has
+   the same behaviour inside one NVLink domain.
+2. **No cross-rank plan check.** Ranks build their plans independently. The regime is safe per source (regime
    bit). `gated` is not: it is chosen from each rank's own link rate, so nodes with different NICs, or one node
    whose sysfs is unreadable, would disagree, and a gated receiver would wait for record flags an ungated proxy
    never puts (a named timeout after about 8 s). Development overrides are per process too. Fix: a plan hash
    in the header word, or one comparison in the first-launch rendezvous.
-4. **The new 4 x 8 boundary on 800G.** Diagnostics checks at 176 / 192 / 224 and soaks at 192 / 224 passed with
-   the regime forced on v1.2; a changing-count list in which the host chooses per rank across 171 tokens was
-   not run on B300 (on 400G the lists across 85 | 86 passed).
-5. **Return records are fenced by lane 0 only** before a chunk put (`ib::reduce`, step 4), while staged rows
+3. **Return records are fenced by lane 0 only** before a chunk put (`ib::reduce`, step 4), while staged rows
    are fenced by every writer. No failure in 3,000-launch soaks. Accept in writing, or time a fence in every
    lane.
-6. **Do not put a printf plus trap in `ib::start`.** Count, and report at the next launch, as
+4. **Do not put a printf plus trap in `ib::start`.** Count, and report at the next launch, as
    `report_return_gaps` does: a device trap there surfaced without its message.
-7. **The reference kernel's hang with few experts per rank** was never root-caused; the in-repo table build
+5. **The reference kernel's hang with few experts per rank** was never root-caused; the in-repo table build
    is written not to depend on the expert count and passes at 12 to 76 experts per rank.
 
-### Serving integration (from a code audit of v1.1, updated for this tree; none blocks benchmarking)
+### Serving integration (from a code audit of v1.1, updated for v2.0; none blocks benchmarking)
 
 | item | state | what it takes |
 |---|---|---|
 | Error path | traps only. A timeout (8 s in named polls, 60 s in waits) ends in a device trap that kills the CUDA context of every waiting rank, sometimes without its message. Epochs are compared for equality across ranks, so a restarted rank cannot rejoin | design item: a bounded wait that sets a status word the host reads, and a host-side group reset. At minimum document "any timeout = rebuild the whole group" and have the serving layer do it |
 | NaN aliases the data sentinel | open as a contract. A token row or scale-factor unit of all-ones bytes reads as "not landed" and spins. The record path does not produce the pattern (the fp8 conversion writes NaN as 0x7F) | state "inputs are finite" as a contract; add a debug-mode host check |
-| Packaging | the kernel needs NCCL 2.32.3 headers (`comm/gin.cuh` uses 2.32 internals), a C++ toolchain at run time (`ib.py` builds an extension inline), `DG_NCCL_INCLUDE_DIR` set before any DeepGEMM kernel is compiled in the process, and `NCCL_GIN_GDAKI_QP_DEPTH=1024` honoured (set with `setdefault`; a smaller value silently wins while every put skips the credit check) | pin NCCL in the image; set the include directory at import; prebuild the extension; assert the queue depth after the communicator is created |
+| Packaging: `DG_NCCL_INCLUDE_DIR`, a compiler at run time, pinned NCCL 2.32.3 | the JIT compiles kernels that include `<nccl.h>`: `DG_NCCL_INCLUDE_DIR` must point at the include directory of the NCCL in use before any DeepGEMM kernel is compiled in the process, or every launch across NVLink domains fails at its first compile with "nccl.h: No such file or directory" (seen in the first in-repo test run; `ib.py` sets it only when the first IB buffer is allocated, and the JIT reads it once). The kernel also needs NCCL 2.32.3 headers (`comm/gin.cuh` uses 2.32 internals), a C++ toolchain at run time (`ib.py` builds an extension inline), and `NCCL_GIN_GDAKI_QP_DEPTH=1024` honoured (set with `setdefault`; a smaller value silently wins while every put skips the credit check) | pin NCCL in the image; set the include directory at import; prebuild the extension; assert the queue depth after the communicator is created |
 | Gin progress threads | with a backend that uses host progress threads, launches stall by milliseconds unless each thread has a core of its own. The harness pins them (`gin_partition` in `tools/mega_moe_ib/jobs/devserver.py`) | move the pinning into the serving launcher |
 | Topology detection | ranks per node is guessed as `min(group size, torch.cuda.device_count())` (`ib.py`, `ranks_per_domain`); a process that sees one GPU gets 1. Node-contiguous rank numbering is assumed, not checked. The link rate is the mean of the fastest active InfiniBand ports, one per visible GPU; unreadable sysfs plans 800G and no gating | take ranks per node from NCCL's LSA team; assert the numbering; print the planned rate at start-up (`DG_PRINT_CONFIGS=1`) and treat "unknown" as a deployment error |
 | Start-up cost: buffers | creating an IB buffer takes about 3.5 s at 32 ranks (3.3 to 3.7 s measured), and 14.4 s for the first one of a process (its communicator) | create buffers at start-up, not on the request path |
@@ -188,8 +183,8 @@ and 57 to 88 at 512 to 1024. (Zero network, top-19, 1024: plan 590.6, no retire 
 | NCCL resources | `SymmBuffer.destroy()` drops references; the extension's `destroy` is never called | call it (about 5 lines) |
 
 Fixed and kept here as a record: the regime chosen per rank (regime bit, v1.2); the epoch alias of the blank
-header (v1.2); the first-launch deadlock with mixed tile classes (v1); the compatibility layer (removed in this
-tree); development switches reachable in a serving process (this tree); zero-token ranks (this tree).
+header (v1.2); the first-launch deadlock with mixed tile classes (v1); the compatibility layer (removed in v2.0);
+development switches reachable in a serving process (v2.0); zero-token ranks (v2.0).
 
 ### Method gap
 
@@ -226,6 +221,6 @@ Status: **usable with gated loads, which the host selects by itself from the lin
   NVLink while it is still blank becomes visible only milliseconds later. Refuted as causes: a diagnostics
   build, a per-put timer, put size, context mapping, the Gin backend, rail bandwidth. One local reader of
   blank bulk memory is free; many local warps polling blank words inside a bulk region are not.
-- Not measured on this tree: 2 x 8 on GB200 (plan-field sweeps exist on earlier gated forms: the 256-token
+- Not measured on v2.0: 2 x 8 on GB200 (plan-field sweeps exist on earlier gated forms: the 256-token
   boundary there was the swept optimum at 11 of 12 points); any gate with `gated` on at 800G (the option's
   early-hint counter fires on B300, so it stays off there).

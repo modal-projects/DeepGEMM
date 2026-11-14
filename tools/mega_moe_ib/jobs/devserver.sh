@@ -68,6 +68,9 @@ fi
 python -c "import modal; print('modal', modal.__version__)" || { echo "NO_MODAL_CLIENT"; exit 2; }
 
 # Server env: the test's, plus the base knobs at process start (ib.py reads some at import)
+# The dev server is a development tool: the host's measurement switches (plan overrides, trace, zero network,
+# compile-only) act only with DG_MEGA_MOE_DEV=1, and the server uses them for every request
+export DG_MEGA_MOE_DEV=${DG_MEGA_MOE_DEV:-1}
 export DG_MEGA_MOE_IB=$IB DG_NCCL_INCLUDE_DIR=$NCCL_ROOT/include DG_JIT_DEBUG=0 NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 # JIT cache: private writable root; an existing ~/.dj is a read-only lookup (keys hash the code and every
 # included header, so a hit there is content-identical)

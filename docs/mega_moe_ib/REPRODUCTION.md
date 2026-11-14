@@ -4,6 +4,9 @@ How every kind of number quoted for the IB kernel is produced, on which hardware
 tree must pass before its numbers count. The harness is in `tools/mega_moe_ib/` (its `README.md` has the
 bring-up). Design: `ARCHITECTURE.md`. Open items: `TODO.md`.
 
+The tree described is tag `fused-ib-base-v2.0` (commit `adac520`), called v2.0 below; v1.1 and v1.2 are the
+tags `fused-ib-base-v1.1` (`7863474`) and `fused-ib-base-v1.2` (`6ebf8b4`).
+
 All times are microseconds per kernel launch. "EP16" and "EP32" mean 16 and 32 GPUs (2 and 4 nodes of 8).
 
 ## 1. Hardware
@@ -53,8 +56,9 @@ DG_FORCE_BUILD=1 python setup.py bdist_wheel && pip install --no-deps --force-re
 What an IB run needs beyond a stock build:
 
 - Development switches (plan overrides, trace, zero network, compile-only) act only with `DG_MEGA_MOE_DEV=1`
-  in the process and are refused by name without it. The dev server must be started with it
-  (`--env DG_MEGA_MOE_DEV=1`; it is an allocation-time variable there, so an arm cannot change it). A plain
+  in the process and are refused by name without it. The dev server sets it: `jobs/devserver.sh` exports
+  `DG_MEGA_MOE_DEV=1` by default (`--env DG_MEGA_MOE_DEV=0` overrides; it is an allocation-time variable
+  there, so an arm cannot change it). A plain
   run of the kernel needs none of them.
 - `DG_MEGA_MOE_IB=1` in the environment of every rank: Mega MoE buffers are then allocated as one NCCL
   window with the IB tail (`deep_gemm/mega/ib.py`).
@@ -66,28 +70,54 @@ What an IB run needs beyond a stock build:
 
 ## 4. The in-repo test
 
-`tests/test_mega_moe.py` runs the IB kernel when `DG_MEGA_MOE_IB=1`. It has two references:
+`tests/test_mega_moe.py` runs the IB kernel when `DG_MEGA_MOE_IB=1`. It needs no development switch. Three
+things must be right, each found by a failed first attempt or by reading the test:
 
-- with DeepEP and tilelang installed: the test's usual baseline (DeepEP dispatch, grouped GEMMs, combine);
-- with `DG_MEGA_MOE_IB_NVL_REF=1`: the same kernel on a second buffer whose ranks form one NVLink domain,
-  that is, the stock path on the same GPUs and inputs. This works only where all ranks really share one
-  domain, so it is the single-node form of the test.
+1. **`DG_NCCL_INCLUDE_DIR`** must point at the include directory of the NCCL in use, because the JIT compiles
+   kernels that include `<nccl.h>`. Without it every launch across NVLink domains fails at its first compile
+   with "nccl.h: No such file or directory".
+2. **`DG_MEGA_MOE_IB_TOLERANCE`** (for example `1e-3`, a bound on `calc_diff`) must be set. Without it the test
+   asserts bit equality with the reference, and a remote node's contribution crosses the wire as an fp8
+   record. It is a variable of the test, not a host switch.
+3. **A cold first run can fail in the reference, not in the kernel.** The test gives its DeepEP reference 10 s
+   to meet its peers while every rank compiles the reference's kernels at first use. Run it again; the JIT
+   caches are warm then.
 
-Because a remote node's contribution passes through an fp8 record, outputs are compared with a bound:
-`DG_MEGA_MOE_IB_TOLERANCE=1e-3` (on `calc_diff`; passing runs read 1.7e-4 to 2.6e-4).
+The plain path pins no NCCL progress threads, so its timings are an upper bound of what section 8 reports.
 
-Single node, every IB path exercised by splitting 8 GPUs into two virtual domains of 4:
+Command lines, as run by `tools/mega_moe_ib/jobs/inrepo_test.sh` on every node of a cluster (`WORLD_SIZE` =
+nodes, `RANK` = node index, `MASTER_ADDR` / `MASTER_PORT` as usual for `deep_gemm/utils/dist.py`):
 
 ```bash
-DG_MEGA_MOE_IB=1 DG_MEGA_MOE_IB_VIRTUAL_LSA=4 DG_MEGA_MOE_IB_NVL_REF=1 DG_MEGA_MOE_IB_TOLERANCE=1e-3 \
-python tests/test_mega_moe.py --num-processes 8 --num-experts 1216 --num-topk 19 --hidden 5120 \
-    --intermediate-hidden 2304 --num-max-tokens-per-rank 1024 --num-tokens 1024 --num-correctness-tests 300
+export DG_NCCL_INCLUDE_DIR=<nccl>/include DG_MEGA_MOE_IB=1 DG_MEGA_MOE_IB_TOLERANCE=1e-3
+export WORLD_SIZE=$NNODES RANK=$NODE_RANK
+# Flash: --num-experts 384 --num-topk 6      MegaSeek: --num-experts 1216 --num-topk 19
+python tests/test_mega_moe.py --num-processes 8 --hidden 5120 --intermediate-hidden 2304 \
+    --num-experts 1216 --num-topk 19 --num-max-tokens-per-rank 1024 --num-tokens 1024 --num-shared-experts 1 \
+    --mma-type fp8xfp4 --num-correctness-tests 20
+# once, to see the plan and the link rate it was planned for:
+DG_PRINT_CONFIGS=1 python tests/test_mega_moe.py ... --num-correctness-tests 1
 ```
 
-Status: this command line was not run during the campaign as recorded (not measured). What was run is the
-harness's own copy of the test's set-up (`Case` in `jobs/devserver.py`, which mirrors the test), including
-with `VIRTUAL_LSA=8` and the single-domain reference on GB200. Multi-node runs of the test file need
-`MASTER_ADDR`, `MASTER_PORT` and `WORLD_SIZE` (`deep_gemm/utils/dist.py`).
+Through the harness (builds DeepEP, tilelang and the tree as a patch on upstream; needs no dev server on the
+cluster):
+
+```bash
+git -C <checkout> diff 5081f85 fused-ib-base-v2.0 > jobs/tree.patch
+python submit.py --cluster <2-node cluster> --name inrepo --script jobs/inrepo_test.sh \
+    --file jobs/setup_deps.sh --file jobs/nccl_topo.py --file jobs/tree.patch --env PATCH=tree.patch --timeout 3600
+```
+
+Result on v2.0, 2 nodes x 8 B300, plain environment (no `DG_MEGA_MOE_DEV`), 14 Nov 2026: **pass** for Flash
+128 / 1024 and MegaSeek 128 / 1024, 20 correctness tests each, largest `calc_diff` 1.69e-4 to 1.77e-4. The
+test's own timing read 152 / 292 / 312 / 697 us, in line with the 154 / 294 / 312 / 698 of the harness on the
+same hardware. Every rank printed `MegaMoEIBPlan(planned for 800 Gb/s per GPU)`: the link-rate reader works in
+the B300 container. A 4-node run of the same job: not measured at the time of writing.
+
+A single-node form exists for hardware where all ranks share one NVLink domain: `DG_MEGA_MOE_IB_VIRTUAL_LSA=4`
+splits 8 GPUs into two virtual domains and `DG_MEGA_MOE_IB_NVL_REF=1` makes the reference the same kernel on a
+second buffer whose ranks form one domain. The test file itself was not run in that form (not measured); the
+harness's copy of the test's set-up was, on GB200.
 
 ## 5. How each kind of number is produced
 
@@ -152,7 +182,7 @@ plan fields need no second tree. For two trees there are two cases:
 
 - *The host forwards arm variables into the JIT source as defines* (hosts built from the trees that preceded
   this one did; that is how v1.1 and v1.2 were timed against the reference kernel in section 8, through a
-  compatibility layer those tags carried and this tree no longer has). Build one
+  compatibility layer those tags carried and v2.0 no longer has). Build one
   combined header tree with `tools/mega_moe_ib/mkab.py OUT exp=<tree>:DG_MEGA_MOE_EXP base=<tag>`: identical
   headers are copied once, differing ones become a dispatcher on the arm's define. The arms then run
   interleaved in one request. Check that an arm's code hash from the combined tree is stable across requests;
@@ -185,7 +215,7 @@ A tree's numbers count only if it passes all of these. "diag" = diagnostics on; 
 
 | # | gate | what runs |
 |---|---|---|
-| 1 | IB off = stock PTX | front-end PTX of the IB-off kernel, this tree against upstream `5081f85`, two shapes; normalised md5 equal (below) |
+| 1 | IB off = stock PTX | front-end PTX of the IB-off kernel, the tree against upstream `5081f85`, two shapes; normalised md5 equal (below) |
 | 2 | diag check, every tile class the plan can select | `--check 300`, each size with its odd neighbour, three shapes. EP32: Scan 128, 16, 40, 96, 240; Ordered 256, 512, 1024, 768, 384, 464 (Flash without 240 and 464). EP16: Scan 128, 256, 64, 16; Ordered 512, 1024, 768, 928 |
 | 3 | changing-count lists, per-rank shift, diag, `--check 300` | Scan `128_120_144_127_136_121`; zero-token `20_0_17_1_0_13`; Ordered `512_490_640_511_600_483`; mixed-regime and crossing: `128_600`, `0_1024`, `8_600`, `0_0_0_600`, `200_300` (EP32), `600_128_1024_0_300_511` |
 | 4 | soak | `--check 3000`: three shapes Ordered 512 / 511 and 1024 / 1023; Scan 128 / 127 |
@@ -209,19 +239,48 @@ changes md5 when the process id gains a digit. With the CUDA 13.2 toolkit wheels
 equality does not. nvcc may exit non-zero after writing the PTX if its assembler rejects the PTX version; the
 script judges by the PTX text.
 
-**FINAL-TAG GATE TABLE: PENDING.** The B300 gate runs of this tree were still in progress when this was
-written (every diagnostics check returned so far passes). The table goes here: one row per gate above, per
-GPU count, with date and server. Until then, what is established:
+### Gate results of v2.0
 
-- Gate 1: pass on this tree (`f850b8e3b441` / `d2fca7b8bc4e`).
-- v1.2 (`6ebf8b4`, 13 Nov 2026), B300: gates 2 to 5 passed at 32 GPUs under the compatibility layer and at 16
-  GPUs on the in-repo host; the mixed-regime lists of gate 3 passed at both GPU counts on the in-repo host;
-  gate 6 within +0.8 us of v1.1 at nine 32-GPU points.
-- This tree on GB200 4 x 8 (14 Nov 2026): the table in section 9.
-- The new 4 x 8 boundary on 800G (171 tokens): Ordered diagnostics checks at 176 / 192 / 224 with odd
-  neighbours passed 6 of 6 and soaks of 3,000 at 192 / 224 passed 4 of 4 on v1.2 with the regime forced; a
-  changing-count list in which the host chooses per rank across 171 was not run.
-- Not run on any tree: the in-repo test command of section 4.
+14 Nov 2026, in-repo host, host's own plan and tile rule throughout, every variant verified. 137 B300 result
+files and the GB200 results (section 9) carried no kernel message: no landing, flag or header timeout, no
+return-order line, no early-hint line; nothing trapped or hung. Gate 1 passes (`f850b8e3b441` /
+`d2fca7b8bc4e`). The runs are spread over v2.0 itself and earlier states of the same commit stack, whose kernel
+headers differ from v2.0's in comments only; the 2 x 8 idle lists, the 2 x 8 soaks and the in-repo test
+ran on v2.0 itself.
+
+B300, 4 x 8 (two servers: A for MegaSeek, B for GigaSeek and Flash) and 2 x 8 (one server):
+
+| gate | 4 x 8 | 2 x 8 |
+|---|---|---|
+| diagnostics checks, every tile class of both regimes | MegaSeek 24 of 24 and GigaSeek 24 of 24 at check 300 (128 / 127, 16 / 15, 40 / 39, 96 / 95, 170 / 169, 171, 192 / 191, 224 / 223, 240, 256 / 255, 512 / 511, 1024 / 1023, 768 / 767). **Flash: 16 sizes at check 300 and 16 more at check 100**, all pass | every tile class of both regimes on three shapes: pass |
+| changing-count, mixed-regime, crossing and idle lists, per-rank shift, check 300 | MegaSeek 7 of 7 (`170_171`, `160_171_200_150_192_128`, `0_171_170_0`, `600_128_1024_0_300_511`, `0_1024`, `512_490_640_511_600_483`, `128_120_144_127_136_121`); GigaSeek 2 of 2; Flash 2 of 2 | MegaSeek 7 of 7 (the same with `511_512`, `480_512_600_500_511_530`, `0_512_511_0` across the 2 x 8 boundary); GigaSeek 2 of 2; Flash 2 of 2 |
+| idle-rank tile: lists `1024_0`, `512_0`, `0_0_0_600`, `600_128_1024_0_300_511` (and `8_1024` at 4 x 8), diagnostics, in the check and back to back | three shapes, check 100: pass 15 of 15; crossing lists `170_171` and `128_600` with the host choosing per rank: pass 6 of 6 | three shapes, check 300: pass 12 of 12 |
+| back-to-back diagnostics, equal counts (5 rounds) | 128 / 127 / 192 / 191 / 512 / 511 / 1024 / 1023, three shapes: clean | clean |
+| back-to-back diagnostics, different counts per rank | two lists per shape (one crossing 170 \| 171): clean | two lists per shape (one crossing 511 \| 512): clean |
+| soak 3000 | MegaSeek 512 / 511, 1024 / 1023, 192 / 191, 224 / 223, 128 / 127: 10 of 10; GigaSeek and Flash 512 / 511, 1024 / 1023, 192 / 191, 224 / 223: 16 of 16 | MegaSeek 512 / 511, 1024 / 1023, 128 / 127; GigaSeek and Flash 512 / 511, 1024 / 1023: 14 of 14 |
+| host | the plan by code hash: 192 tokens = Ordered with policy, 170 = Scan, not gated | plan line printed on every rank: planned for 800 Gb/s per GPU |
+
+Slow launch steps in the back-to-back phases (0 to 15 of 150 per size) fell on whatever size was running when
+a server had a stall episode; the same request on the other 4-node server moved them to other sizes.
+
+Gate 6, timing against v1.2. On the in-repo host two trees cannot share a request, so each side is its own
+request with twins (within 0.3), in the order v2.0, v1.2, v2.0, 5 rounds; the difference uses the mean of the
+two v2.0 runs. v2.0 minus v1.2 at 128 / 512 / 1024 tokens:
+
+| shape | 4 x 8 | 2 x 8 |
+|---|---|---|
+| MegaSeek | +0.3 / -1.4 / -1.7 | -0.7 / -1.3 / -2.1 |
+| GigaSeek | +0.5 / -0.3 / +0.5 | -0.4 / -1.6 / -2.7 |
+| Flash | +0.9 / +2.6 / -0.9 | -1.7 / -0.8 / -1.2 |
+
+The Flash +2.6 at 512 is drift between requests: the first v2.0 run read 238.0, the second 232.8, v1.2 232.8.
+A repeat of the MegaSeek pair at 2 x 8 on v2.0 itself read -1.3 / -0.9 / -0.6.
+
+Where v2.0 changes the plan on 4 nodes (Ordered with policy instead of Scan at 171 to 255 tokens), host's plan
+minus v1.2's Scan plan, same request, twins, at 176 / 192 / 224 tokens: MegaSeek -0.5 / -4.1 / -9.9; GigaSeek
+-0.3 / -3.2 / -7.6; Flash -5.9 / -7.7 / -11.0.
+
+Not run: back-to-back or soak runs with `gated` on at 800G; the in-repo test at 4 nodes (section 4).
 
 ## 7. Request lines for the headline points
 
@@ -263,8 +322,8 @@ O=DG_MEGA_MOE_IBP_ORDERED=1,DG_MEGA_MOE_IBP_L1_LEAD_CAP=9,DG_MEGA_MOE_IBP_RETIRE
 $AB $C32 ab --repo $T --shape megaseek --arm S= --arm O=$O --arm O2=$O --arm S2= --tokens 192 --check 0 --rounds 7 --name b_m192
 ```
 
-A request with `--check` greater than 0 carries one arm. Start the server with `DG_MEGA_MOE_DEV=1` and
-`DEV_HDR_FRESH=1`. An arm that moves a buffer to another kernel family inside a live process (for example a
+A request with `--check` greater than 0 carries one arm. Start the server with `DEV_HDR_FRESH=1`
+(`DG_MEGA_MOE_DEV=1` is the job script's default). An arm that moves a buffer to another kernel family inside a live process (for example a
 tile override) needs fresh ranks: otherwise ranks meet the new kernels in different calls, the first-launch
 rendezvous cannot line them up, and the request ends in a header timeout that is the harness's doing, not the
 kernel's.
@@ -272,10 +331,11 @@ kernel's.
 ## 8. Expected numbers: B300
 
 The data set is frozen at v1.2 (`6ebf8b4`; v1.1 is `7863474`, and v1.2 is v1.1 plus the regime bit and the
-blank-header fix). This tree changes the plan, and with it the kernel a point runs,
-only at 171 to 255 tokens on 4 nodes at 800G, where it selects the Ordered regime; no row below is in that
-range. Its kernels differ from v1.2's by the position of one barrier in shared memory; the equal-count rows
-were not re-timed on it at the time of writing.
+blank-header fix). v2.0 changes the plan, and with it the kernel a point runs, only at 171 to 255 tokens on 4
+nodes at 800G, where it selects the Ordered regime; no row below is in that range. Its kernels differ from
+v1.2's by the position of one barrier in shared memory, and timed against v1.2 at 128 / 512 / 1024 tokens it
+reads within -2.7 to +0.9 us on all three shapes at both GPU counts, apart from one drifted Flash reading
+(section 6), so the rows stand for v2.0.
 
 How the rows were measured: 13 Nov 2026 (16 GPUs: into 14 Nov, 00:15 UTC). One request per point and arm
 order, four arms in one request (reference | reference with the assert removed | v1.1 | v1.2) and reversed,
@@ -287,7 +347,7 @@ prints for the point (32 GPUs: Scan at 128, Ordered with lead cap 9, retire 50 %
 
 Columns:
 
-- **reference kernel**: the kernel that preceded this tree, with its per-point switch strings.
+- **reference kernel**: the kernel that preceded this work's rewrite, with its per-point switch strings.
 - **reference, assert removed**: the same with one debug assert removed from its symmetric-pointer mapping
   (two run-time divisions and a trap path at every NVLink store and pull). This is the fair reference: the
   assert alone accounts for up to 28 us of the reference kernel's time.
@@ -369,19 +429,29 @@ Stage account of one point (MegaSeek, 32 GPUs, 128 tokens, traced pair, 13 Nov):
 in the traced build, 17 are at the start (the counts wait for the header), 10 on the return wire after the
 last put, 6 after the last stamp (mirror re-arm and exit), and under 5 in the pull and GEMM phases together.
 
-Idle ranks (32 GPUs, top-19, 4-node server B, in-repo host, 13 and 14 Nov; timing phase cycling a count list
-with a per-rank shift, medians): list `1024_0` 1,321.8 us with every rank's own tile and 564.6 with the tile
-rule (measured with a development rule that builds the same kernels on these lists); `512_0` 718.0 and 344.2; `600_128_1024_0_300_511` 1,118.3 and 465.0; `8_1024`
-1,331.5 (not covered by the rule). Equal counts are unchanged by the rule by construction.
+Idle ranks. Lists cycle through the timing launches with a per-rank shift, so in every launch some ranks run
+each count; timed twins, 5 rounds, 14 Nov 2026. "Before" is every rank's own tile (v1.2's kernels).
+
+| list | 4 x 8: MegaSeek / GigaSeek / Flash | before | 2 x 8 on v2.0: MegaSeek / GigaSeek / Flash |
+|---|---|---|---|
+| `1024_0` | 560.4 / 683.2 / 412.5 | 1,321.8 / 1,707.0 / 486.4 | 484.1 / 611.2 / 246.8 |
+| `512_0` | 341.9 / 406.0 / 230.6 | 718.0 / 920.5 / 295.6 | 403.2 / 507.4 / 195.5 |
+| `0_0_0_600` | 347.4 / 421.6 / 234.0 | 494.2 (MegaSeek) | 415.0 / 523.1 / 200.4 |
+| `600_128_1024_0_300_511` | 463.7 / 566.8 / 312.5 | 1,118.3 / 1,460.7 / 415.2 | 464.2 / 588.0 / 222.5 |
+| `8_1024` (not covered by the rule) | 1,333.3 / 1,730.1 / 488.0 | 1,331.5 (MegaSeek) | not measured |
+
+The 4 x 8 column was measured on an earlier state of v2.0's commit stack (same kernels and tile rule). At
+2 x 8 the six-entry list read 1,147.0 / 1,489.6 / 414.8 before the rule (diagnostics builds, back to back).
+Equal counts are unchanged: with and without the rule one cubin per size.
 
 ## 9. GB200
 
-GB200 4 x 8 (32 GPUs, 8 trays, 400G NDR), 14 Nov 2026, this tree's kernels (measured on the stack one fold
-before `adac520`, whose kernel headers differ in comments only), host's own plan: gated by itself from the
+GB200 4 x 8 (32 GPUs, 8 trays, 400G NDR), 14 Nov 2026, v2.0's kernels (measured on earlier states of
+v2.0's commit stack, whose kernel headers differ from it in comments only), host's own plan: gated by itself from the
 link rate, Ordered from 86 tokens. Timed plain builds, 5 rounds x 30 launches x 32 ranks, every variant
 verified, 0 slow launches of 150 at every point.
 
-| shape | tokens | this tree | GB200 NVLink, 32 GPUs in one domain (5-6 Nov) | difference |
+| shape | tokens | v2.0 | GB200 NVLink, 32 GPUs in one domain (5-6 Nov) | difference |
 |---|---|---|---|---|
 | MegaSeek | 32 | 196.5 | 177 | +19.5 |
 | MegaSeek | 64 | 212.2 | 185 | +27.2 |
@@ -430,7 +500,7 @@ sizes include one tile class were refused by the harness check "the nodes hold d
 compiles of one source differed between nodes); the same requests passed with another diagnostics value. Not a
 kernel fault.
 
-2 x 8 on GB200: no table for this tree.
+2 x 8 on GB200: no table for v2.0.
 
 ## 10. What cannot be reproduced from this repository alone
 

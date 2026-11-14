@@ -4,7 +4,7 @@ This document describes the extension of the fused MoE kernel (`sm100_fp8_fp4_me
 that span more than one NVLink domain, with InfiniBand between the domains. It is written for a reader who
 knows the stock kernel. Every statement about the code names the file and function it can be checked in; paths
 are relative to `deep_gemm/include/deep_gemm/` unless they start with `csrc/` or `deep_gemm/`. The text
-describes the tree at commit `adac520`.
+describes the tree at tag `fused-ib-base-v2.0` (commit `adac520`), called v2.0 below.
 
 Related documents: `REPRODUCTION.md` (how every number is produced), `TODO.md` (what is open).
 
@@ -325,7 +325,9 @@ own words cannot tell a later warp that the chunk has landed. Every wait goes th
 A diagnostics build counts row loads that found a blank unit after their hint (`signals->early_row_hints`,
 printed by the next launch, `report_return_gaps`). The count must stay zero where the option is on. On B300 it
 does not (rows were read blank after their count there), which is one reason the option is selected by device
-class and is off on 800G; the other is cost (the first forms measured +5.6 to +26.2 us on B300).
+class and is off on 800G; the other is cost (the first forms measured +5.6 to +26.2 us on B300). Compiled in
+on 800G (an earlier form of the gate, MegaSeek, 4 x 8, 512 tokens) it cost 7.6 us, which is why the host leaves
+it off there.
 
 The host turns the option on when the link rate is known and at most 400 Gb/s per GPU (section 8). With the
 option off, the generated code is identical to a build without it (16 reference builds compared by PTX md5).
@@ -519,7 +521,7 @@ the stock kernel's (`REPRODUCTION.md`, "Gate list").
 
 ## 11. File map
 
-Line counts at `adac520`. "+n" is the number of lines added to a stock file (`git diff --numstat 5081f85 adac520`).
+Line counts at v2.0. "+n" is the number of lines added to a stock file (`git diff --numstat 5081f85 fused-ib-base-v2.0`).
 
 | file | lines | content |
 |---|---|---|

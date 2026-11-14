@@ -224,3 +224,15 @@ Status: **usable with gated loads, which the host selects by itself from the lin
 - Not measured on v2.0: 2 x 8 on GB200 (plan-field sweeps exist on earlier gated forms: the 256-token
   boundary there was the swept optimum at 11 of 12 points); any gate with `gated` on at 800G (the option's
   early-hint counter fires on B300, so it stays off there).
+
+## (e) Shapes other than hidden 5120 (Kimi-K3 routed MoE, REPRODUCTION section 11)
+
+- Nothing is tuned for a shape whose L1 has more clusters per block than L2: the lead cap is compiled out there
+  (it deadlocks), and the retire point and regime threshold are the MegaSeek-fitted ones. A cap that is sound
+  for such shapes, or another way to keep L2 completions steady, is open.
+- Only K3 was run with the two v2.1 fixes; gate depth for it is a correctness check, not the full gate list.
+- A shared expert of another width than the routed ones (K3: 7168 against 3584) would let the kernel hide wire
+  time behind it; the stand-in measurement says most of the 56 to 75 us exposed at 512 to 1024 tokens on 4 x 8
+  could be covered. It needs a second task shape. The latent projections cannot hide wire time (one is before
+  the wire, one after it).
+- K3's activation is not the one the kernel implements; timing is unaffected, serving is not possible without it.

@@ -516,3 +516,47 @@ kernel fault.
 | Slow-launch rates | they depend on the host's CPU count and on pinning the Gin progress threads |
 | First-launch times | they depend on the JIT disk cache and on the nodes' CPUs (about 67 s cold and 9 s cached for a 1,920-token buffer at 16 GPUs; about 2 minutes from submit to result for the first request on a fresh 32-GPU server) |
 | Logs and result files of the campaign | not published |
+
+## 11. Another shape: the Kimi-K3 routed MoE (v2.1)
+
+Shape, from the public model config: hidden 3584 (the routed experts' latent), intermediate 3072, 896 experts,
+top-16, no shared expert in the kernel (K3's two shared experts take the 7168 hidden and run outside it).
+Harness shape: `--shape '{"hidden":3584,"inter":3072,"experts":896,"topk":16,"shared":0}'`. v2.0 does not
+build this shape (hidden not a multiple of 1024) and its Ordered regime deadlocks on any shape whose L1 has more
+clusters per block than L2; v2.1 fixes both. The 32 reference builds of the hidden-5120 shapes have the same
+normalised PTX at v2.1 as at v2.0, so the gate results of section 6 carry over (no 5120 launch was repeated).
+
+Correctness, 14 Nov 2026: B300 2 x 8 and 4 x 8 against the reference at 128 / 256 / 512 / 1024 and the lists
+`1023_511_257_127_1000_33`, `511_257_127_33_0_512`, `1024_0`, `0_0_0_600` with per-rank shift: pass, largest
+difference 2.7e-4. Not run for this shape: soak, trace, skewed routing, 768 tokens. On GB200 the only reference
+is the stock NVLink kernel on the same inputs.
+
+Microseconds per call, p50, tokens per rank 128 / 256 / 512 / 1024. Nothing was tuned for this shape: the plan
+is the MegaSeek-fitted one without the lead cap.
+
+| arm | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|
+| B300 IB 4 x 8 (800G) | 189.4 | 224.7 | 317.0 | 515.5 |
+| B300 IB 4 x 8, zero network | 161.1 | 183.2 | 261.2 | 440.8 |
+| GB200 NVLink, 32 GPUs | 159.7 | 195.8 | 303.1 | 515.6 |
+| B300 IB 2 x 8 (800G) | 240.5 | 267.1 | 323.0 | 507.5 |
+| B300 IB 2 x 8, zero network | 225.4 | 249.4 | 292.9 | 466.5 |
+| GB200 NVLink, 16 GPUs | 218.6 | 251.9 | 329.6 | 549.2 |
+| B300 one node, 8 GPUs, NVLink | 356.0 | 367.6 | 409.4 | 508.7 |
+| GB200 NVLink, 8 GPUs | 345.7 | 357.7 | 423.1 | 571.0 |
+| GB200 IB 4 x 8 (400G, gated) | 214.8 | 281.7 | 432.5 | 737.8 |
+| GB200 IB 4 x 8, zero network | 167.5 | 202.6 | 308.3 | 506.2 |
+| GB200 IB 2 x 8 (400G, gated) | 246.7 | 294.7 | 383.6 | 631.6 |
+| GB200 IB 2 x 8, zero network | 221.4 | 259.1 | 330.2 | 548.2 |
+
+Exposed wire on B300 (real minus zero network): 28 / 42 / 56 / 75 us at 4 x 8 (14 to 18% of the call) and
+15 / 18 / 30 / 41 at 2 x 8: the shape behaves like MegaSeek, not like Flash. With the network zeroed B300 is
+4 / 10 / 15 / 13% faster than GB200 on this shape, so the comparison with GB200 NVLink flatters the kernel from
+256 tokens up. Regimes: B300 2 x 8 Scan / Scan / Scan / Ordered; B300 4 x 8 Scan, then Ordered with retire.
+The 4 x 8 B300 rows and the 2 x 8 / one-node rows come from different servers. GB200 NVLink at 32 GPUs and 128
+tokens is bimodal (about 159 or 178 per round), cause not established.
+
+A stand-in for a fused shared expert (`"shared":2`: two shared experts in the 3584 latent, half the width of
+K3's real ones) adds 13 / 38 us of compute at 512 / 1024 on B300 4 x 8 with the network zeroed and 4 / 12 us
+with the real network: 9.5 / 26 us of it hide behind the wire. On one node over NVLink it costs its full
+6 to 27 us.

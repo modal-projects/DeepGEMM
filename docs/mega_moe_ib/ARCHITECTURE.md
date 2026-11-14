@@ -5,6 +5,9 @@ that span more than one NVLink domain, with InfiniBand between the domains. It i
 knows the stock kernel. Every statement about the code names the file and function it can be checked in; paths
 are relative to `deep_gemm/include/deep_gemm/` unless they start with `csrc/` or `deep_gemm/`. The text
 describes the tree at tag `fused-ib-base-v2.0` (commit `adac520`), called v2.0 below.
+v2.1 (tag `fused-ib-base-v2.1`) adds two fixes for other shapes and leaves the generated code of the three
+hidden-5120 shapes unchanged: the proxy sum takes a hidden that is a multiple of 512 (two items per token when it
+is not a multiple of 1024), and the L1 lead cap applies only when L1 has no more clusters per block than L2.
 
 Related documents: `REPRODUCTION.md` (how every number is produced), `TODO.md` (what is open).
 
@@ -368,7 +371,7 @@ build passes `Geometry::TailPolicy`, filled from the plan.
 
 | member | effect |
 |---|---|
-| `kL1LeadCap = C` | after an L2 task the next task is L1 only while L1 leads L2 by at most C pool blocks (claimed tasks of the locality domain); keeps L2 completions, which feed the proxy sum, steady to the end (`get_next_task`) |
+| `kL1LeadCap = C` | after an L2 task the next task is L1 only while L1 leads L2 by at most C pool blocks (claimed tasks of the locality domain); keeps L2 completions, which feed the proxy sum, steady to the end (`get_next_task`). Compiled in only when L1 has no more clusters per block than L2 (2 x intermediate <= hidden, rounded to clusters); with more, L1 needs its warm-up lead and the stock interleave is used (v2.1) |
 | `kRetirePercent`, `kRetireAtPercent` | that share of the clusters, evenly spread, stops claiming once that share of the routed L2 tasks of its locality domain is handed out (`should_retire`). Their warps join the proxy sum |
 | `kSharedL2Early` | the shared expert's L2 always runs before the routed tasks (`mainloop`) |
 | `kClaimAfterStart` | the scheduler makes its first claim only after the cluster's epilogue threads have left `ib::start` (`mainloop` waits on `start_barrier`). Always true in an IB build |

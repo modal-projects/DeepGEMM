@@ -4,7 +4,7 @@ This document describes the extension of the fused MoE kernel (`sm100_fp8_fp4_me
 that span more than one NVLink domain, with InfiniBand between the domains. It is written for a reader who
 knows the stock kernel. Every statement about the code names the file and function it can be checked in; paths
 are relative to `deep_gemm/include/deep_gemm/` unless they start with `csrc/` or `deep_gemm/`. The text
-describes the tree at commit `6ebf8b4`.
+describes the tree at commit `adac520`.
 
 Related documents: `REPRODUCTION.md` (how every number is produced), `TODO.md` (what is open).
 
@@ -27,6 +27,8 @@ Related documents: `REPRODUCTION.md` (how every number is produced), `TODO.md` (
 | epoch | a rank's launch counter for one buffer, starting at 1 (`ib::Launch::epoch`). Its lowest bit is the parity. |
 | plan | `layout::IBPlan`: every build decision of an IB kernel that is not a template argument. |
 | regime | Scan or Ordered: who builds the route tables and in which order token rows travel (section 4). |
+| gated loads | a plan option for NICs on which blank bulk memory must not be read early: hints delay the first read (section 5). |
+| tile | the GEMM block size M of a launch (`block_m`), chosen by the host from a token count. |
 | tail policy | how the scheduler orders the last routed tasks (`sched::SchedulePolicy`, section 7). |
 
 An "IB build" is a kernel compiled with `DG_MEGA_MOE_IB`. A build without it is the stock kernel: every IB site
@@ -119,7 +121,9 @@ nodes never write there.
 Python allocates the buffer and fills the sentinels (`SymmBuffer.__init__` in `deep_gemm/mega/__init__.py`,
 `allocate` in `deep_gemm/mega/ib.py`); it takes every offset from the same struct through
 `get_ib_tail_for_mega_moe` (`csrc/apis/mega_moe.hpp`). The Gin handles reach the host as five extra entries
-behind the per-rank pointers (`layout::kIBMagic`, `layout::IBHandles`) and the kernel as one extra argument.
+behind the per-rank pointers (`layout::kIBMagic`, `layout::IBHandles`: device communicator, window, ranks per
+node, and one word with the Gin backend in its low byte and the InfiniBand link rate per GPU in Gb/s above it)
+and the kernel as one extra argument.
 No Python or C++ signature of the stock API changes.
 
 ### Streams
@@ -144,9 +148,11 @@ dispatch warps                               epilogue warps                     
   count own top-k, write slot entries          SM 0        post Meta, return order  (kClaimAfterStart)
   and counts to ranks of THIS node             SMs 1..R    post SF + rows
 + node_barrier (ranks of this node)            Ordered:    order SMs, stage SMs,
-  fetch_expert_recv_count                                  8 table-build SMs
-  (waits for every source's counts)            last SMs    receive one remote
-+ pull loop on SMs [kFirstPullSM,                          source each
++ gated: watch_rows (one thread of each                 8 table-build SMs
+  row poster's SM)                             last SMs    receive one remote
+  fetch_expert_recv_count                                  source each
+  (waits for every source's counts)
++ pull loop on SMs [kFirstPullSM,
   kEndPullSM): slot_entry (await             + start_barrier.arrive ------------->  first claim
   tables_ready), pull_row (poll)               GEMM tasks: L1, L2                    L1 / L2 tasks under the
 + reduce: proxy sum, return puts             + store_partial for remote sources      tail policy
@@ -161,7 +167,8 @@ dispatch warps                               epilogue warps                     
 ```
 
 Sites in `impls/sm100_fp8_fp4_mega_moe.cuh`, in kernel order: `ib::Launch` construction after `workspace`;
-`reset_counters`, `trace::begin`, `report_return_gaps` at the start of the dispatch warps; skips of other
+`reset_counters`, `trace::begin`, `report_return_gaps` at the start of the dispatch warps; `ib::watch_rows` on
+one dispatch thread of each row poster's SM (gated builds); skips of other
 nodes' ranks in the slot-entry, grid-index and count pushes; `comm::node_barrier` in place of
 `comm::nvlink_barrier` (twice); `__threadfence()` after `fetch_expert_recv_count`; the pull loop bounds;
 `ib::slot_entry` and `ib::pull_row` in place of the stock per-row body; `ib::reduce` after the pull loop;
@@ -290,15 +297,39 @@ The epoch word is stored after the re-arm (kernel, after `rearm_mirrors`). Every
 launch, also with zero tokens; a zero-token source's proxies return a header instead of records
 (`ib::reduce`), which the source awaits and re-arms.
 
-### Limit on ConnectX-7 class NICs
+### Gated loads, for ConnectX-7 class NICs
 
-"The load is the poll" was developed and gated on B300 nodes with ConnectX-8 800G NICs. On GB200 trays with
-ConnectX-7 400G NICs the same tree is correct but unusably slow: a bulk region that many GPU threads read
-while it is still blank became visible only milliseconds later (about 10 ms per launch at 128 tokens on 32
-GPUs; `REPRODUCTION.md`, "GB200"). Small puts were not affected, and a single local reader of blank bulk
-memory was free. The tree at this commit contains no mitigation. `TODO.md` section (d) records the status of
-the candidate (a plan-selected hint that delays the first read of bulk data until it is likely to have
-landed, with the polls above kept behind it).
+"The load is the poll" was developed on B300 nodes with ConnectX-8 800G NICs, where reading blank memory is
+free. On GB200 trays with ConnectX-7 400G NICs it is not: a bulk region that many GPU threads load over NVLink
+while it is still blank became visible only milliseconds later (9.9 / 63.6 / 129.6 ms per launch at 128 / 512 /
+1024 tokens on 32 GPUs, against 200 to 650 us for the same kernel with the network switched off). Small puts
+were not affected, and one local thread polling blank bulk memory was free.
+
+A build with `plan.gated` (`Geometry::kGated`) therefore keeps threads from loading NIC-written bulk before it
+has probably landed. The hints are for speed and are never proofs: **every poll of the protocol above stays
+behind them**, and so does the re-arm's wait. A put lands in address order, so the last word of a put tells
+that the put is in.
+
+| bulk | hint | who waits |
+|---|---|---|
+| token rows | one thread per source node on the proxy (`ib::watch_rows`, `pull.cuh`; a dispatch thread of a row poster's SM, which does not pull) polls the last unit of every 16th row and publishes `(epoch << 32) | rows landed` in `signals->rows_landed[node]`, all ones when complete | `pull_row` before its loads (word read over NVLink from the proxy, once per row until the source is complete); `reduce` before its first item |
+| index rows | the receiver's header thread polls the last index entry (`ib::start`), where index rows are read: scan sources, and the proxy of any source | the scan |
+| table counts, table entries | thread 0 polls the last count, then the last of its rank's entries (`receive_tables`) | the copy |
+| return records | the proxy puts one flag word (the epoch) behind each chunk, on the chunk's queue pair, at `Geometry::kOffRecordFlags` behind the packed records (`reduce`) | `add_records` before loading a record |
+
+Records need a flag of their own because the combine re-arms a record in place as it reads it, so a record's
+own words cannot tell a later warp that the chunk has landed. Every wait goes through `ib::gate`
+(`geometry.cuh`): entered only when the first look fails, 200 ns between polls, named and bounded
+(`landing::spin<true>`, about 8 s). A zero-network launch does not wait.
+
+A diagnostics build counts row loads that found a blank unit after their hint (`signals->early_row_hints`,
+printed by the next launch, `report_return_gaps`). The count must stay zero where the option is on. On B300 it
+does not (rows were read blank after their count there), which is one reason the option is selected by device
+class and is off on 800G; the other is cost (the first forms measured +5.6 to +26.2 us on B300).
+
+The host turns the option on when the link rate is known and at most 400 Gb/s per GPU (section 8). With the
+option off, the generated code is identical to a build without it (16 reference builds compared by PTX md5).
+Measured cost of gating where the bulk is small: 8.5 us at 32 tokens on GB200 (`TODO.md`).
 
 ## 6. The pull, the proxy sum and the combine
 
@@ -344,23 +375,24 @@ A build that retires clusters also joins early (`Geometry::kJoinEarly`): after i
 warp 0 of an SM waits in the L2 grid sync; the other warps go to `ib::reduce`. The dispatch / epilogue CTA
 barrier still holds every warp back from the combine until warp 0 is through.
 
-In an IB build the claim-after-start barrier shares storage with `dispatch_barriers` in an anonymous union
-(kernel, `SharedStorage`); an IB build has no pull barriers. The comment at the site says why and when it
-becomes a member of its own.
+The claim-after-start barrier is a member of the kernel's `SharedStorage` in IB builds (`start_barrier`); the
+host adds its 8 bytes to the shared-memory size (`get_pipeline_config_for_mega_moe`, argument `is_ib`).
 
 ## 8. The plan
 
 `layout::IBPlan` (`layout/mega_moe_ib.cuh`) is filled by `get_mega_moe_ib_plan`
 (`csrc/jit_kernels/heuristics/mega_moe.hpp`) and printed into the JIT source as the macro
 `DG_MEGA_MOE_IB_PLAN` (`get_mega_moe_ib_defines`, `csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp`). The
-kernel reads it in one place (`ib::BuildPlan`). No IB header reads another macro, except the temporary
-`DG_MEGA_MOE_IB_COMPAT_ABI` (section 11).
+kernel reads it in one place (`ib::BuildPlan`). No IB header reads another macro. With `DG_PRINT_CONFIGS=1`
+the host prints every plan once, with the link rate it was planned for; the JIT source carries the same rate
+as a comment.
 
 | field | what it does | set by |
 |---|---|---|
 | `ranks_per_node` | node arithmetic and every per-node loop bound, at compile time | the buffer's handle (`IBHandles::ranks_per_node_of`) |
-| `ordered` | the regime of this rank as a sender; SM roles | token count against the fitted boundary: 512 with one remote node, 256 with more |
+| `ordered` | the regime of this rank as a sender; SM roles | the regime rule below |
 | `gin_backend` | compiles one Gin backend's put instead of a run-time dispatch over all | the communicator (`ib.py`, `create`); the host asserts an override equals it |
+| `gated` | gated loads (section 5) | on iff `0 < link rate <= 400` Gb/s per GPU; an unknown rate plans the ungated path |
 | `l1_lead_cap` | `kL1LeadCap` | 9 in the Ordered regime, else 0 |
 | `retire_percent` | `kRetirePercent`; also selects join-early | 50 in the Ordered regime with more than one remote node, else 0 |
 | `retire_at_percent` | `kRetireAtPercent` | `round(100 x 0.6^(nodes / top-k))` when clusters retire |
@@ -369,15 +401,51 @@ kernel reads it in one place (`ib::BuildPlan`). No IB header reads another macro
 | `trace` | time stamps (`impls/mega_moe_ib/trace.cuh`) | false; development override |
 | `zero_network` | from the third launch on: no puts, no re-arm, epochs not checked (`Geometry::is_network_live`, `kRearm`). A measurement of the kernel without the wire; valid only for identical inputs every launch | false; development override |
 
-Fitted values are in one struct (`Fitted` in `get_mega_moe_ib_plan`), with the measurements that set them in
-the comment beside it. They were fitted on B300 nodes at two and four nodes; `TODO.md` section (a) lists them
-and the evidence of how far they carry.
+**The regime rule.** One physical quantity decides the regime: how long a rank's token rows occupy the wire,
+
+```
+row_us = remote nodes x tokens x hidden bytes / link rate per GPU        ordered iff row_us >= 26.2 us
+```
+
+In the Scan regime no expert's first block is complete before that stream ends; the Ordered regime hides the
+stream behind the GEMM and pays a fixed chain of sender tables in front of the counts. 26.2 us is 512 tokens of
+5,120-byte rows to one remote node at 800G. The rule gives 512 / 256 / 171 tokens on 2 / 3 / 4 nodes at 800G
+and 256 / 128 / 86 at 400G, for every top-k. The comment above `get_mega_moe_ib_plan` lists the measured
+crossovers the constant was set from. The link rate is read once per process from sysfs
+(`link_gbps_per_gpu` in `deep_gemm/mega/ib.py`: the mean rate of the node's fastest active InfiniBand ports, one
+per GPU) and travels in the buffer handle; 0 means unknown and is planned as 800G.
+
+The other plan values are constants and topology rules in the same function, each with its measurement in the
+comment beside it: lead cap 9 in the Ordered regime; half of the clusters retire with more than one remote
+node; the retire point; shared L2 early wherever clusters retire. All of them were set on B300 at two and four
+nodes; `TODO.md` section (a) lists the evidence of how far they carry.
 
 One more fitted constant is in device code: `Geometry::kNumRecordsPerPut` = 8 with more than one remote node,
 32 with one (`geometry.cuh`, with its measurement).
 
-Development overrides: one environment variable per field, `DG_MEGA_MOE_IBP_<FIELD>`; a name that is no field
-is refused. `DG_MEGA_MOE_IB_TRACE` and `DG_MEGA_MOE_IB_ORACLE >= 2` also set `trace` and `zero_network`.
+**Development switches.** One environment variable per plan field, `DG_MEGA_MOE_IBP_<FIELD>=<number>`; a name
+that is no field, or a value that is no number, is refused. `DG_MEGA_MOE_IB_TRACE` and
+`DG_MEGA_MOE_IB_ORACLE >= 2` also set `trace` and `zero_network`. These, `DG_MEGA_MOE_IB_TILE_TOKENS`,
+`DG_DEV_COMPILE_ONLY` and `DG_MOE_NO_RENDEZVOUS` act only in a process that set `DG_MEGA_MOE_DEV=1`; anywhere
+else a set switch is refused by name (`get_mega_moe_dev_env`), so a stray variable cannot make a serving
+process send nothing or skip its launches. The allocation switches of `ib.py` (`DG_MEGA_MOE_IB`,
+`DG_MEGA_MOE_IB_GIN_TYPE`, `DG_MEGA_MOE_IB_VIRTUAL_LSA`, `DG_MEGA_MOE_IB_FORCE`) are outside that guard.
+
+### The tile of an idle rank
+
+The host chooses the tile of a launch from one rank's token count as if every rank had it. A rank with no
+tokens of its own still receives its peers' rows; with the smallest tile it splits them into many blocks, each
+with its own weight passes, and every other rank waits for its records. On B300 4 x 8, top-19, with half the
+ranks idle and half at 1,024 tokens, a launch took 1,322 us (675 us with 1,024 tokens on every rank). So across
+NVLink domains a rank with zero tokens takes the tile of a quarter of the buffer's token maximum
+(`get_mega_moe_ib_tile_tokens`, used at both `get_mega_moe_config` call sites of the launch function): 565 us
+on that list. Every other count keeps its own tile.
+
+Constraint: the tile is also what the caller lays its inputs out by (the shared expert's input scale factors
+are stored per tile). `get_block_m_for_mega_moe` (`csrc/apis/mega_moe.hpp`) therefore applies the same rule, in
+a process with `DG_MEGA_MOE_IB=1` and more than one rank, and any tile rule must be a function of that
+function's own arguments. With zero tokens a caller has no rows to lay out, which is why the rule can differ
+there and nowhere else. Ranks with 1 to 20 tokens beside busy ranks are not covered (`TODO.md` section (c)).
 
 Limits enforced by static asserts (they surface as a JIT compile error at the first launch): at most 16 nodes
 and 64 remote source ranks (`MegaMoEIBSignals`); `tokens x top-k < 65536` (`slot_entry`, `build_tables`); at
@@ -410,7 +478,7 @@ this process has not launched: it sets a flag, and the Python wrapper barriers t
 The barrier is a group collective, so every rank must enter it in the same call. A rank whose token count
 crossed a tile class or the regime boundary alone would otherwise meet a new kernel object alone. So on that
 first call the host compiles every kernel the buffer can launch: it builds the source for every token count
-from 0 to the buffer's maximum, de-duplicates by source text, compiles each distinct one and marks it as
+from 0 to the buffer's maximum (each with the tile rule above), de-duplicates by source text, compiles each distinct one and marks it as
 launched. After the one rendezvous no call of that buffer shape meets a new kernel object. The cost is
 first-call time (one compile per tile class and plan; the JIT disk cache keeps them); `TODO.md` section (c)
 lists the warm-up item. Under CUDA graph capture the launch is not skipped.
@@ -443,39 +511,40 @@ invariant is enforced.
 | I19 | A proxied source's token count and regime bit are published with its return order: stored before the fence, barrier and raise of `order_ready`, and read only after acquiring that flag. | `ib::start` proxy part; `reduce`. `rearm_mirrors` reads it after every dispatch warp has passed `reduce` |
 | I20 | (added in v1.2) Regime per source: a receiver treats each source in the regime that source's header announces; a receiver of an Ordered source polls that source's tables only after its header. | `ib::start` receiver part |
 
+| I21 | (added with gated loads) A hint is never a proof: with `plan.gated`, every poll and the re-arm's wait stay behind the hints; a row load that finds a blank unit after its hint is counted, and the count is zero where the option is on. | `ib::gate`, `watch_rows`; `pull_row` (`early_row_hints`) |
+| I22 | (added with the idle-rank tile) The tile of a launch is a function of the arguments of `get_block_m_for_mega_moe`, and that function returns the tile the launch uses. | `get_mega_moe_ib_tile_tokens`, both callers |
+
 Gate 1 is not an invariant of the IB path but of the change as a whole: with IB off, the kernel's PTX equals
 the stock kernel's (`REPRODUCTION.md`, "Gate list").
 
 ## 11. File map
 
-Line counts at `6ebf8b4`. "+n" is the number of lines added to a stock file (`git diff --stat 5081f85 6ebf8b4`).
+Line counts at `adac520`. "+n" is the number of lines added to a stock file (`git diff --numstat 5081f85 adac520`).
 
 | file | lines | content |
 |---|---|---|
-| `layout/mega_moe_ib.cuh` | 230 | `IBPlan`, `IBHandles`, `MegaMoEIBSignals`, `IBBufferLayout` |
+| `layout/mega_moe_ib.cuh` | 225 | `IBPlan`, `IBHandles`, `MegaMoEIBSignals`, `IBBufferLayout` |
 | `comm/gin.cuh` | 105 | `Stream`, `GinOf` (put, put_value), single-backend helpers |
 | `comm/landing.cuh` | 146 | sentinels, `load`, `spin`, `await`, `await_all`, flags, `rearm` |
 | `comm/barrier.cuh` | 135 (+41) | `node_barrier` |
-| `impls/mega_moe_ib/geometry.cuh` | 205 | `Geometry` (topology, roles, table offsets, `TailPolicy`), `Launch`, `make_gin`, `Slots` |
-| `impls/mega_moe_ib/start.cuh` | 311 | `start` (all sender and receiver roles), `report_return_gaps` |
-| `impls/mega_moe_ib/route.cuh` | 324 | `publish_counts`, `scan_route`, `build_tables`, `receive_tables` |
+| `impls/mega_moe_ib/geometry.cuh` | 226 | `Geometry` (topology, roles, table offsets, `TailPolicy`), `Launch`, `make_gin`, `gate`, `rows_landed`, `Slots` |
+| `impls/mega_moe_ib/start.cuh` | 321 | `start` (all sender and receiver roles), `report_return_gaps` |
+| `impls/mega_moe_ib/route.cuh` | 327 | `publish_counts`, `scan_route`, `build_tables`, `receive_tables` |
 | `impls/mega_moe_ib/sort.cuh` | 116 | `build_return_keys`, `sort_by_key` |
-| `impls/mega_moe_ib/pull.cuh` | 106 | `slot_entry`, `pull_row` |
-| `impls/mega_moe_ib/proxy.cuh` | 236 | `store_partial`, `reset_counters`, `reduce`, `rearm_mirrors` |
-| `impls/mega_moe_ib/combine.cuh` | 168 | `local_slot`, `park`, `add_records`, `await_empty_returns` |
-| `impls/mega_moe_ib/trace.cuh` | 80 | trace stamps (compiled only with `plan.trace`) |
-| `impls/sm100_fp8_fp4_mega_moe.cuh` | 1,717 (+189) | the hook sites of section 3 |
-| `scheduler/mega_moe.cuh` | 569 (+98) | `SchedulePolicy` and its four mechanisms |
-| `layout/mega_moe.cuh` | (+4) | compat padding only (temporary) |
-| `layout/mega_moe_ib_compat.cuh` | 147 | temporary: the buffer and argument layout of hosts built before this tree |
-| `csrc/jit_kernels/heuristics/mega_moe.hpp` | 365 (+100) | `get_mega_moe_ib_plan`, `to_string(IBPlan)` |
-| `csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp` | 302 (+106) | plan define, handles argument, compile-only hook, first-launch rendezvous |
-| `csrc/apis/mega_moe.hpp` | 425 (+27) | `get_ib_tail_for_mega_moe`, tail size check, three bindings |
+| `impls/mega_moe_ib/pull.cuh` | 140 | `slot_entry`, `pull_row`, `watch_rows` |
+| `impls/mega_moe_ib/proxy.cuh` | 239 | `store_partial`, `reset_counters`, `reduce`, `rearm_mirrors` |
+| `impls/mega_moe_ib/combine.cuh` | 169 | `local_slot`, `park`, `add_records`, `await_empty_returns` |
+| `impls/mega_moe_ib/trace.cuh` | 79 | trace stamps (compiled only with `plan.trace`) |
+| `impls/sm100_fp8_fp4_mega_moe.cuh` | 1,707 (+179) | the hook sites of section 3 |
+| `scheduler/mega_moe.cuh` | 569 (+93) | `SchedulePolicy` and its four mechanisms |
+| `csrc/jit_kernels/heuristics/mega_moe.hpp` | 391 (+131) | `get_mega_moe_dev_env`, `get_mega_moe_ib_tile_tokens`, `get_mega_moe_ib_plan`, `to_string(IBPlan)`; the start barrier's bytes |
+| `csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp` | 312 (+104) | plan define, handles argument, compile-only hook, first-launch rendezvous |
+| `csrc/apis/mega_moe.hpp` | 431 (+33) | `get_ib_tail_for_mega_moe`, tail size check, three bindings, the tile rule in `get_block_m_for_mega_moe` |
 | `csrc/runtime/jit.hpp` | (+4) | `DG_NCCL_INCLUDE_DIR` on the nvcc command line |
-| `deep_gemm/mega/ib.py` | 198 | NCCL window, device communicator, handles |
-| `deep_gemm/mega/__init__.py` | 256 (+44) | tail allocation, sentinel fill, rendezvous wrapper |
-| `tests/test_mega_moe.py` | 509 (+75) | tolerance check, single-domain reference |
+| `deep_gemm/mega/ib.py` | 219 | NCCL window, device communicator, handles, link rate from sysfs |
+| `deep_gemm/mega/__init__.py` | 256 (+41) | tail allocation, sentinel fill, rendezvous wrapper |
+| `tests/test_mega_moe.py` | 509 (+58) | tolerance check, single-domain reference |
 
-The compat layer (`DG_MEGA_MOE_IB_COMPAT_ABI`, every line marked `TEMPORARY`) lets this kernel run under a
-host extension built from an earlier tree, which is how it was timed against the earlier kernel in one
-request. The in-repo host never defines the macro. Its removal is a listed item (`TODO.md` section (c)).
+No stock file other than those listed is changed: `layout/mega_moe.cuh` and `layout/sym_buffer.cuh` are
+byte-identical to upstream. Earlier trees of this work carried a compatibility layer for hosts built before
+them; it is removed, and the in-repo host is the only host this kernel runs under.

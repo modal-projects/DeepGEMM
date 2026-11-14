@@ -44,7 +44,8 @@ DEFAULT_KNOBS = ('DG_MEGA_MOE_IB_SKIP_CREDIT=1,DG_MEGA_MOE_IB_HDR_CTX=1,DG_MEGA_
                  'DG_MEGA_MOE_IB_GPU_ACQ=1,DG_MEGA_MOE_IB_STREAM_COMBINE=1,DG_MEGA_MOE_PULL_META_EARLY=1')
 # Read when the process starts or a buffer is allocated (Python / NCCL setup): fixed for the server's lifetime, so an
 # arm may repeat the server's value but not change it (restart the server with another DEV_BASE_KNOBS instead)
-STATIC_KNOBS = {'DG_MEGA_MOE_IB', 'DG_MEGA_MOE_IB_PCOMB_COPIES', 'DG_MEGA_MOE_IB_CONTEXTS', 'DG_MEGA_MOE_IB_SHARING', 'DG_MEGA_MOE_IB_EXCLUSIVE',
+STATIC_KNOBS = {'DG_MEGA_MOE_IB', 'DG_MEGA_MOE_DEV',  # DEV: the final host refuses measurement switches without it
+                'DG_MEGA_MOE_IB_PCOMB_COPIES', 'DG_MEGA_MOE_IB_CONTEXTS', 'DG_MEGA_MOE_IB_SHARING', 'DG_MEGA_MOE_IB_EXCLUSIVE',
                 'DG_MEGA_MOE_IB_RAIL', 'DG_MEGA_MOE_IB_GIN_TYPE', 'DG_MEGA_MOE_IB_VIRTUAL_LSA', 'DG_MEGA_MOE_IB_FORCE',
                 'DG_MEGA_MOE_IB_NVL_REF', 'DG_MEGA_MOE_IB_TOLERANCE',
                 # SKIP_CREDIT: ib.py sizes the QP depth from it at import, and kernels with and without
@@ -66,10 +67,10 @@ SHAPES = {
     'flash': dict(hidden=5120, inter=2304, experts=384, topk=6, shared=1),
     'megaseek': dict(hidden=5120, inter=2304, experts=1216, topk=19, shared=1),
 }
-# The kernel's trace and hang lines start with DG_IB_; OPUS_ is the prefix of reference trees older than that rename
+# The kernel's trace line starts with DG_IB_TRACE; OPUS_ is the prefix of reference trees older than that rename
 TRACE_RE = re.compile(r'DG_IB_|OPUS_|NVL_TRACE|DeepGEMM|timeout|Timeout|FAIL_DETAIL')
-STAGE_RE = re.compile(r'DeepGEMM STAGE|grid sync|barrier .*timeout|DG_IB_HANG|OPUS_HANG')
-ALERT_RE = re.compile(r'DG_IB_HANG|OPUS_HANG|DeepGEMM STAGE|DeepGEMM .*timeout|grid sync|timeout|Timeout|trap|illegal|Traceback|Error|FAIL_DETAIL')
+STAGE_RE = re.compile(r'DeepGEMM STAGE|grid sync|barrier .*timeout|OPUS_HANG')
+ALERT_RE = re.compile(r'OPUS_HANG|DeepGEMM STAGE|DeepGEMM .*timeout|grid sync|timeout|Timeout|trap|illegal|Traceback|Error|FAIL_DETAIL')
 
 ROOT = os.environ.get('DEV_ROOT', '/tmp/devserver')
 PLANNED_EXIT = 75  # a rank exits with this after an ORACLE request: restart for fresh buffers, not a failure
@@ -2372,6 +2373,7 @@ class Rank:
         t = time.time()
         self.progress(rid, 'cases')
         cases = {s: self.case(shape, s) for s in sizes}
+        res['times']['case_parts'] = {str(s): c.__dict__.pop('t_parts') for s, c in cases.items() if 't_parts' in c.__dict__}
         if len(self.cases) > int(os.environ.get('DEV_MAX_CASES', 3)):
             self.restart_after = True  # also when a compile-ahead 'prep' created this request's cases
         res['times']['cases'] = round(time.time() - t, 2)
@@ -2800,8 +2802,12 @@ class Case:
         self.burned = False
         self.epr = self.E // R.world
         self.skew = skew_bias(torch, self.E, self.K, self.epr, R.world, getattr(R, 'say', None))  # DEV_SKEW_R: (score bias on rank 0's experts, max / mean)
+        # Where a case's creation time goes (rank 0's seconds, returned as times.case_parts): the product's IB buffer
+        # alone, then the harness's own pieces
+        tp = [time.time()]
         self.buffer = dg.get_symm_buffer_for_mega_moe(R.group, self.E, tokens, self.K, self.H, self.I,
                                                       num_shared_experts=self.S, mma_type='fp8xfp4')
+        tp.append(time.time())
         self.nvl_ref_buffer = None
         if R.nvl_ref:
             saved = os.environ.pop('DG_MEGA_MOE_IB_VIRTUAL_LSA', None)
@@ -2831,9 +2837,13 @@ class Case:
             self.barrier_fn = lambda: self.ep_buffer.barrier(**kw)
         else:
             self.barrier_fn = lambda: R.dist.all_reduce(torch.empty(1, device='cuda'), group=R.group)
+        tp.append(time.time())
         torch.manual_seed(1000003 * R.rank + 7919 * tokens + self.E)
         self.make_weights()
+        tp.append(time.time())
         self.timing = self.make_inputs()
+        tp.append(time.time())
+        self.t_parts = dict(zip(('ib_buffer', 'reference_buffers', 'weights', 'inputs'), (round(b - a, 2) for a, b in zip(tp, tp[1:]))))
 
     def make_weights(self):
         torch, dg = self.torch, self.dg
@@ -3280,7 +3290,7 @@ def fakeworker():
         atomic_write_json(PROGRESS, {'id': req['id'], 'phase': 'timing', 'detail': 'fake', 'time': time.time()})
         if 'crash' in names:
             with open(f'{gd}/rank0.log', 'w') as f:
-                f.write('DG_IB_HANG fake rank=0\nTraceback: boom\n')
+                f.write('DeepGEMM STAGE fake rank=0\nTraceback: boom\n')
             os._exit(3)
         if 'hang' in names:
             time.sleep(10 ** 6)

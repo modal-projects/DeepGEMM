@@ -62,7 +62,7 @@ git -C <checkout> diff 5081f85 $BASE > jobs/devserver_tree.patch
 python submit.py --cluster b300_2n_b --script jobs/devserver.sh \
     --file jobs/devserver.py --file jobs/setup_deps.sh --file jobs/nccl_topo.py --file jobs/devserver_tree.patch \
     --env PATCH=devserver_tree.patch --env DEV_BASE_COMMIT=$BASE --env TEST_NODES=2 \
-    --env DG_MEGA_MOE_IB_GIN_TYPE=3 --env DEV_HDR_FRESH=1 --env DEV_MAX_CASES=8 \
+    --env DG_MEGA_MOE_DEV=1 --env DG_MEGA_MOE_IB_GIN_TYPE=3 --env DEV_HDR_FRESH=1 --env DEV_MAX_CASES=8 \
     --env DEV_HOURS=15 --env DEV_WARM=megaseek:1024 --timeout 57600 --no-wait --name devserver
 python devclient.py --cluster b300_2n_b status
 ```
@@ -72,6 +72,7 @@ Server-side switches (all `--env` of the job; the full list is in the two `jobs/
 | variable | meaning |
 |---|---|
 | `PATCH`, `DEV_BASE_COMMIT` | the tree; `devclient.py ab --repo` sends every header that differs from `DEV_BASE_COMMIT` |
+| `DG_MEGA_MOE_DEV=1` | required: the host refuses plan overrides, trace, zero-network and compile-only switches without it, and the server uses the compile-only switch for every request. It is fixed for the server's lifetime; an arm cannot set or unset it |
 | `TEST_NODES` | nodes that take part (2 on a 4-node cluster gives a 16-GPU server) |
 | `DG_MEGA_MOE_IB_GIN_TYPE` | NCCL Gin backend: 3 (GDAKI) on the InfiniBand clusters, 0 = any |
 | `DG_MEGA_MOE_IB_VIRTUAL_LSA=n` | treat groups of n consecutive ranks as NVLink domains (GB200: 8 = two trays per logical node) |
@@ -100,7 +101,8 @@ Each timed launch follows `bench_kineto`: a 256 MB L2 flush, `torch.cuda._sleep(
 the kernel's CUPTI duration. `--warmup` (10) launches precede `--launches` (30) timed ones in every round.
 Reported per arm and size: `median` (median over (rank, round) of the per-rank mean), `clean` (the same without
 launch steps above 1.5x the median launch), `st/10k` (those steps per 10,000), the round medians, a check
-verdict with the largest `calc_diff`, the code hash of the cubin and whether it was verified.
+verdict with the largest `calc_diff`, the code hash of the cubin and whether it was verified. `times.case_parts` in the raw
+result gives the seconds rank 0 spent creating each new case, split into the IB buffer and the harness's own parts.
 
 Shapes: `--shape flash` (384 experts, top-6), `--shape megaseek` (1216 experts, top-19), or a JSON object,
 e.g. `'{"hidden": 5120, "inter": 2304, "experts": 1600, "topk": 25, "shared": 1}'` (the "GigaSeek" shape).
@@ -115,7 +117,7 @@ Test-only arm variables handled by the server (not by the kernel):
 | `DG_MEGA_MOE_DEV_ALT_TIMING=1` | the timing launches cycle through the list as well (no reference run in between; its times are no benchmark) |
 | `DG_MEGA_MOE_DEV_TIME_NVL=1` | time the single-domain reference buffer instead (needs `DG_MEGA_MOE_IB_NVL_REF=1`). It did not take effect on the one server it was tried on: accept a result only if its code hash differs from the IB arm's |
 | `DG_MEGA_MOE_IB_ORACLE=2` | zero-network build. Must be alone in its request, with `--check 0`; the ranks restart before and after |
-| `--trace` | trace build: the kernel's trace lines come back in the result (the server matches the prefix `DG_IB_` and, for reference trees older than that rename, `OPUS_`) |
+| `--trace` | trace build: the kernel's trace lines come back in the result (`DG_IB_TRACE ...`; the server also matches the prefix `OPUS_` of reference trees older than the rename) |
 
 Rules the harness enforces: an arm that sets an allocation-time variable to another value than the server's is
 refused; a zero-network arm cannot share a request; a failed check restarts the ranks; background compiles are

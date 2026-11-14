@@ -12,9 +12,9 @@ All times are microseconds per kernel launch. "EP16" and "EP32" mean 16 and 32 G
 |---|---|---|---|---|
 | B300 2 x 8 | 2 bare-metal nodes | 16 B300 | ConnectX-8, 800G InfiniBand | all gates run; fitted |
 | B300 4 x 8 | 4 bare-metal nodes | 32 B300 | ConnectX-8, 800G InfiniBand | all gates run; fitted |
-| GB200 4 x 8 | 8 trays of 4 GPUs in one rack, grouped as 4 logical nodes of 8 (`DG_MEGA_MOE_IB_VIRTUAL_LSA=8`) | 32 GB200 | ConnectX-7, 400G NDR InfiniBand, one rail per GPU | correct, not usable as is (section 9) |
+| GB200 4 x 8 | 8 trays of 4 GPUs in one rack, grouped as 4 logical nodes of 8 (`DG_MEGA_MOE_IB_VIRTUAL_LSA=8`) | 32 GB200 | ConnectX-7, 400G NDR InfiniBand, one rail per GPU | gated loads; gates run; not tuned (section 9) |
 
-Every number in section 8 is from B300. A B300 node here has 8 GPUs in one NVLink domain and about 115 host
+The B300 numbers are in section 8, the GB200 numbers in section 9. A B300 node here has 8 GPUs in one NVLink domain and about 115 host
 CPUs, of which a container gets 64. The CPU count matters: with a Gin backend that uses host progress threads,
 each of those threads needs a core of its own during a measurement (the harness pins them; `DEV_PIN`).
 
@@ -52,6 +52,10 @@ DG_FORCE_BUILD=1 python setup.py bdist_wheel && pip install --no-deps --force-re
 
 What an IB run needs beyond a stock build:
 
+- Development switches (plan overrides, trace, zero network, compile-only) act only with `DG_MEGA_MOE_DEV=1`
+  in the process and are refused by name without it. The dev server must be started with it
+  (`--env DG_MEGA_MOE_DEV=1`; it is an allocation-time variable there, so an arm cannot change it). A plain
+  run of the kernel needs none of them.
 - `DG_MEGA_MOE_IB=1` in the environment of every rank: Mega MoE buffers are then allocated as one NCCL
   window with the IB tail (`deep_gemm/mega/ib.py`).
 - NCCL 2.32.3 headers and library from the `nvidia-nccl-cu13` wheel. `ib.py` finds them through the `nvidia`
@@ -133,6 +137,10 @@ launches in per case before it times anything.
     expected delta and its mechanism are written down before a timing is submitted, and a miss gets a traced
     cause before the item is closed.
 
+**The host's plan.** Ordered iff `remote nodes x tokens x hidden / link rate >= 26.2 us`: from 512 tokens at
+2 x 8 and 171 at 4 x 8 on 800G; from 256 and 86 on 400G, where the plan is also gated. `DG_PRINT_CONFIGS=1`
+prints each plan with the rate it was planned for.
+
 **Forcing a regime.** `DG_MEGA_MOE_IBP_ORDERED=0|1` sets only the regime. The tail policy is chosen before
 the overrides, from the regime the host would have picked, so "Ordered with the host's policy" below the
 boundary is spelled out: `DG_MEGA_MOE_IBP_ORDERED=1,DG_MEGA_MOE_IBP_L1_LEAD_CAP=9` and, with more than one
@@ -143,7 +151,8 @@ remote node, `DG_MEGA_MOE_IBP_RETIRE_PERCENT=50,DG_MEGA_MOE_IBP_RETIRE_AT_PERCEN
 plan fields need no second tree. For two trees there are two cases:
 
 - *The host forwards arm variables into the JIT source as defines* (hosts built from the trees that preceded
-  this one did; that is how this kernel was timed against its predecessor, with the compat layer). Build one
+  this one did; that is how v1.1 and v1.2 were timed against the reference kernel in section 8, through a
+  compatibility layer those tags carried and this tree no longer has). Build one
   combined header tree with `tools/mega_moe_ib/mkab.py OUT exp=<tree>:DG_MEGA_MOE_EXP base=<tag>`: identical
   headers are copied once, differing ones become a dispatcher on the arm's define. The arms then run
   interleaved in one request. Check that an arm's code hash from the combined tree is stable across requests;
@@ -166,6 +175,7 @@ plan fields need no second tree. For two trees there are two cases:
 | `DEV_MAX_CASES` | live (shape, tokens) cases before the ranks restart; 8 was used on the in-repo-host servers, the default is 3 | each case holds its own communicator and progress threads |
 | `DG_MEGA_MOE_DEV_ALT_TIMING=1` with `DG_MEGA_MOE_DEV_ALT_TOKENS` (and `_ALT_RANK=1`) | the timing launches cycle through the token list, shifted per rank: back-to-back launches with different counts per rank | written, selftest only; not run on a server |
 | `DG_MEGA_MOE_DEV_TIME_NVL=1` | times the single-domain reference buffer instead of the IB buffer | did NOT take effect on the one server it was tried on (GB200, 32 GPUs: same code hashes and times as the IB arm). Treat a result as valid only if its code hash differs from the IB arm's |
+| case timer | a result's `times.case_parts` gives rank 0's seconds per new case: the IB buffer alone, then the harness's reference buffers, weights and inputs | 32 ranks, top-19: 14.4 s for the first IB buffer of a process, 3.3 to 3.7 s for each later one |
 | fault-address capture | a failure result carries the node's `Xid` / `NVRM` kernel-log lines (`logs.<node>.xid`), where the container may read the kernel log | installed; whether it has captured a fault address: not measured |
 
 ## 6. Gate list
@@ -181,7 +191,7 @@ A tree's numbers count only if it passes all of these. "diag" = diagnostics on; 
 | 4 | soak | `--check 3000`: three shapes Ordered 512 / 511 and 1024 / 1023; Scan 128 / 127 |
 | 5 | back-to-back diagnostics | timing phase of the diag builds: three shapes, Scan 128 / 127, Ordered 512 / 511, 1024 / 1023; no trap, no alert, no device message |
 | 6 | timing against the previous base | same request, both orders, twins, at 128, 512, 1024 on three shapes at both GPU counts: equal or better, or the miss explained in writing |
-| 7 | host | first IB launch of a buffer (cold JIT cache); an unknown `DG_MEGA_MOE_IBP_*` name is refused with its name; a plan whose backend differs from the communicator's is refused |
+| 7 | host | first IB launch of a buffer (cold JIT cache); an unknown `DG_MEGA_MOE_IBP_*` name is refused with its name; a development switch without `DG_MEGA_MOE_DEV=1` is refused with its name; a plan whose backend differs from the communicator's is refused; on a 400G node the host's plan is the gated one |
 | 8 | experts per rank (Ordered, EP16) | diag check at 12, 24, 31, 32, 33, 38, 50, 76 experts per rank |
 
 Gate 1 is local (front end only; needs nvcc, no GPU):
@@ -199,12 +209,19 @@ changes md5 when the process id gains a digit. With the CUDA 13.2 toolkit wheels
 equality does not. nvcc may exit non-zero after writing the PTX if its assembler rejects the PTX version; the
 script judges by the PTX text.
 
-State of the gates for the tree at `6ebf8b4` (13 Nov 2026): gate 1 pass; gates 2 to 5 pass at EP32 on the
-earlier host ABI and at EP16 on the in-repo host; the mixed-regime lists of gate 3 pass at EP32 and EP16 on the
-in-repo host; gate 6 within +0.8 us of the previous base at nine EP32 points and not slower at EP16. Open at
-that date: gates 2, 4 and 5 in full at EP32 on the in-repo host (`TODO.md` section (c)), and back-to-back
-launches with different counts per rank (the harness mode exists, `DG_MEGA_MOE_DEV_ALT_TIMING=1`, and had not
-been run on a server).
+**FINAL-TAG GATE TABLE: PENDING.** The B300 gate runs of this tree were still in progress when this was
+written (every diagnostics check returned so far passes). The table goes here: one row per gate above, per
+GPU count, with date and server. Until then, what is established:
+
+- Gate 1: pass on this tree (`f850b8e3b441` / `d2fca7b8bc4e`).
+- v1.2 (`6ebf8b4`, 13 Nov 2026), B300: gates 2 to 5 passed at 32 GPUs under the compatibility layer and at 16
+  GPUs on the in-repo host; the mixed-regime lists of gate 3 passed at both GPU counts on the in-repo host;
+  gate 6 within +0.8 us of v1.1 at nine 32-GPU points.
+- This tree on GB200 4 x 8 (14 Nov 2026): the table in section 9.
+- The new 4 x 8 boundary on 800G (171 tokens): Ordered diagnostics checks at 176 / 192 / 224 with odd
+  neighbours passed 6 of 6 and soaks of 3,000 at 192 / 224 passed 4 of 4 on v1.2 with the regime forced; a
+  changing-count list in which the host chooses per rank across 171 was not run.
+- Not run on any tree: the in-repo test command of section 4.
 
 ## 7. Request lines for the headline points
 
@@ -246,87 +263,174 @@ O=DG_MEGA_MOE_IBP_ORDERED=1,DG_MEGA_MOE_IBP_L1_LEAD_CAP=9,DG_MEGA_MOE_IBP_RETIRE
 $AB $C32 ab --repo $T --shape megaseek --arm S= --arm O=$O --arm O2=$O --arm S2= --tokens 192 --check 0 --rounds 7 --name b_m192
 ```
 
-A request with `--check` greater than 0 carries one arm. On the in-repo host, send one request at a time to a
-server unless it was started with the current `jobs/devserver.py` and `DEV_HDR_FRESH=1`.
+A request with `--check` greater than 0 carries one arm. Start the server with `DG_MEGA_MOE_DEV=1` and
+`DEV_HDR_FRESH=1`. An arm that moves a buffer to another kernel family inside a live process (for example a
+tile override) needs fresh ranks: otherwise ranks meet the new kernels in different calls, the first-launch
+rendezvous cannot line them up, and the request ends in a header timeout that is the harness's doing, not the
+kernel's.
 
-## 8. Expected numbers
+## 8. Expected numbers: B300
 
-Final values come from the re-benchmark of the final tree. Until they are filled in, every cell below is a
-placeholder; do not quote this table.
+The data set is frozen at v1.2 (`6ebf8b4`; v1.1 is `7863474`, and v1.2 is v1.1 plus the regime bit and the
+blank-header fix). This tree changes the plan, and with it the kernel a point runs,
+only at 171 to 255 tokens on 4 nodes at 800G, where it selects the Ordered regime; no row below is in that
+range. Its kernels differ from v1.2's by the position of one barrier in shared memory; the equal-count rows
+were not re-timed on it at the time of writing.
 
-**PLACEHOLDER TABLE: to be filled from the re-benchmark (date, server, tree commit and host ABI per row).**
+How the rows were measured: 13 Nov 2026 (16 GPUs: into 14 Nov, 00:15 UTC). One request per point and arm
+order, four arms in one request (reference | reference with the assert removed | v1.1 | v1.2) and reversed,
+one token count per request, 5 rounds x 30 launches x all ranks, `--check 0`; each cell is order a / order b.
+Each arm passed a 30-test check against the DeepEP reference in its own request. All four arms come from one
+combined header tree on servers whose host forwards arm defines; v1.1 and v1.2 ran the plan their own host
+prints for the point (32 GPUs: Scan at 128, Ordered with lead cap 9, retire 50 % and shared L2 early from 256;
+16 GPUs: Scan at 128 and 256, Ordered with lead cap 9 from 512).
 
-| shape | GPUs | tokens | regime (host plan) | time | twin | zero network | NVLink, 32 GPUs in one domain (GB200) | stock, one B300 node, equal per-GPU work | date | server | tree |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| MegaSeek | 32 | 128 | Scan | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| MegaSeek | 32 | 256 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| MegaSeek | 32 | 512 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| MegaSeek | 32 | 768 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| MegaSeek | 32 | 1024 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| GigaSeek | 32 | 128 | Scan | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| GigaSeek | 32 | 256 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| GigaSeek | 32 | 512 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| GigaSeek | 32 | 768 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| GigaSeek | 32 | 1024 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Flash | 32 | 128 | Scan | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Flash | 32 | 256 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Flash | 32 | 512 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Flash | 32 | 1024 | Ordered | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| MegaSeek | 16 | 128 | Scan | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| MegaSeek | 16 | 256 | Scan | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| MegaSeek | 16 | 512 | Ordered | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| MegaSeek | 16 | 1024 | Ordered | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| GigaSeek | 16 | 128 | Scan | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| GigaSeek | 16 | 512 | Ordered | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| GigaSeek | 16 | 1024 | Ordered | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| Flash | 16 | 128 | Scan | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| Flash | 16 | 512 | Ordered | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
-| Flash | 16 | 1024 | Ordered | TBD | TBD | TBD | - | TBD | TBD | TBD | TBD |
+Columns:
 
-How to read the two reference columns once filled:
+- **reference kernel**: the kernel that preceded this tree, with its per-point switch strings.
+- **reference, assert removed**: the same with one debug assert removed from its symmetric-pointer mapping
+  (two run-time divisions and a trap path at every NVLink store and pull). This is the fair reference: the
+  assert alone accounts for up to 28 us of the reference kernel's time.
+- **GB200 NVLink**: the stock kernel on GB200 with all 16 or 32 GPUs in one NVLink domain, measured on 5 and 6
+  Nov 2026. It is another machine. Taken at face value, with one caveat: with the network switched off, the
+  top-19 kernel reads 198.0 / 359.6 / 590.1 us on B300 and 199.8 / 398.9 / 652.9 us on GB200 at 128 / 512 /
+  1024 tokens, so GB200 has about 10 % less compute at 512 to 1024 tokens and none at 128. The same pair was
+  not measured for the other two shapes. No scaled baseline is used anywhere. 768 tokens were not measured on
+  NVLink.
 
-- **NVLink, 32 GPUs in one domain** was measured on a GB200 rack (5 and 6 Nov 2026), not on B300. Comparing a
-  B300 IB time with it compares two kinds of hardware.
-- **Stock, one B300 node, equal per-GPU work** is the stock kernel on 8 B300 GPUs with the expert count
-  scaled so that each GPU does the same work as in the 32-GPU run. It is the same-hardware reference for the
-  zero-network column.
+### 32 GPUs: 4 nodes x 8 B300, 800G (4-node server A)
 
-### Interim values (not final; for orientation only)
+| shape | tokens | reference kernel | reference, assert removed | v1.1 | v1.2 | v1.2 - reference (assert removed) | GB200 NVLink | v1.2 - NVLink |
+|---|---|---|---|---|---|---|---|---|
+| MegaSeek | 128 | 246.2 / 246.2 | 245.1 / 245.3 | 231.7 / 232.0 | 232.1 / 232.1 | -13.1 | 206 | +26.1 |
+| MegaSeek | 256 | 318.6 / 318.7 | 317.9 / 318.1 | 295.2 / 295.5 | 294.7 / 294.9 | -23.2 | 257 | +37.8 |
+| MegaSeek | 512 | 460.4 / 460.2 | 453.9 / 454.0 | 427.1 / 427.1 | 426.8 / 427.1 | -27.0 | 407 | +19.9 |
+| MegaSeek | 768 | 594.0 / 594.3 | 573.0 / 572.7 | 542.0 / 541.5 | 541.6 / 541.5 | -31.3 | - | - |
+| MegaSeek | 1024 | 723.8 / 723.7 | 710.9 / 711.2 | 671.7 / 671.8 | 672.3 / 672.1 | -38.8 | 652 | +20.2 |
+| GigaSeek | 128 | 289.6 / 289.7 | 287.9 / 288.1 | 273.7 / 273.5 | 273.6 / 273.7 | -14.4 | 258 | +15.6 |
+| GigaSeek | 256 | 365.8 / 365.1 | 363.6 / 362.7 | 336.5 / 335.9 | 336.8 / 335.8 | -26.9 | 326 | +10.3 |
+| GigaSeek | 512 | 552.6 / 552.7 | 548.0 / 548.0 | 515.9 / 515.9 | 515.8 / 515.8 | -32.2 | 528.5 | -12.7 |
+| GigaSeek | 768 | 735.5 / 735.6 | 707.7 / 707.6 | 664.6 / 665.2 | 665.1 / 665.5 | -42.4 | - | - |
+| GigaSeek | 1024 | 899.7 / 899.8 | 879.0 / 879.9 | 832.0 / 831.8 | 832.2 / 832.1 | -47.3 | 835 | -2.9 |
+| Flash | 128 | 158.3 / 157.8 | 157.4 / 157.3 | 152.8 / 153.1 | 153.1 / 153.2 | -4.2 | 92 | +61.2 |
+| Flash | 256 | 212.3 / 212.6 | 211.5 / 211.2 | 179.6 / 179.5 | 179.3 / 179.2 | -32.1 | 112 | +67.2 |
+| Flash | 512 | 278.1 / 278.0 | 274.6 / 274.7 | 241.6 / 241.6 | 241.3 / 241.4 | -33.3 | 165 | +76.3 |
+| Flash | 768 | 346.2 / 346.3 | 343.9 / 343.6 | 310.7 / 310.6 | 310.7 / 310.5 | -33.2 | - | - |
+| Flash | 1024 | 430.5 / 430.3 | 426.4 / 426.2 | 393.6 / 393.6 | 393.2 / 393.0 | -33.1 | 238 | +155.1 |
 
-Measured 13 Nov 2026 on the tree one commit pair before this one (`7863474`; the two later commits read
-within +0.8 us at nine EP32 points). EP32 rows: an earlier host ABI on the servers (the kernel's compat
-layer), MegaSeek on one 4-node server and GigaSeek / Flash on another; EP16 on a 2-node server. Same-request
-medians, order a / order b. Levels differ by several us between servers and requests.
+### 16 GPUs: 2 nodes x 8 B300, 800G (2-node server)
 
-| shape | GPUs | tokens | time (a / b) | zero network | NVLink, 32 GPUs, GB200 | stock, one B300 node |
-|---|---|---|---|---|---|---|
-| MegaSeek | 32 | 128 (Scan) | 232.5 / 232.5 | 198.0 | 206 | not measured |
-| MegaSeek | 32 | 512 | 426.3 / 425.9 | 359.6 | 407 | 334.2 |
-| MegaSeek | 32 | 1024 | 670.4 / 670.5 (675 to 678 in later requests) | 590.1 | 652 | 549.0 |
-| GigaSeek | 32 | 128 (Scan) | 273.9 / 273.7 | not measured | 258 | not measured |
-| GigaSeek | 32 | 512 | 510.1 / 511.5 | 457.7 | 528.5 | 429.5 |
-| GigaSeek | 32 | 1024 | 831.7 / 832.8 | 754.4 | 835 | 720.4 |
-| Flash | 32 | 512 | 236.0 / 233.9 | not measured here | not in the notes this table was built from | not measured |
-| Flash | 32 | 1024 | 401.0 / 400.9 | not measured here | not in the notes this table was built from | not measured |
-| MegaSeek | 16 | 128 (Scan) | 311.0 | not measured | - | not measured |
-| MegaSeek | 16 | 1024 | 697.6 / 697.8 | not measured | - | not measured |
-| GigaSeek | 16 | 1024 | 905.4 / 906.0 | not measured | - | not measured |
-| Flash | 16 | 1024 | 294.1 / 294.4 | not measured | - | not measured |
+| shape | tokens | reference kernel | reference, assert removed | v1.1 | v1.2 | v1.2 - reference (assert removed) | GB200 NVLink | v1.2 - NVLink |
+|---|---|---|---|---|---|---|---|---|
+| MegaSeek | 128 | 321.0 / 321.3 | 319.9 / 319.9 | 311.1 / 311.5 | 311.8 / 311.9 | -8.0 | 291.0 | +20.9 |
+| MegaSeek | 256 | 361.8 / 361.5 | 359.1 / 358.9 | 347.9 / 348.0 | 348.8 / 348.9 | -10.2 | 337 | +11.8 |
+| MegaSeek | 512 | 453.9 / 454.3 | 450.3 / 450.2 | 422.6 / 422.5 | 422.6 / 422.5 | -27.7 | 430.5 | -8.0 |
+| MegaSeek | 768 | 562.7 / 562.6 | 552.3 / 552.7 | 516.6 / 517.2 | 516.7 / 516.5 | -35.9 | - | - |
+| MegaSeek | 1024 | 743.8 / 743.5 | 740.7 / 740.0 | 697.2 / 697.6 | 697.3 / 697.6 | -42.9 | 721.5 | -24.1 |
+| GigaSeek | 128 | 399.2 / 399.1 | 397.4 / 397.4 | 386.6 / 386.3 | 385.8 / 385.9 | -11.6 | 365.5 | +20.3 |
+| GigaSeek | 256 | 451.3 / 453.9 | 448.2 / 449.7 | 434.1 / 433.4 | 433.1 / 433.0 | -15.9 | 425.5 (h) | +7.6 (h) |
+| GigaSeek | 512 | 568.3 / 568.4 | 562.9 / 563.0 | 531.0 / 534.4 | 530.1 / 534.9 | -30.5 | 548 (h) | -15.5 (h) |
+| GigaSeek | 768 | 720.0 / 721.4 | 713.1 / 713.3 | 657.3 / 657.5 | 656.9 / 656.4 | -56.6 | - | - |
+| GigaSeek | 1024 | 951.5 / 951.2 | 949.1 / 948.8 | 903.0 / 903.2 | 902.9 / 904.0 | -45.5 | 925.0 | -21.5 |
+| Flash | 128 | 158.3 / 160.9 | 156.8 / 159.9 | 152.6 / 155.0 | 153.2 / 155.5 | -4.0 | 126.0 | +28.4 |
+| Flash | 256 | 181.4 / 181.7 | 180.1 / 180.0 | 169.2 / 169.5 | 169.5 / 169.6 | -10.5 | 142 | +27.5 |
+| Flash | 512 | 228.9 / 229.1 | 228.4 / 228.5 | 206.1 / 206.1 | 205.6 / 205.5 | -22.9 | 173 | +32.5 |
+| Flash | 768 | 282.7 / 285.4 | 276.1 / 278.5 | 241.6 / 243.8 | 241.9 / 243.7 | -34.6 | - | - |
+| Flash | 1024 | 340.5 / 342.0 | 340.7 / 341.8 | 293.1 / 295.3 | 293.4 / 294.7 | -47.1 | 268.5 | +25.6 |
+
+(h): the bar is from the same NVLink sweep but was not in the re-benchmark's own table; the difference is
+computed here from the mean of the two orders. Flash 1024: the sweep log reads 269 where the table has 268.5.
+
+Caveats of these rows:
+
+- Levels differ by 3 to 9 us between servers and move by about 3 us between requests on one server (v1.1 at
+  top-19, 32 GPUs, 1024 tokens read 678 in six earlier requests the same day and 671.7 here). Only differences
+  inside a row count.
+- GigaSeek at 16 GPUs, 512 tokens: orders a and b differ by 3 to 5 us in the two new arms and not in the
+  reference arms; not explained. GigaSeek 256 and Flash 128 / 768 / 1024 at 16 GPUs: order b reads 2 to 3 us
+  above order a in every arm.
+- The Flash row at 32 GPUs, 512 tokens, replaces two earlier requests that read every arm 5 to 10 us high
+  while other compiles ran on the server.
+- 1,920 tokens: not measured.
+
+Other reference values (top-19 and top-25, 32 GPUs, 13 Nov 2026, v1.1, 4-node server A, real and zero-network
+from the same hour):
+
+| point | real | zero network | exposure | stock kernel, one B300 node, equal per-GPU work (12 Nov) |
+|---|---|---|---|---|
+| MegaSeek 512 | 426.1 | 359.6 | 67 | 334.2 |
+| MegaSeek 1024 | 678.0 | 590.1 | 88 | 549.0 |
+| GigaSeek 512 | 515.1 | 457.7 | 57 | 429.5 |
+| GigaSeek 1024 | 832.6 | 754.4 | 78 | 720.4 |
+| MegaSeek 128 (4-node server B) | 232.5 to 233.8 | 198.0 | 35 | 184.5 |
+| Flash 256 / 512 / 1024 | 179.1 / 241.1 / 393.4 | 120.4 / 167.1 / 245.0 | 58.7 / 74.0 / 148.4 | not measured / not measured / 202.3 |
 
 Stage account of one point (MegaSeek, 32 GPUs, 128 tokens, traced pair, 13 Nov): of 38 us of network exposure
 in the traced build, 17 are at the start (the counts wait for the header), 10 on the return wire after the
 last put, 6 after the last stamp (mirror re-arm and exit), and under 5 in the pull and GEMM phases together.
 
+Idle ranks (32 GPUs, top-19, 4-node server B, in-repo host, 13 and 14 Nov; timing phase cycling a count list
+with a per-rank shift, medians): list `1024_0` 1,321.8 us with every rank's own tile and 564.6 with the tile
+rule (measured with a development rule that builds the same kernels on these lists); `512_0` 718.0 and 344.2; `600_128_1024_0_300_511` 1,118.3 and 465.0; `8_1024`
+1,331.5 (not covered by the rule). Equal counts are unchanged by the rule by construction.
+
 ## 9. GB200
 
-The tree at `6ebf8b4` comes up on GB200 4 x 8 with the in-repo host and passes the single-domain reference
-check (`calc_diff` 2.6e-4), but every launch takes milliseconds: about 10 ms at 128 tokens (MegaSeek, 4 x 8),
-growing with the row bytes. With zero network the same kernel reads 201.7 us at that point. The cause and the
-candidate fix are in `ARCHITECTURE.md` section 5 and `TODO.md` section (d). No GB200 number belongs in
-section 8 until that item is closed.
+GB200 4 x 8 (32 GPUs, 8 trays, 400G NDR), 14 Nov 2026, this tree's kernels (measured on the stack one fold
+before `adac520`, whose kernel headers differ in comments only), host's own plan: gated by itself from the
+link rate, Ordered from 86 tokens. Timed plain builds, 5 rounds x 30 launches x 32 ranks, every variant
+verified, 0 slow launches of 150 at every point.
 
-Server settings used there: `TEST_NODES=8`, `DG_MEGA_MOE_IB_VIRTUAL_LSA=8`, `DG_MEGA_MOE_IB_GIN_TYPE=0`,
-`NO_LEGACY=1`, `DG_MEGA_MOE_IB_NVL_REF=1`, `DEV_HDR_FRESH=1`, `DEV_MAX_CASES=8`.
+| shape | tokens | this tree | GB200 NVLink, 32 GPUs in one domain (5-6 Nov) | difference |
+|---|---|---|---|---|
+| MegaSeek | 32 | 196.5 | 177 | +19.5 |
+| MegaSeek | 64 | 212.2 | 185 | +27.2 |
+| MegaSeek | 128 | 262.8 | 206 | +56.8 |
+| MegaSeek | 256 | 357.3 | 257 | +100.3 |
+| MegaSeek | 512 | 554.4 | 407 | +147.4 |
+| MegaSeek | 768 | 747.4 | not measured | - |
+| MegaSeek | 1024 | 938.7 | 652 | +286.7 |
+| GigaSeek | 128 | 308.5 | 258 | +50.5 |
+| GigaSeek | 512 | 660.3 | 528.5 | +131.8 |
+| GigaSeek | 1024 | 1,109.6 | 835 | +274.6 |
+| Flash | 128 | 167.7 | 92 | +75.7 |
+| Flash | 512 | 433.6 | 165 | +268.6 |
+| Flash | 1024 | 808.4 | 238 | +570.4 |
+
+Here both columns are the same GPUs, so the difference is the cost of 400G InfiniBand between trays against
+NVLink, with this software. Zero network on the same hardware (top-19, 13 Nov): 199.8 / 398.9 / 652.9 at 128 /
+512 / 1024. Without gating the same kernel reads 12,517 us at 128 tokens (forced `GATED=0`, same request).
+
+Regime on 400G at 4 x 8: the host's plan (Ordered with policy, gated) minus the Scan plan (gated), same request,
+twins within 0.8, 5 rounds:
+
+| shape | 96 tokens | 128 | 192 |
+|---|---|---|---|
+| MegaSeek | +1.1 | -8.9 | -27.9 |
+| GigaSeek | +6.9 | -1.6 | -24.9 |
+| Flash | -3.2 | -11.8 | -18.7 |
+
+Gates on GB200 4 x 8 (14 Nov 2026; 28 results, every variant verified, no device message of any kind, nothing
+trapped or hung):
+
+| gate | what ran | result |
+|---|---|---|
+| the host chooses gated | host plan, `GATED=1`, `GATED=0` at 32 and 128 tokens | code hash of the host plan = `GATED=1`, differs from `GATED=0` |
+| diagnostics check 30 + back-to-back (3 rounds) | MegaSeek 32 / 31 / 128 / 127 / 512 / 511 / 1024 / 1023 and 64 / 85 / 86 / 96 / 192 / 256; Flash 32 / 128 / 512 / 1024; GigaSeek 128 / 512 / 1024; MegaSeek with the Scan plan forced at 96 / 128 / 127 / 192 | pass 25 of 25 |
+| changing-count lists, per-rank shift, check 300 | MegaSeek `512_490_640_511_600_483`; Flash `1024_1023_600_1000_513_897` | pass 2 of 2 |
+| mixed-regime and crossing lists, check 300 | MegaSeek `600_64_1024_0_300_511` and `40_200_86_85_0_128`; Flash `600_64_1024_0_300_511` | pass 4 of 4 |
+| back-to-back with different counts per rank (diagnostics, no reference, 5 rounds) | MegaSeek `600_64_1024_0_300_511` | pass, 0 slow of 150 |
+| soak 3000 | MegaSeek 512 / 511, 1024 / 1023; Flash 1024 / 1023 | pass 6 of 6 |
+| idle-rank tile (on the kernels with that rule) | lists `1024_0` and `600_64_1024_0_300_511`, check 300; back-to-back | pass; mixed list 1,129.3 us before the rule, 662.1 with it (diagnostics builds); equal counts unchanged (262.0 / 556.1 / 940.0) |
+
+Checks here used 30 tests where the B300 gate list uses 300. Server settings: `TEST_NODES=8`,
+`DG_MEGA_MOE_IB_VIRTUAL_LSA=8`, `DG_MEGA_MOE_IB_GIN_TYPE=0`, `NO_LEGACY=1`, `DG_MEGA_MOE_IB_NVL_REF=1`,
+`DG_MEGA_MOE_DEV=1`, `DEV_HDR_FRESH=1`, `DEV_MAX_CASES=8`. Harness note: with `DIAGNOSTICS=1`, requests whose
+sizes include one tile class were refused by the harness check "the nodes hold different kernel code" (inline
+compiles of one source differed between nodes); the same requests passed with another diagnostics value. Not a
+kernel fault.
+
+2 x 8 on GB200: no table for this tree.
 
 ## 10. What cannot be reproduced from this repository alone
 
@@ -334,7 +438,7 @@ Server settings used there: `TEST_NODES=8`, `DG_MEGA_MOE_IB_VIRTUAL_LSA=8`, `DG_
 |---|---|
 | The harness outside Modal | `runner.py` is a Modal app: clustered functions with RDMA, Modal Queue / Dict / Volume as the control plane. On another scheduler the dev server (`jobs/devserver.py supervise` on every node, with `DEV_DICT_DIR` pointing at a shared directory instead of a Modal Dict) is the part to keep; that mode is used by the selftest only and was not run on a cluster |
 | The cluster hardware | 2 and 4 bare-metal B300 nodes with 800G InfiniBand and GPU-initiated RDMA enabled on the host (GDAKI) |
-| Comparisons with the kernel that preceded this tree | they were timed in one request through a combined header tree (`mkab.py`) and the compat layer, on servers whose host extension was built from the earlier tree. The earlier kernel and its host are not in this repository |
+| The reference-kernel columns of section 8 | they were timed in one request through a combined header tree (`mkab.py`) on servers whose host extension was built from an earlier tree, with a compatibility layer that v1.1 and v1.2 carried and this tree does not. The reference kernel and its host are not in this repository, and the in-repo host cannot select a tree by an arm's define |
 | The 32-GPU single-domain NVLink reference | needs a GB200 rack with 32 GPUs in one NVLink domain |
 | Absolute levels | a cubin's level moves by 3 to 13 us between requests and by several us between servers; only same-request differences reproduce |
 | Slow-launch rates | they depend on the host's CPU count and on pinning the Gin progress threads |

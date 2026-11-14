@@ -165,6 +165,40 @@ struct L2KBlockDependency {
     }
 };
 
+// How the scheduler orders the routed tail and the shared expert. Every member of the default is "off", and an
+// "off" member selects the stock code at compile time, so a kernel that does not name a policy is unchanged.
+// A kernel that waits on a network (Mega MoE across NVLink domains) passes its own type with the same members:
+//   kL1LeadCap > 0       After an L2 task the stock scheduler always takes an L1 task next. L1 has fewer N
+//                        clusters per block than L2 when 2 x intermediate < hidden, so L1 runs ahead in block
+//                        space and the last L2 tasks come in a burst after the last L1. With a cap C, the next
+//                        task is L1 only while L1 leads L2 by at most C pool blocks (claimed tasks of this
+//                        locality domain), which keeps L2 completions linear to the end.
+//   kRetirePercent > 0   That share of the clusters (CTA pairs), evenly spread, stops claiming tasks once
+//                        kRetireAtPercent of the routed L2 tasks of their locality domain are handed out, and
+//                        leaves the shared tail to the others. Nothing claimed is dropped: a retiring cluster
+//                        publishes the end sentinel like a cluster that ran out of work. `retired()` tells the
+//                        kernel, which gives the freed warps other work.
+//   kSharedL2Early       The shared L2 always runs before the routed tasks (stock: only if it fits one wave).
+//   kClaimAfterStart     The scheduler makes its first claim only once the kernel completes `start_barrier`. A
+//                        claimed task belongs to its cluster, and nobody else can take it: a cluster whose
+//                        consumer threads are still busy with network work would hold the two tasks of its
+//                        schedule stages, and everything that depends on them, until that work is done.
+struct SchedulePolicy {
+    static constexpr uint32_t kL1LeadCap = 0;
+    static constexpr uint32_t kRetirePercent = 0;
+    static constexpr uint32_t kRetireAtPercent = 100;
+    static constexpr bool kSharedL2Early = false;
+    static constexpr bool kClaimAfterStart = false;
+};
+
+// State only a retiring scheduler has (empty for the stock policy)
+template <bool kEnabled>
+struct RetireState {};
+template <>
+struct RetireState<true> {
+    bool is_retired = false;
+};
+
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
@@ -176,8 +210,9 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
-          uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
-struct MegaMoEScheduler {
+          uint32_t kNumL2Clusters = kNumL2BlockNs / 2,
+          typename policy_t = SchedulePolicy>
+struct MegaMoEScheduler: RetireState<(policy_t::kRetirePercent > 0)> {
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
     static constexpr uint32_t SHARED_L1_SHAPE_K = L1_SHAPE_K;
@@ -385,12 +420,35 @@ struct MegaMoEScheduler {
                 // Create task
                 return create_task(BlockPhase::Linear1, m_block_idx, n_cluster_idx, L1_SHAPE_N, L1_SHAPE_K);
             } else {
+                if constexpr (policy_t::kL1LeadCap > 0) {
+                    if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx)) {
+                        // With a lead cap this scheduler may be taking L2 tasks only while L1 tasks are still
+                        // unissued: never leave before L1 is exhausted
+                        if (num_sched_l1_waves != kNumSchedL1WavesDone) {
+                            num_sched_l1_waves = 1;
+                            continue;
+                        }
+                        break;
+                    }
+
+                    // The next task is L1 only while L1 leads L2 by at most the cap. The cap must exceed the worst
+                    // claim overshoot (kNumSMs / 2 schedulers, each one L2 task) so that an L2 claim never waits
+                    // for L1 tasks nobody will issue.
+                    if (num_sched_l1_waves != kNumSchedL1WavesDone) {
+                        constexpr uint64_t kL1Local = kNumL1Clusters / kNumLocalityDomains, kL2Local = kNumL2Clusters / kNumLocalityDomains;
+                        DG_STATIC_ASSERT(static_cast<uint64_t>(policy_t::kL1LeadCap) * kNumL2Clusters > kNumSMs / 2 + kNumL2Clusters, "L1 lead cap too small");
+                        const uint64_t num_l1_claimed = ptx::ld_volatile(workspace.get_l1_task_count_ptr() + sm_locality_domain_idx);
+                        const uint64_t num_l2_claimed = ptx::ld_volatile(workspace.get_l2_task_count_ptr() + sm_locality_domain_idx);
+                        num_sched_l1_waves = num_l1_claimed * kL2Local <= num_l2_claimed * kL1Local + static_cast<uint64_t>(policy_t::kL1LeadCap) * kL1Local * kL2Local ? 1 : 0;
+                    }
+                } else {
                 if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx))
                     break;
 
                 // The next task should be L1
                 if (num_sched_l1_waves != kNumSchedL1WavesDone)
                     num_sched_l1_waves = 1;
+                }
 
                 // Create task
                 auto task_info = create_task(BlockPhase::Linear2, m_block_idx, n_cluster_idx, L2_SHAPE_N, L2_SHAPE_K);
@@ -418,6 +476,26 @@ struct MegaMoEScheduler {
         advance_sched_pipeline();
     }
 
+    // Retirement (policy_t::kRetirePercent): whether this cluster is one of the retiring ones, and whether its
+    // locality domain has handed out enough routed L2 tasks for it to stop claiming
+    CUTLASS_DEVICE static bool is_retiring_cluster(const uint32_t& cluster_idx) {
+        return (cluster_idx * policy_t::kRetirePercent) / 100 != ((cluster_idx + 1) * policy_t::kRetirePercent) / 100;
+    }
+
+    CUTLASS_DEVICE bool should_retire(const uint32_t& num_m_blocks) const {
+        if (not is_retiring_cluster(blockIdx.x / 2))
+            return false;
+        const uint64_t num_l2_claimed = ptx::ld_volatile(workspace.get_l2_task_count_ptr() + sm_locality_domain_idx);
+        return num_l2_claimed * 100 >= static_cast<uint64_t>(policy_t::kRetireAtPercent) * num_m_blocks * (kNumL2Clusters / kNumLocalityDomains);
+    }
+
+    CUTLASS_DEVICE bool retired() const {
+        if constexpr (policy_t::kRetirePercent > 0)
+            return this->is_retired;
+        else
+            return false;
+    }
+
     template <BlockPhase kBlockPhase, uint32_t kShapeN, uint32_t kShapeK>
     CUTLASS_DEVICE void shared_mainloop(const uint32_t& num_tokens, const uint32_t& lane_idx, const uint32_t* task_count_ptr) {
         constexpr uint32_t kNumNClusters = kShapeN / BLOCK_N / 2;
@@ -435,13 +513,17 @@ struct MegaMoEScheduler {
         }
     }
 
-    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains) {
+    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains,
+                                 const Barrier* start_barrier = nullptr) {
+        if constexpr (policy_t::kClaimAfterStart)
+            start_barrier->wait(0);
         const auto lane_idx = ptx::get_lane_idx();
         sm_locality_domain_idx = kNumLocalityDomains == 1 ? 0u : sm_locality_domains[ptx::get_sm_idx()];
 
         // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
         constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
-        const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
+        const bool is_shared_l2_early = policy_t::kSharedL2Early or
+            math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
         if constexpr (kHasShared) {
             // Shared expert L1 tasks do not depend on dispatch.
             shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
@@ -460,12 +542,18 @@ struct MegaMoEScheduler {
         task_info_t task_info;
         do {
             task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            if constexpr (policy_t::kRetirePercent > 0) {
+                if (should_retire(num_total_m_blocks)) {
+                    this->is_retired = true;
+                    break;
+                }
+            }
             task_info = get_next_task();
             if (task_info.is_valid()) publish_task(task_info, lane_idx);
         } while (task_info.is_valid());
 
         if constexpr (kHasShared) {
-            if (not is_shared_l2_early)
+            if (not is_shared_l2_early and not retired())
                 shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
                     num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }

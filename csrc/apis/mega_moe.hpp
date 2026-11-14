@@ -24,8 +24,14 @@ static int get_block_m_for_mega_moe(
     const std::string& mma_type) {
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
+    // The tile the launch will use. Across NVLink domains (a process-wide choice: DG_MEGA_MOE_IB=1) it differs from
+    // the stock one for num_tokens = 0 only (get_mega_moe_ib_tile_tokens), where a caller has no tokens and no
+    // scale factors to lay out by it
+    const char* ib = std::getenv("DG_MEGA_MOE_IB");
+    const int tile_tokens = num_ranks > 1 and ib != nullptr and std::string_view(ib) == "1" ?
+        get_mega_moe_ib_tile_tokens(num_tokens, num_max_tokens_per_rank) : num_tokens;
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, tile_tokens, mma_kind);
     return block_m;
 }
 
@@ -152,6 +158,19 @@ get_symm_buffer_size_for_mega_moe(
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
 
+// Geometry of the IB tail of the symmetric buffer (layout/mega_moe_ib.cuh), for the Python allocation:
+// (tail offset, tail bytes, offset of node slot 0 in the tail, node stride, mirror stride,
+//  offset of the top-k index rows in a mirror, their bytes). The kernel derives the same numbers from the same
+// struct, so nothing is repeated by hand.
+static std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>
+get_ib_tail_for_mega_moe(const int64_t& num_stock_bytes, const int& num_nodes, const int& num_experts,
+                         const int& num_max_tokens_per_rank, const int& num_topk, const int& hidden) {
+    DG_HOST_ASSERT(num_nodes > 0 and num_nodes <= static_cast<int>(layout::MegaMoEIBSignals::kMaxNodes));
+    const layout::IBBufferLayout ib(num_max_tokens_per_rank, hidden, num_topk, num_experts);
+    return {layout::IBBufferLayout::tail_offset(num_stock_bytes), ib.num_bytes(num_nodes), ib.off_node(0),
+            ib.node_stride(), ib.mirror_stride(), ib.off_idx(), static_cast<int64_t>(num_max_tokens_per_rank) * num_topk * 8};
+}
+
 static void fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
@@ -235,7 +254,7 @@ static void fp8_fp4_mega_moe(
     }
 
     // Check buffer bytes
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_ranks = static_cast<int>(layout::IBHandles::num_ranks_of(sym_buffer_ptrs));
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
@@ -245,6 +264,15 @@ static void fp8_fp4_mega_moe(
         activation, num_shared_experts
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    if (layout::IBHandles::present(sym_buffer_ptrs)) {
+        // Ranks of other NVLink domains: the buffer also carries the IB tail, one slot per node
+        const auto num_ranks_per_node = static_cast<int>(layout::IBHandles::ranks_per_node_of(sym_buffer_ptrs));
+        DG_HOST_ASSERT(num_ranks % num_ranks_per_node == 0);
+        const auto [tail_offset, num_tail_bytes, _0, _1, _2, _3, _4] = get_ib_tail_for_mega_moe(
+            num_required_bytes, num_ranks / num_ranks_per_node, num_experts,
+            num_max_tokens_per_rank, num_topk, hidden);
+        DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(tail_offset + num_tail_bytes));
+    }
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
@@ -394,6 +422,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("get_ib_tail_for_mega_moe", &get_ib_tail_for_mega_moe);
+    m.def("get_ib_num_gin_contexts_for_mega_moe", []() { return static_cast<int>(layout::kNumIBGinContexts); });
+    m.def("mega_moe_launch_skipped", []() { return mega_moe_launch_skipped(); });
     m.def("bf16_mega_moe", &bf16_mega_moe);
 }
 

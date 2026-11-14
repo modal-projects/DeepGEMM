@@ -2,14 +2,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
 
+#include <unistd.h>
+
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_ib.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_jit/utils/env.hpp>
 
@@ -133,7 +138,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind, const bool& is_ib = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -161,8 +166,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<true>));
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
-    // + schedule task publish full/empty barriers.
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
+    // + schedule task publish full/empty barriers (+ the start barrier of a build across NVLink domains).
+    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2 + is_ib) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
@@ -200,7 +205,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind, const bool& is_ib = false) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
@@ -235,7 +240,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+        mma_kind, is_ib);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
@@ -260,6 +265,127 @@ static MegaMoEConfig get_mega_moe_config(
         }
     }
     return config;
+}
+
+// A development switch of the Mega MoE host code (plan overrides, trace and zero-network builds, compile-only
+// calls, no rendezvous: what the development servers set per measurement). It acts only in a process that
+// asked for development behaviour with DG_MEGA_MOE_DEV=1; anywhere else a set switch is refused, by name: a
+// serving process must not send nothing (zero network) or skip its launches because of a stray variable.
+static const char* get_mega_moe_dev_env(const std::string& name) {
+    const char* value = std::getenv(name.c_str());
+    const char* dev = std::getenv("DG_MEGA_MOE_DEV");
+    if (value != nullptr and (dev == nullptr or std::string_view(dev) != "1"))
+        DG_HOST_UNREACHABLE(std::format("{} is a Mega MoE development switch: it needs DG_MEGA_MOE_DEV=1", name));
+    return value;
+}
+
+// The token count the tile (block M) of a launch across NVLink domains is chosen for. The block heuristic takes
+// one rank's token count as every rank's. A rank with no tokens of its own still receives its peers' rows, and
+// with the smallest tile it splits them into many blocks, each with its own weight passes: on 4 x 8 B300, top-19,
+// half the ranks idle and half at 1024 tokens ran at 1,322 us (675 us with 1024 tokens on every rank), 565 us
+// with the tile below. So an idle rank takes the tile of a quarter of the buffer's token maximum; every other
+// count keeps its own tile (the caller lays its inputs out by it: get_block_m_for_mega_moe). Ranks with 1 to 20
+// tokens beside busy ranks are not covered (8 next to 1024: 1,332 us).
+// Development: DG_MEGA_MOE_IB_TILE_TOKENS=n chooses every tile as for n tokens.
+static int get_mega_moe_ib_tile_tokens(const int& num_tokens, const int& num_max_tokens_per_rank) {
+    if (const char* value = get_mega_moe_dev_env("DG_MEGA_MOE_IB_TILE_TOKENS"); value != nullptr)
+        return std::min(std::stoi(value), num_max_tokens_per_rank);
+    return num_tokens == 0 ? num_max_tokens_per_rank / 4 : num_tokens;
+}
+
+// The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
+// One physical quantity decides the regime: how long the token rows of a rank are on the wire,
+//   row_us = remote nodes x tokens x hidden bytes / link rate per GPU.
+// In the receiver scan (rows in token order) no expert's first block is complete before that stream ends; the
+// ordered regime (the sender routes and posts rows in first-need order) hides it behind the GEMM and pays a
+// fixed chain of sender tables in front of the counts. Ordered pays from 26.2 us of rows on the wire (512 tokens
+// of 5,120-byte rows to one remote node at 800G), whatever the node count, link or top-k: 512 / 256 / 171 tokens
+// on 2 / 3 / 4 nodes at 800G, 256 / 128 / 86 at 400G. Measured crossovers (same-request A/B, ordered + policy against the scan):
+//   800G (B300), one remote node: 15 / 22 / 25 us (top-6 / 19 / 25; +5 / +2 / -1 us at 320 / 384 / 448 tokens,
+//     -13 at 512, top-19); three remote nodes: ~25 us (+5 at 128 tokens, -1 / -6 / -11 at 160 / 192 / 224, -36 /
+//     -87 at 512 / 1024, top-19).
+//   400G (GB200), one remote node: 22 / 26 / 29 us (+6 / -1 / -17 at 192 / 256 / 384 tokens, top-19).
+// `link_gbps` is the communicator's (deep_gemm/mega/ib.py); 0 = unknown, planned as 800G.
+static layout::IBPlan get_mega_moe_ib_plan(
+    const int& num_ranks, const int& num_ranks_per_node,
+    const int& num_tokens, const int& num_topk,
+    const int& gin_backend, const int& hidden, const int& link_gbps) {
+    DG_HOST_ASSERT(num_ranks_per_node > 0 and num_ranks % num_ranks_per_node == 0 and num_ranks >= num_ranks_per_node);
+    const int num_nodes = num_ranks / num_ranks_per_node;
+    const double row_us = static_cast<double>(num_nodes - 1) * num_tokens * hidden / ((link_gbps > 0 ? link_gbps : 800) * 125.0);
+
+    layout::IBPlan plan;
+    plan.ranks_per_node = num_ranks_per_node;
+    plan.gin_backend = static_cast<uint32_t>(gin_backend);  // the communicator's (0: unknown, generic dispatch)
+    // Gated loads for 400G-class NICs (IBPlan::gated); an unknown rate plans the ungated path, like 800G
+    plan.gated = link_gbps > 0 and link_gbps <= 400;
+    const bool is_ordered = num_nodes >= 2 and row_us >= 26.2;  // us: what the sender-table chain costs
+    plan.ordered = is_ordered;
+    if (is_ordered) {
+        // L1 leads L2 by at most this many pool blocks: -4 .. -8 us with one remote node, -10 .. -18 with three
+        // (7 = 9, 11 is 3 worse); a scheduler constant, no link term
+        plan.l1_lead_cap = 9;
+        // Half of the clusters stop claiming tasks near the end of the routed L2 and feed the proxy sum, which
+        // serves nodes - 1 return streams: -3 .. -9 us with three remote nodes, +9 .. +25 with one
+        plan.retire_percent = num_nodes > 2 ? 50 : 0;
+        // The trigger: the share of the routed L2 after which a retiring cluster stops. The later, the more
+        // nodes share a token's experts (fewer of its partial sums are still missing near the end):
+        // 100 x 0.6^(nodes / top-k) = 90 at top-19, 92 at top-25 and 71 at top-6 on four nodes (measured: 92
+        // against 90 is -9 us at top-25, 1024 tokens, and -3 at 768; 71 against 90 is -5 at top-6, 1024 tokens).
+        if (plan.retire_percent > 0)
+            plan.retire_at_percent = static_cast<uint32_t>(std::lround(100.0 * std::pow(0.6, static_cast<double>(num_nodes) / num_topk)));
+        // The shared expert's L2 before the routed tasks, wherever clusters retire. On four nodes, on minus off:
+        // top-19 -1.4 .. -3.2 us at 256 .. 768 tokens and 0 .. -2.7 at 1024; top-25 -4 at 512, 0 at 1024; top-6 0.
+        // (With one remote node it cost 8 us at top-19, 1024 tokens: no retire there, so it is off.)
+        plan.shared_l2_early = plan.retire_percent > 0;
+    }
+
+    // Development overrides (DG_MEGA_MOE_DEV=1), one variable per field: DG_MEGA_MOE_IBP_<FIELD>=value (what the
+    // development servers pass per arm; a name that is no field is refused: a misspelt arm must not run the
+    // default plan). Their switch names for a trace and a zero-network run also apply.
+    for (char** entry = environ; *entry != nullptr; ++ entry) {
+        constexpr std::string_view kPrefix = "DG_MEGA_MOE_IBP_";
+        const std::string_view variable(*entry);
+        if (not variable.starts_with(kPrefix) or variable.find('=') == std::string_view::npos)
+            continue;
+        const auto name = variable.substr(kPrefix.size(), variable.find('=') - kPrefix.size());
+        get_mega_moe_dev_env(std::string(variable.substr(0, variable.find('='))));
+        const auto digits = std::string(variable.substr(variable.find('=') + 1));
+        if (digits.empty() or digits.find_first_not_of("0123456789") != std::string::npos)
+            DG_HOST_UNREACHABLE(std::format("Mega MoE IB plan override without a number: {}", variable));
+        const auto value = static_cast<uint32_t>(std::stoul(digits));
+        if (name == "ORDERED") plan.ordered = value;
+        else if (name == "GIN_BACKEND") plan.gin_backend = value;
+        else if (name == "GATED") plan.gated = value;
+        else if (name == "L1_LEAD_CAP") plan.l1_lead_cap = value;
+        else if (name == "RETIRE_PERCENT") plan.retire_percent = value;
+        else if (name == "RETIRE_AT_PERCENT") plan.retire_at_percent = value;
+        else if (name == "SHARED_L2_EARLY") plan.shared_l2_early = value;
+        else if (name == "DIAGNOSTICS") plan.diagnostics = value;
+        else if (name == "TRACE") plan.trace = value;
+        else if (name == "ZERO_NETWORK") plan.zero_network = value;
+        else DG_HOST_UNREACHABLE(std::format("Unknown Mega MoE IB plan override: {}", variable));
+    }
+    if (const char* value = get_mega_moe_dev_env("DG_MEGA_MOE_IB_TRACE"); value != nullptr and std::stoul(value) != 0)
+        plan.trace = true;
+    if (const char* value = get_mega_moe_dev_env("DG_MEGA_MOE_IB_ORACLE"); value != nullptr and std::stoul(value) >= 2)
+        plan.zero_network = true;
+    // The kernel compiles the plan's backend only and cannot check it before its puts run
+    DG_HOST_ASSERT(plan.gin_backend == 0 or gin_backend == 0 or plan.gin_backend == static_cast<uint32_t>(gin_backend));
+    return plan;
+}
+
+// The plan as the JIT source spells it (a designated initializer of layout::IBPlan, fields in declaration order)
+static std::string to_string(const layout::IBPlan& plan) {
+    return std::format(
+        "{{.ranks_per_node = {}, .ordered = {}, "
+        ".gin_backend = {}, {}"
+        ".l1_lead_cap = {}, .retire_percent = {}, .retire_at_percent = {}, "
+        ".shared_l2_early = {}, .diagnostics = {}, .trace = {}, .zero_network = {}}}",
+        plan.ranks_per_node, plan.ordered,
+        plan.gin_backend, plan.gated ? ".gated = true, " : "",     // spelt only when on: other plans keep their text
+        plan.l1_lead_cap, plan.retire_percent, plan.retire_at_percent,
+        plan.shared_l2_early, plan.diagnostics, plan.trace, plan.zero_network);
 }
 
 } // namespace deep_gemm

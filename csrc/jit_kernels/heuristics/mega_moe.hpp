@@ -279,6 +279,20 @@ static const char* get_mega_moe_dev_env(const std::string& name) {
     return value;
 }
 
+// The token count the tile (block M) of a launch across NVLink domains is chosen for. The block heuristic takes
+// one rank's token count as every rank's. A rank with no tokens of its own still receives its peers' rows, and
+// with the smallest tile it splits them into many blocks, each with its own weight passes: on 4 x 8 B300, top-19,
+// half the ranks idle and half at 1024 tokens ran at 1,322 us (675 us with 1024 tokens on every rank), 565 us
+// with the tile below. So an idle rank takes the tile of a quarter of the buffer's token maximum; every other
+// count keeps its own tile (the caller lays its inputs out by it: get_block_m_for_mega_moe). Ranks with 1 to 20
+// tokens beside busy ranks are not covered (8 next to 1024: 1,332 us).
+// Development: DG_MEGA_MOE_IB_TILE_TOKENS=n chooses every tile as for n tokens.
+static int get_mega_moe_ib_tile_tokens(const int& num_tokens, const int& num_max_tokens_per_rank) {
+    if (const char* value = get_mega_moe_dev_env("DG_MEGA_MOE_IB_TILE_TOKENS"); value != nullptr)
+        return std::min(std::stoi(value), num_max_tokens_per_rank);
+    return num_tokens == 0 ? num_max_tokens_per_rank / 4 : num_tokens;
+}
+
 // The plan of an IB build (groups that span several NVLink domains), layout/mega_moe_ib.cuh.
 // One physical quantity decides the regime: how long the token rows of a rank are on the wire,
 //   row_us = remote nodes x tokens x hidden bytes / link rate per GPU.

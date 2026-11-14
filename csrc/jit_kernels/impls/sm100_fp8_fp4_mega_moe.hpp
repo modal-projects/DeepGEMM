@@ -66,9 +66,12 @@ static void sm100_fp8_fp4_mega_moe(
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
+    const auto tile_tokens_of = [&](const int& tokens) {  // the count the tile is chosen for
+        return is_ib ? get_mega_moe_ib_tile_tokens(tokens, num_max_tokens_per_rank) : tokens;
+    };
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+        num_max_tokens_per_rank, tile_tokens_of(num_tokens), num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
         MmaKind::MXFP8FP4, is_ib);
 
@@ -253,7 +256,7 @@ static void __instantiate_kernel() {{
             for (int tokens = 0; tokens <= num_max_tokens_per_rank; ++ tokens) {
                 const auto other = make_code(get_mega_moe_config(
                     num_ranks, num_experts, num_experts_per_rank,
-                    num_max_tokens_per_rank, tokens, num_topk, hidden, intermediate_hidden,
+                    num_max_tokens_per_rank, tile_tokens_of(tokens), num_topk, hidden, intermediate_hidden,
                     num_ring_tokens, num_sf_ring_tokens,
                     MmaKind::MXFP8FP4, is_ib), tokens);
                 if (family.insert(other).second)

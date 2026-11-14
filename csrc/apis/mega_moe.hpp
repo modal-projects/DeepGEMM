@@ -24,8 +24,14 @@ static int get_block_m_for_mega_moe(
     const std::string& mma_type) {
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
+    // The tile the launch will use. Across NVLink domains (a process-wide choice: DG_MEGA_MOE_IB=1) it differs from
+    // the stock one for num_tokens = 0 only (get_mega_moe_ib_tile_tokens), where a caller has no tokens and no
+    // scale factors to lay out by it
+    const char* ib = std::getenv("DG_MEGA_MOE_IB");
+    const int tile_tokens = num_ranks > 1 and ib != nullptr and std::string_view(ib) == "1" ?
+        get_mega_moe_ib_tile_tokens(num_tokens, num_max_tokens_per_rank) : num_tokens;
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, tile_tokens, mma_kind);
     return block_m;
 }
 

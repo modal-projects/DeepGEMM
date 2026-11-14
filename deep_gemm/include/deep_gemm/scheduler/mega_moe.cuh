@@ -420,7 +420,9 @@ struct MegaMoEScheduler: RetireState<(policy_t::kRetirePercent > 0)> {
                 // Create task
                 return create_task(BlockPhase::Linear1, m_block_idx, n_cluster_idx, L1_SHAPE_N, L1_SHAPE_K);
             } else {
-                if constexpr (policy_t::kL1LeadCap > 0) {
+                // The cap is for L1 with no more clusters per block than L2 (L1 then runs ahead). With more, L1 needs its
+                // warm-up lead to the end: capped, every scheduler ends up holding an L2 task of a block whose L1 nobody claims
+                if constexpr (policy_t::kL1LeadCap > 0 and kNumL1Clusters <= kNumL2Clusters) {
                     if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx)) {
                         // With a lead cap this scheduler may be taking L2 tasks only while L1 tasks are still
                         // unissued: never leave before L1 is exhausted

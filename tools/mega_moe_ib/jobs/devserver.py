@@ -2639,7 +2639,8 @@ class Rank:
                 eps = sorted({int(m.group(1)) for l in hits for m in [re.search(r'epoch=(\d+)', l)] if m})[-n_ep:]
                 return [l for l in hits if (m := re.search(r'epoch=(\d+)', l)) is None or int(m.group(1)) in eps][-400:]
             tr = self.gather({f'{k[0]}|{k[1]}': last_epochs(v) for k, v in traces.items()})
-        alerts = self.gather([l for l in self.new_log_lines() if ALERT_RE.search(l)][-40:])
+        # K3 sweep (2026-11-14): also return the host's DG_PRINT_CONFIGS plan line (printed once per process and plan)
+        alerts = self.gather([l for l in self.new_log_lines() if ALERT_RE.search(l) or 'MegaMoEIBPlan' in l][-40:])
         self.quiet_off()
         self.apply_env(self.static_env())
 
@@ -2861,9 +2862,12 @@ class Case:
         self.l1 = cast_fp4(torch.randn((epr, I * 2, H), dtype=torch.bfloat16, device='cuda'))
         self.l2 = cast_fp4(torch.randn((epr, H, I), dtype=torch.bfloat16, device='cuda'))
         SI = I * self.S
+        self.tl1, self.tl2 = dg.transform_weights_for_mega_moe(self.l1, self.l2)
+        if self.S == 0:   # K3 sweep (2026-11-14): no shared expert, as tests/test_mega_moe.py --num-shared-experts 0
+            self.sl1 = self.sl2 = self.tsl1 = self.tsl2 = None
+            return
         self.sl1 = self.cast_fp8(torch.randn((SI * 2, H), dtype=torch.bfloat16, device='cuda'))[0::2]
         self.sl2 = self.cast_fp8(torch.randn((H, SI), dtype=torch.bfloat16, device='cuda'))[0::2]
-        self.tl1, self.tl2 = dg.transform_weights_for_mega_moe(self.l1, self.l2)
         self.tsl1, self.tsl2 = dg.transform_weights_for_mega_moe(self.sl1, self.sl2)
 
     def cast_fp8(self, x):
@@ -2897,13 +2901,18 @@ class Case:
         block_m = dg.get_block_m_for_mega_moe(R.world, self.E, self.buffer.num_max_tokens_per_rank, T, self.K, 'fp8xfp4')
         x_fp8, x_sf, x_sf_tma = self.cast_fp8(x)
         return dict(x=(x_fp8, x_sf), shared_x=(x_fp8, x_sf_tma), topk_idx=topk_idx, topk_weights=topk_weights,
-                    shared_l1_x_sf=self.shared_sf_layout(x_sf, block_m, self.buffer.shared_l1_acts_sf.shape[0]),
+                    shared_l1_x_sf=(self.shared_sf_layout(x_sf, block_m, self.buffer.shared_l1_acts_sf.shape[0])
+                                    if self.S > 0 else None),
                     stats0=stats0, stats=stats0.clone(), dev_bm=os.environ.get('DG_MEGA_MOE_DEV_BLOCK_M', ''))
 
     def copy_inputs(self, inp, buf):
         T = self.T
         buf.x[:T].copy_(inp['x'][0])
         buf.x_sf[:T].copy_(inp['x'][1])
+        if self.S == 0:   # no shared expert: the buffer has no shared_l1_acts_sf view to fill
+            buf.topk_idx[:T].copy_(inp['topk_idx'])
+            buf.topk_weights[:T].copy_(inp['topk_weights'])
+            return
         dst, src = buf.shared_l1_acts_sf, inp['shared_l1_x_sf']
         dev_bm = os.environ.get('DG_MEGA_MOE_DEV_BLOCK_M', '')
         if dev_bm != inp.get('dev_bm', ''):
@@ -2933,7 +2942,7 @@ class Case:
             self.copy_inputs(inp, buf)
         self.dg.fp8_fp4_mega_moe(y=y, l1_weights=self.tl1, l2_weights=self.tl2, sym_buffer=buf,
                                  cumulative_local_expert_recv_stats=stats, activation_clamp=10.0, fast_math=True,
-                                 shared_l1_weights=self.tsl1, shared_l2_weights=self.tsl2)
+                                 **({'shared_l1_weights': self.tsl1, 'shared_l2_weights': self.tsl2} if self.S > 0 else {}))
         return y, stats
 
     def baseline(self, inp):
@@ -2958,6 +2967,8 @@ class Case:
             dg.m_grouped_fp8_fp4_gemm_nt_contiguous(l1_y, self.l2, l2_y, handle.psum_num_recv_tokens_per_expert, **gk)
         # shared expert bias
         T, SI = self.T, self.I * self.S
+        if self.S == 0:   # no shared expert: no bias (the test's get_baseline_shared_bias returns None)
+            return self.ep_buffer.combine(l2_y, handle=handle, bias=None)[0], stats
         sy = torch.empty((T, self.H), dtype=torch.bfloat16, device='cuda')
         s1 = torch.empty((T, SI * 2), dtype=torch.bfloat16, device='cuda')
         dg.fp8_gemm_nt(inp['shared_x'], self.sl1, s1, recipe=(1, 1, 32), disable_ue8m0_cast=True)

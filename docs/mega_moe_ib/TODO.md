@@ -236,3 +236,12 @@ Status: **usable with gated loads, which the host selects by itself from the lin
   could be covered. It needs a second task shape. The latent projections cannot hide wire time (one is before
   the wire, one after it).
 - K3's activation is not the one the kernel implements; timing is unaffected, serving is not possible without it.
+
+## (f) Fabrics that are not one InfiniBand NIC per GPU
+
+- AWS B300 nodes carry two 400G EFA ports per GPU (16 per node), not one 800G InfiniBand NIC. The kernel does not
+  run there: it issues its puts from GPU threads through the ConnectX path and uses one NIC per GPU. Open: whether
+  EFA offers a GPU-initiated path, striping a GPU's traffic over two ports, and whether wire time hides behind
+  compute there as it does on InfiniBand. No result in this repository transfers to EFA without that work.
+- 400G RoCE (as opposed to 400G InfiniBand) is likewise unmeasured.
+

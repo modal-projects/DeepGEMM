@@ -91,4 +91,45 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 }
 
+// The NVLink barrier among the ranks of this rank's node only (groups that span several NVLink domains, see
+// layout/mega_moe_ib.cuh). Ranks of other nodes never touch the signal words; what this rank needs from them is
+// proven by the data it polls.
+template <uint32_t kNumRanks, uint32_t kNumRanksPerNode, uint32_t kNumSMs, uint32_t kNumThreads,
+          uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
+CUTLASS_DEVICE void node_barrier(const layout::Workspace& workspace,
+                                 const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                 const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                 const sync_scope_t& sync_scope,
+                                 const bool& sync_prologue = true,
+                                 const bool& sync_epilogue = true) {
+    DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+
+    if (sync_prologue)
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+
+    if (sm_idx == 0) {
+        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const auto status = (*counter_ptr) & 3;
+        const auto signal_phase = status & 1, signal_sign = status >> 1;
+        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+
+        if (thread_idx < kNumRanks and thread_idx / kNumRanksPerNode == sym_buffer.rank_idx / kNumRanksPerNode)
+            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+        sync_scope();
+
+        if (thread_idx == 0) {
+            ptx::red_add(counter_ptr, 1);
+            const int target = signal_sign ? 0 : static_cast<int>(kNumRanksPerNode);
+            wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
+                printf("DeepGEMM node barrier timeout: rank=%d, signal=%d, target=%d, tag=%d\n",
+                       sym_buffer.rank_idx, ptx::ld_acq_sys(signal_ptr), target, kTag);
+            });
+        }
+        sync_scope();
+    }
+
+    if (sync_epilogue)
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+}
+
 } // namespace deep_gemm::comm

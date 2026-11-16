@@ -10,6 +10,12 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+#include <deep_gemm/impls/mega_moe_ib/proxy.cuh>
+#include <deep_gemm/impls/mega_moe_ib/pull.cuh>
+#include <deep_gemm/impls/mega_moe_ib/start.cuh>
+#include <deep_gemm/impls/mega_moe_ib/combine.cuh>
+#endif
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
@@ -76,6 +82,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                            const __grid_constant__ layout::IBHandles ib_handles,
+#endif
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -132,6 +141,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    // Ranks of other NVLink domains (impls/mega_moe_ib/): the constants of this build and the state of this launch
+    using IB = ib::Geometry<kNumRanks, kNumSMs, kNumMaxTokensPerRank, kHidden, kNumTopk, kNumExperts>;
+    const ib::Launch ib_launch(sym_buffer, ib_handles, workspace.signals, buffer.get_num_bytes(), IB());
+#endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
@@ -207,6 +221,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         task_info_t task_infos[kNumScheduleStages];
         Barrier dispatch_barriers[kNumDispatchWarps];
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // What an IB build's scheduler waits for before its first claim (sched::SchedulePolicy::kClaimAfterStart);
+        // the host adds its 8 bytes (get_pipeline_config_for_mega_moe)
+        Barrier start_barrier;
+#endif
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
@@ -248,10 +267,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             );
         }
     } else if (warp_idx == 1) {
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // One arrival per CTA of the cluster, when its epilogue threads have left `ib::start`
+        if (lane_idx == 0)
+            shared_storage.start_barrier.init(2);
+#else
         // Init m-barriers for dispatch
         #pragma unroll
         for (uint32_t i = lane_idx; i < kNumDispatchWarps; i += 32)
             shared_storage.dispatch_barriers[i].init(1);
+#endif
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
         // Init GEMM barriers
@@ -289,6 +314,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     cudaGridDependencySynchronize();
 
     // Task scheduler
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    // With the plan's tail policy, which follows the scheduler's five derived arguments
+    auto scheduler = sched::MegaMoEScheduler<
+        BLOCK_M, BLOCK_N, BLOCK_K, L1_SHAPE_N, L1_SHAPE_K, L2_SHAPE_N, L2_SHAPE_K,
+        kNumExpertsPerRank, kNumSMs, kNumRanks, kNumRingBlocks, kNumLocalityDomains, kNumSharedExperts,
+        math::constexpr_ceil_div(kNumExpertsPerRank, 32u), L1_SHAPE_N / BLOCK_N, L2_SHAPE_N / BLOCK_N,
+        L1_SHAPE_N / BLOCK_N / 2, L2_SHAPE_N / BLOCK_N / 2, typename IB::TailPolicy>(
+#else
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
@@ -297,6 +330,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSMs, kNumRanks,
         kNumRingBlocks, kNumLocalityDomains,
         kNumSharedExperts>(
+#endif
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -325,7 +359,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+    // The dispatch warps also run the proxy sum, whose items need the registers
+    constexpr bool kUseMoreEpilogueRegisters = false;
+#else
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
+#endif
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 72;
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 168;
@@ -365,6 +404,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         };
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // The proxy work queues of this launch start empty
+        if (sm_idx == 1)
+            ib::reset_counters<IB>(ib_launch, thread_idx, kNumDispatchThreads);
+        ib::trace::begin<IB>(ib_launch, num_tokens, sm_idx == 1 and thread_idx == 0);
+        ib::report_return_gaps<IB>(ib_launch, sm_idx == 1 and thread_idx == 0);
+#endif
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -384,6 +430,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // An expert on another node: the proxy there writes this entry
+            if (IB::node_of(dst_rank_idx) != ib_launch.my_node)
+                return;
+#endif
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
@@ -399,13 +450,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            if (thread_idx < kNumRanks and IB::node_of(thread_idx) == ib_launch.my_node)
+#else
             if (thread_idx < kNumRanks)
+#endif
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
             __syncwarp();
 
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                // Ranks of other nodes get this source's counts from its proxy there
+                if (IB::node_of(dst_rank_idx) != ib_launch.my_node)
+                    continue;
+#endif
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
                 *sym_buffer.map(
@@ -419,7 +479,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        comm::node_barrier<kNumRanks, IB::kLsa, kNumSMs, kNumDispatchThreads,
+#else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+#endif
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
@@ -442,11 +506,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Gated loads: the dispatch warps of the row posters' SMs do not pull; one thread of each watches rows land
+        if (IB::kGated and sm_idx >= IB::kFirstRowSM and sm_idx < IB::kFirstRowSM + IB::kR and thread_idx == 0)
+            ib::watch_rows<IB>(ib_launch, sm_idx - IB::kFirstRowSM);
+#endif
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Counts and slot tables of remote sources were written by this GPU's receiver SMs, which fence before
+        // adding to the count sums
+        __threadfence();
+#endif
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // SMs whose epilogue warps are busy at the start (posters, receivers) take no part in the pull
+        constexpr uint32_t kNumGlobalWarps = (IB::kEndPullSM - IB::kFirstPullSM) * kNumDispatchWarps;
+        uint64_t ib_tables_seen = 0, ib_rows_done = 0;
+        for (uint32_t token_idx = (sm_idx - IB::kFirstPullSM) * kNumDispatchWarps + warp_idx;
+             sm_idx >= IB::kFirstPullSM and sm_idx < IB::kEndPullSM; token_idx += kNumGlobalWarps) {
+#else
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+#endif
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -528,8 +610,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            const uint32_t ib_entry = ib::slot_entry<IB>(ib_launch, workspace, current_expert_idx, current_rank_in_expert_idx,
+                                                         token_idx_in_rank, ib_tables_seen);
+            const uint32_t src_token_topk_idx = ib_entry & 0xffff;
+#else
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+#endif
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -549,6 +637,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Register pull: every row, node-local or from a mirror, in one NVLink round trip
+            const float weight = ib::pull_row<IB>(
+                ib_launch, sym_buffer, buffer, current_rank_in_expert_idx, ib_entry,
+                buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<uint8_t>(),
+                buffer.l1_sf_buffer.get_base_ptr<uint32_t>() + (pool_block_idx % kNumRingBlocks) * SF_BLOCK_M
+                    + transform_sf_token_idx(token_idx_in_expert % BLOCK_M),
+                kNumSFRingTokens, lane_idx, ib_rows_done);
+#else
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
@@ -598,6 +695,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
             }
             __syncwarp();
+#endif
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -607,8 +705,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
+#if not (defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB)
                 // Complete last chunk's store
                 issue_and_wait_pull_store(kNumChunks - 1);
+#endif
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
@@ -617,6 +717,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Idle until the cleanup: sum the partial results of the tokens this GPU is the proxy of
+        ib::reduce<IB, decltype(scheduler)>(ib_launch, (warp_idx * kNumSMs + sm_idx) % cute::max(IB::kR, 1u),
+                                            sm_idx == 0 and thread_idx == 0, lane_idx);
+#endif
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -680,13 +786,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         // Wait for all ranks to finish cleaning
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        comm::node_barrier<kNumRanks, IB::kLsa, kNumSMs, kNumDispatchThreads,
+#else
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+#endif
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Every pull of this node is done: re-arm the mirrors this launch read, then count the launch
+        ib::rearm_mirrors<IB>(ib_launch, sm_idx * kNumDispatchThreads + thread_idx, kNumSMs * kNumDispatchThreads,
+                              thread_idx == 0, [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+        if (sm_idx == 0 and thread_idx == 0)
+            ib_launch.signals->epoch = ib_launch.epoch;
+#endif
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -942,7 +1059,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            scheduler.mainloop(num_tokens, sm_locality_domains, &shared_storage.start_barrier);
+#else
             scheduler.mainloop(num_tokens, sm_locality_domains);
+#endif
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -972,6 +1093,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(WG_BLOCK_M % STORE_BLOCK_M_L1 == 0 and WG_BLOCK_M % STORE_BLOCK_M_L2 == 0, "Invalid warpgroup block M");
         DG_STATIC_ASSERT(STORE_BLOCK_M_L1 % ATOM_M == 0 and STORE_BLOCK_M_L2 % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Before the first task: post this rank's inputs to the other nodes and receive theirs
+        ib::start<IB, kNumRanks, kNumSMs, kNumEpilogueThreads, kEpilogueFullBarrierIdx>(
+            ib_launch, workspace, &sym_buffer, buffer.input_token_buffer.get_base_ptr<uint8_t>(), num_tokens,
+            reinterpret_cast<uint32_t*>(&shared_storage.smem_d), sizeof(shared_storage.smem_d), sm_idx, epilogue_thread_idx);
+        // The cluster's scheduler may claim now (the barrier is the leader CTA's)
+        if (epilogue_thread_idx == 0)
+            shared_storage.start_barrier.arrive(0u);
+#endif
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1348,6 +1479,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+                        if (IB::node_of(dst_rank_idx) != ib_launch.my_node) {
+                            ib::store_partial<IB>(ib_launch, sym_buffer, dst_rank_idx,
+                                                  reinterpret_cast<const uint8_t*>(dst_ptr) - buffer.combine_token_buffer.get_base_ptr<uint8_t>(), packed);
+                            continue;
+                        }
+#endif
                         *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
                 }
@@ -1409,14 +1547,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
         // All local L2 writes are done after this grid sync
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Join early: once this SM's warps have all left the task loop, only warp 0 waits for the other SMs; the
+        // others start on the proxy sum below. The barrier with the dispatch warps still holds everyone back
+        // from the combine until warp 0 is through.
+        if constexpr (IB::kJoinEarly) {
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if (epilogue_warp_idx == 0)
+                comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() { __syncwarp(); });
+        } else
+#endif
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks and IB::node_of(epilogue_thread_idx) == ib_launch.my_node)
+#else
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+#endif
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // This SM's GEMM tasks are done: help with the proxy sum
+        ib::trace::stamp<IB>(ib_launch, ib::trace::kLastTask, epilogue_thread_idx == 0);
+        ib::reduce<IB, decltype(scheduler)>(ib_launch, (epilogue_warp_idx * kNumSMs + sm_idx) % cute::max(IB::kR, 1u), false, lane_idx);
+#endif
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1428,9 +1586,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // Experts on other nodes are not slots of this loop: their results come back as records (below)
+            const int stored_topk_slot_idx = ib::local_slot<IB>(ib_launch, lane_idx < kNumTopk ?
+                static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
+                (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1), lane_idx);
+#else
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
+#endif
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             // Wait for the ranks of the selected experts to finish their L2 writes
@@ -1489,6 +1654,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 load_stage_idx ^= 1;
             }
 
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+            // The local part is done: park the fp32 sums, the records are added in a second loop
+            ib::park<kNumUint4PerLane>(reduced, ib::Slots<IB>::combine_scratch(ib_launch) + static_cast<int64_t>(token_idx) * kHidden
+                                                + chunk_idx * (kHidden / kNumChunks), lane_idx);
+#else
             // Cast
             #pragma unroll
             for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
@@ -1517,7 +1687,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cute::tma_store_arrive();
             }
             __syncwarp();
+#endif
         }
+#if defined(DG_MEGA_MOE_IB) and DG_MEGA_MOE_IB
+        // Second loop of the combine: add one record per remote node to the parked sums and store
+        ib::add_records<IB, kNumChunks, kNumUint4PerLane>(
+            ib_launch, buffer.input_topk_idx_buffer.get_base_ptr<int64_t>(), y, num_tokens, combine_store_buffer,
+            epilogue_warp_idx * kNumSMs + sm_idx, kNumSMs * kNumEpilogueWarps, lane_idx);
+        if (sm_idx == 0 and num_tokens == 0)
+            ib::await_empty_returns<IB>(ib_launch, epilogue_thread_idx);
+#endif
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

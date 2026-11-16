@@ -187,26 +187,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
-    def copy_inputs_to_buffer():
+    def copy_inputs_to_buffer(buf=None):
+        buf = buffer if buf is None else buf
         if is_bf16xbf16:
-            buffer.x[:num_tokens].copy_(x)
+            buf.x[:num_tokens].copy_(x)
         else:
-            buffer.x[:num_tokens].copy_(x[0])
-            buffer.x_sf[:num_tokens].copy_(x[1])
+            buf.x[:num_tokens].copy_(x[0])
+            buf.x_sf[:num_tokens].copy_(x[1])
             if num_shared_experts > 0:
-                _copy_fp8_sf(buffer.shared_l1_acts_sf, shared_l1_x_sf, num_tokens)
-        buffer.topk_idx[:num_tokens].copy_(topk_idx)
-        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+                _copy_fp8_sf(buf.shared_l1_acts_sf, shared_l1_x_sf, num_tokens)
+        buf.topk_idx[:num_tokens].copy_(topk_idx)
+        buf.topk_weights[:num_tokens].copy_(topk_weights)
 
-    def run_fused():
-        cumulative_local_expert_recv_stats_fused.copy_(initial_cumulative_local_expert_recv_stats_fused)
-        copy_inputs_to_buffer()
+    def run_fused(buf=None, stats=None):
+        buf = buffer if buf is None else buf
+        stats = cumulative_local_expert_recv_stats_fused if stats is None else stats
+        stats.copy_(initial_cumulative_local_expert_recv_stats_fused)
+        copy_inputs_to_buffer(buf)
 
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         kernel_kwargs = dict(
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
-            sym_buffer=buffer,
-            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            sym_buffer=buf,
+            cumulative_local_expert_recv_stats=stats,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
         if num_shared_experts > 0:
@@ -215,7 +218,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 shared_l2_weights=transformed_shared_l2_weights
             )
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
-        return y, cumulative_local_expert_recv_stats_fused
+        return y, stats
+
+    # DG_MEGA_MOE_IB_NVL_REF=1 (single-node IB test without the DeepEP reference): the reference is the same kernel on a
+    # second buffer whose ranks form one NVLink domain (DG_MEGA_MOE_IB_VIRTUAL_LSA unset for that allocation), i.e. the
+    # stock path on the same GPUs and inputs, compared with the tolerance check below
+    nvl_ref_buffer, nvl_ref_stats = None, None
+    if os.environ.get('DG_MEGA_MOE_IB_NVL_REF', '0') == '1' and os.environ.get('DG_MEGA_MOE_IB', '0') == '1':
+        _saved = os.environ.pop('DG_MEGA_MOE_IB_VIRTUAL_LSA', None)
+        try:
+            nvl_ref_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+                num_shared_experts=num_shared_experts, mma_type=args.mma_type)
+        finally:
+            if _saved is not None:
+                os.environ['DG_MEGA_MOE_IB_VIRTUAL_LSA'] = _saved
+        assert nvl_ref_buffer.handle.num_lsa_ranks == num_ranks, \
+            f'NVL reference needs one NVLink domain over all {num_ranks} ranks, got {nvl_ref_buffer.handle.num_lsa_ranks}'
+        dist_print(f' > NVL reference buffer: one NVLink domain of {num_ranks} ranks', once_in_node=True)
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
@@ -336,14 +356,34 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Check correctness
     # noinspection PyBroadException
-    if is_legacy_loaded and num_correctness_tests > 0:
-        dist_print('Running correctness tests:', once_in_node=True)
+    if (is_legacy_loaded or nvl_ref_buffer is not None) and num_correctness_tests > 0:
+        dist_print('Running correctness tests' + ('' if is_legacy_loaded else ' (reference: NVLink-only kernel)') + ':', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
             fused_y, fused_stats = run_fused()
-            baseline_y, baseline_stats = run_baseline()
+            if is_legacy_loaded:
+                baseline_y, baseline_stats = run_baseline()
+            else:
+                if nvl_ref_stats is None:
+                    nvl_ref_stats = torch.empty_like(cumulative_local_expert_recv_stats_fused)
+                baseline_y, baseline_stats = run_fused(nvl_ref_buffer, nvl_ref_stats)
             assert torch.equal(fused_stats, baseline_stats)
-            assert torch.equal(fused_y, baseline_y), f'calc_diff={calc_diff(fused_y, baseline_y)}'
+            # DG_MEGA_MOE_IB_TOLERANCE=<calc_diff bound>: across NVLink domains a node's partial results come back as
+            # one fp8 record per token, so the outputs match the reference within a tolerance, not bit for bit
+            tol = float(os.environ.get('DG_MEGA_MOE_IB_TOLERANCE', '0'))
+            if tol > 0:
+                diff = calc_diff(fused_y, baseline_y)
+                ref = baseline_y.float()
+                err = (fused_y.float() - ref)
+                rel_rms = (err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-30)).item()
+                max_abs = err.abs().max().item()
+                bad = (~torch.isfinite(fused_y.float())).sum().item()
+                if i < 3 or (i + 1) % 10 == 0 or diff >= tol or bad:
+                    print(f'IB_ERR rank={rank_idx} test={i} calc_diff={diff:.3e} rel_rms={rel_rms:.3e} max_abs={max_abs:.3e} '
+                          f'ref_max={ref.abs().max().item():.3e} nonfinite={bad}', flush=True)
+                assert diff < tol and bad == 0, f'calc_diff={diff} >= {tol} (nonfinite {bad})'
+            else:
+                assert torch.equal(fused_y, baseline_y), f'calc_diff={calc_diff(fused_y, baseline_y)}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
@@ -422,6 +462,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Exit
     dist.barrier()
     buffer.destroy()
+    nvl_ref_buffer.destroy() if nvl_ref_buffer is not None else None
     ep_buffer.destroy() if is_legacy_loaded else None
     deep_gemm.destroy_localizer()
     dist.destroy_process_group()
